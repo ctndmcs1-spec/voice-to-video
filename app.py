@@ -79,22 +79,26 @@ def fetch_story_media(query: str, idx: int, p_key: str, workdir: str) -> str:
     return dest
 
 def create_kenburns_clip(img_path: str, duration: float, out_clip: str, mode: int = 0):
-    """Tạo clip ngắn có hiệu ứng Zoom In / Zoom Out từ ảnh tĩnh"""
-    frames = max(1, int(duration * FPS))
-    # Chuyển đổi qua lại giữa Zoom In và Zoom Out
+    """Tạo clip ngắn Zoom In / Zoom Out siêu mượt, loại bỏ triệt để rung giật"""
+    frames = max(25, int(duration * FPS))
+    step = 0.20 / frames  # Tự động tính bước zoom mượt theo đúng độ dài từng câu
+
     if mode % 2 == 0:
-        # Zoom In từ từ vào tâm
-        z_expr = f"min(zoom+0.0012,1.25)"
+        # Zoom In từ 1.0 lên 1.20 từ từ
+        z_expr = f"min(zoom+{step:.6f},1.20)"
         x_expr = "iw/2-(iw/zoom/2)"
         y_expr = "ih/2-(ih/zoom/2)"
     else:
-        # Zoom Out từ 1.25 về 1.0
-        z_expr = f"if(eq(on,1),1.25,max(1.0,zoom-0.0012))"
+        # Zoom Out từ 1.20 về 1.0
+        z_expr = f"if(eq(on,1),1.20,max(1.0,zoom-{step:.6f}))"
         x_expr = "iw/2-(iw/zoom/2)"
         y_expr = "ih/2-(ih/zoom/2)"
 
+    # Xử lý nội bộ ở 2560x1440 để triệt tiêu rung giật do làm tròn pixel, sau đó scale mượt về 1280x720
     filter_complex = (
-        f"zoompan=z='{z_expr}':x='{x_expr}':y='{y_expr}':d={frames}:s={W}x{H}:fps={FPS},"
+        f"scale=2560:1440,"
+        f"zoompan=z='{z_expr}':x='{x_expr}':y='{y_expr}':d={frames}:s=2560x1440:fps={FPS},"
+        f"scale={W}:{H}:flags=lanczos,"
         f"format=yuv420p"
     )
     cmd = [
