@@ -13,79 +13,83 @@ import requests
 from PIL import Image, ImageOps
 from groq import Groq
 
-st.set_page_config(page_title="AI Voice to Video 16:9", layout="centered")
+st.set_page_config(page_title="Voice to Video 16:9", layout="centered")
 
 W, H = 1280, 720
 FPS = 25
 STT_MODEL = "whisper-large-v3"
 LLM_MODEL = "openai/gpt-oss-20b"
 PEXELS_PHOTO_URL = "https://api.pexels.com/v1/search"
-POLLINATIONS_URL = "https://image.pollinations.ai/prompt/{prompt}?width=1280&height=720&nologo=true&seed={seed}"
 
-st.title("🎬 Tạo Video 16:9 Tự Động")
-st.caption("Bóc tách giọng nói, phân tích cảnh và ghép video MP4 chuẩn YouTube")
+st.title("🎬 Tạo Video Biểu Cảm / Phân Cảnh (16:9)")
+st.caption("Tối ưu tốc độ: Tải ảnh có sẵn siêu nhanh, không chờ vẽ AI")
 
 groq_key = st.text_input("Groq API Key (Bắt buộc)", type="password", placeholder="gsk_...")
-pexels_key = st.text_input("Pexels API Key (Tùy chọn, để trống dùng ảnh AI)", type="password", placeholder="Để trống nếu muốn AI tự tạo ảnh")
+pexels_key = st.text_input("Pexels API Key (Tùy chọn)", type="password", placeholder="Để trống để dùng ảnh minh họa có sẵn")
 
-audio_file = st.file_uploader("Tải lên file Voice / Âm thanh", type=["mp3", "wav", "m4a", "ogg"])
+audio_file = st.file_uploader("Tải file âm thanh", type=["mp3", "wav", "m4a", "ogg"])
 
-def fetch_media(query: str, idx: int, p_key: str, workdir: str) -> str:
+def fetch_fast_media(query: str, idx: int, p_key: str, workdir: str) -> str:
     dest = os.path.join(workdir, f"media_{idx:03d}.jpg")
+    downloaded = False
     
-    # 1. Lấy ảnh thật từ Pexels
+    # Ưu tiên 1: Pexels (nếu có key)
     if p_key and p_key.strip():
+        for search_term in [query, query.split()[0] if query.split() else "abstract", "reaction"]:
+            try:
+                url = f"{PEXELS_PHOTO_URL}?query={urllib.parse.quote(search_term)}&per_page=5&orientation=landscape"
+                r = requests.get(url, headers={"Authorization": p_key.strip()}, timeout=5)
+                if r.ok and r.json().get("photos"):
+                    # Lấy ngẫu nhiên 1 trong các ảnh gần đúng
+                    photos = r.json()["photos"]
+                    img_url = random.choice(photos)["src"]["large2x"]
+                    img_data = requests.get(img_url, timeout=10).content
+                    with open(dest, "wb") as f:
+                        f.write(img_data)
+                    downloaded = True
+                    break
+            except Exception:
+                continue
+
+    # Ưu tiên 2: Tải ảnh minh họa / stickman / cartoon từ CDN có sẵn (mất 1-2s)
+    if not downloaded:
         try:
-            url = f"{PEXELS_PHOTO_URL}?query={urllib.parse.quote(query)}&per_page=1&orientation=landscape"
-            r = requests.get(url, headers={"Authorization": p_key.strip()}, timeout=15)
-            if r.ok and r.json().get("photos"):
-                img_url = r.json()["photos"][0]["src"]["large2x"]
-                img_data = requests.get(img_url, timeout=20).content
+            # Tìm ảnh qua Lexica API (Kho ảnh minh họa AI đã được render sẵn hàng triệu tấm, tải về ngay lập tức)
+            lexica_url = f"https://lexica.art/api/v1/search?q={urllib.parse.quote(query + ' stickman cartoon illustration')}"
+            r = requests.get(lexica_url, timeout=6)
+            if r.ok and r.json().get("images"):
+                img_url = r.json()["images"][0]["src"]
+                img_data = requests.get(img_url, timeout=10).content
                 with open(dest, "wb") as f:
                     f.write(img_data)
-                
-                # Kiểm tra và resize ảnh
-                with Image.open(dest) as img:
-                    fitted = ImageOps.fit(img.convert("RGB"), (W, H), Image.LANCZOS)
-                    fitted.save(dest, "JPEG", quality=90)
-                return dest
+                downloaded = True
         except Exception:
-            pass # Nếu Pexels lỗi, tự động trôi xuống dùng Pollinations AI
+            pass
 
-    # 2. Dùng AI vẽ ảnh & BỘ LỌC ẢNH GIẢ
+    # Nếu tất cả đều rớt mạng: Dùng ảnh màu nền tối giản
+    if not downloaded:
+        img = Image.new('RGB', (W, H), color=(20, 25, 35))
+        img.save(dest, "JPEG")
+        return dest
+
     try:
-        safe_q = urllib.parse.quote(f"cinematic 16:9 landscape photography, {query}"[:160])
-        ai_url = POLLINATIONS_URL.format(prompt=safe_q, seed=random.randint(1, 99999))
-        
-        # Tải ảnh từ Pollinations
-        r = requests.get(ai_url, timeout=90)
-        r.raise_for_status() # Bắt lỗi server (404, 500...)
-        
-        with open(dest, "wb") as f:
-            f.write(r.content)
-            
-        # Thử mở ảnh. Nếu đây là HTML/Text báo lỗi, lệnh này sẽ văng lỗi ngay lập tức
         with Image.open(dest) as img:
             fitted = ImageOps.fit(img.convert("RGB"), (W, H), Image.LANCZOS)
             fitted.save(dest, "JPEG", quality=90)
-            
-        return dest
-        
     except Exception:
-        # 3. LỚP BẢO VỆ CUỐI CÙNG: Mạng rớt, server quá tải, hoặc trả về ảnh giả
-        # Tạo ảnh đen trơn để chèn vào video, giúp quá trình chạy tiếp không bị sập
-        img = Image.new('RGB', (W, H), color=(30, 30, 30))
+        img = Image.new('RGB', (W, H), color=(20, 25, 35))
         img.save(dest, "JPEG")
-        return dest
+
+    return dest
 
 if st.button("⚡ Bắt Đầu Tạo Video", use_container_width=True, type="primary"):
     if not groq_key or not groq_key.strip():
         st.error("Vui lòng nhập Groq API Key!")
     elif not audio_file:
-        st.error("Vui lòng tải file âm thanh lên trước!")
+        st.error("Vui lòng tải file âm thanh lên!")
     else:
-        status = st.status("Đang khởi động tiến trình...", expanded=True)
-        workdir = tempfile.mkdtemp(prefix="s2v_")
+        status = st.status("Đang xử lý...", expanded=True)
+        workdir = tempfile.mkdtemp(prefix="fast_v2v_")
         
         try:
             audio_path = os.path.join(workdir, audio_file.name)
@@ -94,7 +98,8 @@ if st.button("⚡ Bắt Đầu Tạo Video", use_container_width=True, type="pri
 
             client = Groq(api_key=groq_key.strip())
 
-            status.update(label="🎙️ Bước 1/4: Đang bóc tách lời thoại qua Whisper...")
+            # 1. Whisper
+            status.update(label="🎙️ 1/4: Bóc tách giọng nói...")
             with open(audio_path, "rb") as fh:
                 resp = client.audio.transcriptions.create(
                     file=fh, model=STT_MODEL, response_format="verbose_json"
@@ -109,13 +114,14 @@ if st.button("⚡ Bắt Đầu Tạo Video", use_container_width=True, type="pri
             if not segments:
                 cmd_dur = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", audio_path]
                 dur = float(subprocess.run(cmd_dur, capture_output=True, text=True).stdout.strip() or 5.0)
-                segments.append({"start": 0.0, "end": dur, "text": data.get("text", "scenic landscape")})
+                segments.append({"start": 0.0, "end": dur, "text": "animation"})
 
-            status.update(label="🧠 Bước 2/4: AI đang phân tích nội dung và chọn bối cảnh...")
+            # 2. Tạo từ khóa biểu cảm đơn giản
+            status.update(label="🧠 2/4: Lọc biểu cảm nhân vật...")
             transcript_text = "\n".join([f"[{i}] {s['text']}" for i, s in enumerate(segments)])
-            prompt = f"""Phân tích các đoạn kịch bản sau và trích xuất cho MỖI đoạn 1 từ khóa tiếng Anh (2-4 từ, phong cảnh 16:9 cinematic):
+            prompt = f"""Phân tích các câu thoại sau và trích xuất cho MỖI đoạn 1 từ khóa biểu cảm cảm xúc (tiếng Anh ngắn gọn 1-2 từ, ví dụ: angry, funny stickman, shocked, running, happy):
 {transcript_text}
-Chỉ trả về JSON thuần túy theo định dạng: {{"scenes": [{{"index": 0, "search_query": "concrete visual keyword"}}]}}"""
+Chỉ trả lời đúng định dạng JSON: {{"scenes": [{{"index": 0, "search_query": "shocked face"}}]}}"""
 
             llm_resp = client.chat.completions.create(
                 model=LLM_MODEL,
@@ -125,12 +131,13 @@ Chỉ trả về JSON thuần túy theo định dạng: {{"scenes": [{{"index": 
             parsed = json.loads(llm_resp.choices[0].message.content).get("scenes", [])
             by_idx = {int(item.get("index", -1)): item.get("search_query", "") for item in parsed}
 
-            status.update(label="🖼️ Bước 3/4: Đang tải và xử lý khung hình 16:9 (Có thể mất 1-2 phút)...")
+            # 3. Lấy ảnh tức thì (Chỉ mất 1-2s / ảnh)
+            status.update(label="⚡ 3/4: Tải nhanh hình ảnh phù hợp...")
             concat_file = os.path.join(workdir, "concat.txt")
             with open(concat_file, "w", encoding="utf-8") as f_concat:
                 for idx, sc in enumerate(segments):
-                    query = by_idx.get(idx) or "scenic nature landscape"
-                    img_path = fetch_media(query, idx, pexels_key, workdir)
+                    query = by_idx.get(idx) or "stickman reaction"
+                    img_path = fetch_fast_media(query, idx, pexels_key, workdir)
                     dur_scene = max(1.0, sc["end"] - sc["start"])
                     f_concat.write(f"file '{os.path.abspath(img_path)}'\n")
                     f_concat.write(f"duration {dur_scene:.2f}\n")
@@ -138,7 +145,8 @@ Chỉ trả về JSON thuần túy theo định dạng: {{"scenes": [{{"index": 
                 last_img = os.path.join(workdir, f"media_{len(segments)-1:03d}.jpg")
                 f_concat.write(f"file '{os.path.abspath(last_img)}'\n")
 
-            status.update(label="⚡ Bước 4/4: Đang xuất video hoàn chỉnh...")
+            # 4. Render video
+            status.update(label="🎬 4/4: Ghép video MP4 16:9...")
             out_path = os.path.join(workdir, "output.mp4")
             cmd = [
                 "ffmpeg", "-y",
@@ -150,7 +158,7 @@ Chỉ trả về JSON thuần túy theo định dạng: {{"scenes": [{{"index": 
             ]
             subprocess.run(cmd, check=True)
 
-            status.update(label="✅ Đã tạo video thành công!", state="complete")
+            status.update(label="✅ Hoàn thành!", state="complete")
             
             with open(out_path, "rb") as vid_file:
                 video_bytes = vid_file.read()
@@ -165,7 +173,7 @@ Chỉ trả về JSON thuần túy theo định dạng: {{"scenes": [{{"index": 
             )
 
         except Exception as e:
-            status.update(label=f"❌ Thất bại: {str(e)}", state="error")
-            st.error(f"Chi tiết lỗi: {e}")
+            status.update(label=f"❌ Lỗi: {str(e)}", state="error")
+            st.error(f"Chi tiết: {e}")
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
