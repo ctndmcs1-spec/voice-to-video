@@ -14,7 +14,7 @@ import requests
 from PIL import Image, ImageOps
 from groq import Groq
 
-st.set_page_config(page_title="AI POV & Tâm Lý Video Maker", layout="centered")
+st.set_page_config(page_title="AI Story Video 16:9", layout="centered")
 
 W, H = 1280, 720
 FPS = 25
@@ -22,51 +22,25 @@ STT_MODEL = "whisper-large-v3"
 LLM_MODEL = "openai/gpt-oss-20b"
 PEXELS_PHOTO_URL = "https://api.pexels.com/v1/search"
 
-st.title("🎬 POV: Kể Chuyện Góc Khuất Tâm Lý & Nghề Nghiệp")
-st.caption("Tự động phân tích tâm lý nhân vật, bắt góc máy kịch tính & khử rung mượt mà")
+st.title("🎬 Video Kể Chuyện Điện Ảnh 16:9")
+st.caption("Khử rung Ken Burns, chống trùng ảnh và tối ưu file âm thanh dài")
 
 groq_key = st.text_input("Groq API Key (Bắt buộc)", type="password", placeholder="gsk_...")
-pexels_key = st.text_input("Pexels API Key (Tùy chọn)", type="password", placeholder="Nhập key Pexels để lấy ảnh stock thật siêu nhanh")
-
-# Thêm bộ chọn chủ đề POV chuyên sâu
-theme_choice = st.selectbox(
-    "Chọn Thể loại / Chủ đề Video:",
-    [
-        "POV Góc Khuất Tâm Lý (Thao túng, Ái kỷ, Sang chấn, Nội tâm)",
-        "POV Góc Khuất Nghề Nghiệp (Bác sĩ, Công sở, Tăng ca kiệt sức, Mặt tối ngành nghề)",
-        "Tự do (Theo sát văn bản)"
-    ]
-)
-
+pexels_key = st.text_input("Pexels API Key (Tùy chọn)", type="password", placeholder="Nhập key Pexels để tải ảnh thật siêu tốc")
 audio_file = st.file_uploader("Tải lên file Voice / Âm thanh", type=["mp3", "wav", "m4a", "ogg"])
 
-def fetch_unique_media(query: str, idx: int, p_key: str, workdir: str, used_urls: set, genre_tag: str) -> str:
+def fetch_unique_media(query: str, idx: int, p_key: str, workdir: str, used_urls: set) -> str:
     dest = os.path.join(workdir, f"media_{idx:03d}.jpg")
     downloaded = False
 
-    # Danh sách dự phòng tùy chỉnh đúng theo góc khuất tâm lý & công việc
-    if "Nghề Nghiệp" in genre_tag:
-        fallback_terms = [
-            "exhausted worker late night office",
-            "stressed doctor hospital corridor",
-            "overworked employee desk dark",
-            "corridor silhouette mystery job"
-        ]
-    else:
-        fallback_terms = [
-            "psychological manipulation shadow",
-            "stressed person mirror reflection",
-            "dark room lonely person sitting",
-            "fake smile depressed portrait"
-        ]
-
-    search_candidates = [
-        f"{query} cinematic moody",
-        query,
-        query.split(",")[0]
-    ] + fallback_terms
-
     if p_key and p_key.strip():
+        search_candidates = [
+            query,
+            query.split(",")[0],
+            "student studying focus",
+            "psychology thinking desk",
+            "reading book library"
+        ]
         for term in search_candidates:
             if downloaded:
                 break
@@ -89,10 +63,9 @@ def fetch_unique_media(query: str, idx: int, p_key: str, workdir: str, used_urls
             except Exception:
                 continue
 
-    # Kho Lexica hỗ trợ tạo khung hình dark cinematic
     if not downloaded:
         try:
-            lexica_url = f"https://lexica.art/api/v1/search?q={urllib.parse.quote(query + ' cinematic dramatic shadows dark room 35mm photography')}"
+            lexica_url = f"https://lexica.art/api/v1/search?q={urllib.parse.quote(query + ' cinematic lighting realistic')}"
             r = requests.get(lexica_url, timeout=7)
             if r.ok and r.json().get("images"):
                 images = r.json()["images"]
@@ -110,7 +83,7 @@ def fetch_unique_media(query: str, idx: int, p_key: str, workdir: str, used_urls
             pass
 
     if not downloaded:
-        img = Image.new('RGB', (W, H), color=(15, 18, 24))
+        img = Image.new('RGB', (W, H), color=(20, 24, 32))
         img.save(dest, "JPEG")
         return dest
 
@@ -119,7 +92,7 @@ def fetch_unique_media(query: str, idx: int, p_key: str, workdir: str, used_urls
             fitted = ImageOps.fit(img.convert("RGB"), (W, H), Image.LANCZOS)
             fitted.save(dest, "JPEG", quality=90)
     except Exception:
-        img = Image.new('RGB', (W, H), color=(15, 18, 24))
+        img = Image.new('RGB', (W, H), color=(20, 24, 32))
         img.save(dest, "JPEG")
 
     return dest
@@ -152,14 +125,14 @@ def create_kenburns_clip(img_path: str, duration: float, out_clip: str, mode: in
     ]
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-if st.button("⚡ Bắt Đầu Dựng Video POV", use_container_width=True, type="primary"):
+if st.button("⚡ Bắt Đầu Dựng Video", use_container_width=True, type="primary"):
     if not groq_key or not groq_key.strip():
         st.error("Vui lòng nhập Groq API Key!")
     elif not audio_file:
         st.error("Vui lòng tải file âm thanh lên trước!")
     else:
-        status = st.status("Đang khởi động tiến trình dựng phim POV...", expanded=True)
-        workdir = tempfile.mkdtemp(prefix="pov_v2v_")
+        status = st.status("Đang khởi động tiến trình dựng phim...", expanded=True)
+        workdir = tempfile.mkdtemp(prefix="kb_fix_")
         used_urls = set()
 
         try:
@@ -173,7 +146,7 @@ if st.button("⚡ Bắt Đầu Dựng Video POV", use_container_width=True, type
             client = Groq(api_key=groq_key.strip())
 
             # 1. Bóc tách âm thanh
-            status.update(label="🎙️ 1/4: Bóc tách lời thoại và tính toán nhịp ngắt câu...")
+            status.update(label="🎙️ 1/4: Đang phân tích lời thoại...")
             with open(audio_path, "rb") as fh:
                 resp = client.audio.transcriptions.create(
                     file=fh, model=STT_MODEL, response_format="verbose_json"
@@ -181,6 +154,7 @@ if st.button("⚡ Bắt Đầu Dựng Video POV", use_container_width=True, type
             data = resp.model_dump() if hasattr(resp, "model_dump") else dict(resp)
             raw_segs = data.get("segments") or []
 
+            # Gộp các câu quá ngắn để cảnh giữ tối thiểu 4-6s
             segments = []
             cur_text = ""
             cur_start = 0.0
@@ -195,6 +169,7 @@ if st.button("⚡ Bắt Đầu Dựng Video POV", use_container_width=True, type
                 else:
                     cur_text += " " + t
 
+                # Mỗi cảnh tối thiểu 4.5s hoặc câu kết
                 if float(seg["end"]) - cur_start >= 4.5:
                     segments.append({"start": cur_start, "end": float(seg["end"]), "text": cur_text})
                     cur_text = ""
@@ -204,7 +179,7 @@ if st.button("⚡ Bắt Đầu Dựng Video POV", use_container_width=True, type
                 segments.append({"start": cur_start, "end": end_time, "text": cur_text})
 
             if not segments:
-                segments.append({"start": 0.0, "end": total_audio_dur, "text": "psychological drama"})
+                segments.append({"start": 0.0, "end": total_audio_dur, "text": "learning and education"})
 
             for i in range(len(segments)):
                 if i < len(segments) - 1:
@@ -212,29 +187,21 @@ if st.button("⚡ Bắt Đầu Dựng Video POV", use_container_width=True, type
                 else:
                     segments[i]["duration"] = max(2.0, total_audio_dur - segments[i]["start"])
 
-            # 2. Phân tích ngữ cảnh POV chuyên sâu
-            status.update(label=f"🧠 2/4: AI xây dựng góc máy điện ảnh cho thể loại: {theme_choice}...")
+            # 2. Phân tích kịch bản (Xử lý an toàn tránh vỡ JSON)
+            status.update(label="🧠 2/4: AI lên danh sách hình ảnh phong phú...")
             by_idx = {}
+            # Chia thành từng batch 15 cảnh nếu kịch bản quá dài
             batch_size = 15
-
-            if "Nghề Nghiệp" in theme_choice:
-                context_guide = "Focus on workplace dark sides: exhausted doctors, tired workers in dimly lit offices, toxic boss meetings, hospital corridors at night, stressful clock ticking, paper piles, burnout expressions."
-            else:
-                context_guide = "Focus on psychological tension: covert narcissism, manipulation, gaslighting, cold stares, fake smiles, shadows behind curtains, double face masks, toxic relationship distance, isolated person looking in mirror."
-
             for b_start in range(0, len(segments), batch_size):
                 sub_segs = segments[b_start:b_start + batch_size]
-                transcript_text = "\n".join([f"[{i + b_start}] {s['text'][:90]}" for i, s in enumerate(sub_segs)])
-                prompt = f"""You are a cinema visual director specializing in psychological drama and dark reality POV.
-Analyze these lines and create 1 vivid, specific English visual search query (3-5 words) for each index.
-Rule: {context_guide}
-ABSOLUTELY NO school kids or generic classrooms unless explicitly mentioned.
-
+                transcript_text = "\n".join([f"[{i + b_start}] {s['text'][:80]}" for i, s in enumerate(sub_segs)])
+                prompt = f"""Extract 1 specific English visual keyword (3-5 words) for each index.
+Diverse subjects: student studying, classroom, library books, exam tension, writing on desk, clock ticking.
 Lines:
 {transcript_text}
 
-Return STRICT JSON:
-{{"scenes": [{{"index": {b_start}, "search_query": "exhausted person in dark room thinking"}}]}}"""
+Return strictly a JSON object:
+{{"scenes": [{{"index": {b_start}, "search_query": "student writing exam paper"}}]}}"""
 
                 try:
                     llm_resp = client.chat.completions.create(
@@ -243,6 +210,7 @@ Return STRICT JSON:
                         temperature=0.3
                     )
                     content = llm_resp.choices[0].message.content
+                    # Tìm khối JSON trong câu trả lời
                     match = re.search(r'\{.*\}', content, re.DOTALL)
                     if match:
                         parsed = json.loads(match.group(0)).get("scenes", [])
@@ -251,20 +219,20 @@ Return STRICT JSON:
                 except Exception:
                     pass
 
-            # 3. Tải ảnh khớp chủ đề
-            status.update(label="🎥 3/4: Đang gom ảnh điện ảnh & xử lý chuyển động Ken Burns...")
+            # 3. Gom ảnh và tạo clip Ken Burns
+            status.update(label="🎥 3/4: Tải ảnh độc bản & tạo chuyển động Ken Burns...")
             clips_txt = os.path.join(workdir, "clips.txt")
             with open(clips_txt, "w", encoding="utf-8") as f_clips:
                 for idx, sc in enumerate(segments):
-                    query = by_idx.get(idx) or "psychological tension mystery"
-                    img_path = fetch_unique_media(query, idx, pexels_key, workdir, used_urls, theme_choice)
+                    query = by_idx.get(idx) or "college student studying desk"
+                    img_path = fetch_unique_media(query, idx, pexels_key, workdir, used_urls)
                     clip_out = os.path.join(workdir, f"clip_{idx:03d}.mp4")
 
                     create_kenburns_clip(img_path, sc["duration"], clip_out, mode=idx)
                     f_clips.write(f"file '{os.path.abspath(clip_out)}'\n")
 
-            # 4. Xuất video
-            status.update(label="⚡ 4/4: Ghép video hoàn chỉnh...", state="running")
+            # 4. Xuất video hoàn thiện
+            status.update(label="⚡ 4/4: Ghép video và đồng bộ âm thanh...")
             out_path = os.path.join(workdir, "output.mp4")
             cmd = [
                 "ffmpeg", "-y",
@@ -277,7 +245,7 @@ Return STRICT JSON:
             ]
             subprocess.run(cmd, check=True)
 
-            status.update(label="✅ Video POV hoàn thành xuất sắc!", state="complete")
+            status.update(label="✅ Hoàn thành dựng video!", state="complete")
 
             with open(out_path, "rb") as vid_file:
                 video_bytes = vid_file.read()
@@ -286,7 +254,7 @@ Return STRICT JSON:
             st.download_button(
                 label="⬇️ Tải Video Về Máy",
                 data=video_bytes,
-                file_name=f"pov_{int(time.time())}.mp4",
+                file_name=f"story_{int(time.time())}.mp4",
                 mime="video/mp4",
                 use_container_width=True
             )
