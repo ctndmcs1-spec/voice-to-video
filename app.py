@@ -32,9 +32,8 @@ audio_file = st.file_uploader("Tải lên file Voice / Âm thanh", type=["mp3", 
 
 def fetch_media(query: str, idx: int, p_key: str, workdir: str) -> str:
     dest = os.path.join(workdir, f"media_{idx:03d}.jpg")
-    downloaded = False
     
-    # 1. Thử lấy ảnh thật từ Pexels (nếu có key)
+    # 1. Lấy ảnh thật từ Pexels
     if p_key and p_key.strip():
         try:
             url = f"{PEXELS_PHOTO_URL}?query={urllib.parse.quote(query)}&per_page=1&orientation=landscape"
@@ -44,30 +43,40 @@ def fetch_media(query: str, idx: int, p_key: str, workdir: str) -> str:
                 img_data = requests.get(img_url, timeout=20).content
                 with open(dest, "wb") as f:
                     f.write(img_data)
-                downloaded = True
+                
+                # Kiểm tra và resize ảnh
+                with Image.open(dest) as img:
+                    fitted = ImageOps.fit(img.convert("RGB"), (W, H), Image.LANCZOS)
+                    fitted.save(dest, "JPEG", quality=90)
+                return dest
         except Exception:
-            downloaded = False
+            pass # Nếu Pexels lỗi, tự động trôi xuống dùng Pollinations AI
 
-    # 2. Nếu không có Pexels, dùng AI vẽ ảnh
-    if not downloaded:
-        try:
-            safe_q = urllib.parse.quote(f"cinematic 16:9 landscape photography, {query}"[:160])
-            ai_url = POLLINATIONS_URL.format(prompt=safe_q, seed=random.randint(1, 99999))
-            # Tăng timeout lên 90s để chống sập khi server load chậm
-            img_data = requests.get(ai_url, timeout=90).content
-            with open(dest, "wb") as f:
-                f.write(img_data)
-        except Exception as e:
-            # LỚP BẢO VỆ CHỐNG SẬP: Nếu vẽ ảnh vẫn lỗi, tạo ảnh đen có chữ để video đi tiếp
-            img = Image.new('RGB', (W, H), color=(30, 30, 30))
-            img.save(dest, "JPEG")
-            return dest
-
-    # Resize ảnh cho đúng chuẩn 16:9
-    with Image.open(dest) as img:
-        fitted = ImageOps.fit(img.convert("RGB"), (W, H), Image.LANCZOS)
-        fitted.save(dest, "JPEG", quality=90)
-    return dest
+    # 2. Dùng AI vẽ ảnh & BỘ LỌC ẢNH GIẢ
+    try:
+        safe_q = urllib.parse.quote(f"cinematic 16:9 landscape photography, {query}"[:160])
+        ai_url = POLLINATIONS_URL.format(prompt=safe_q, seed=random.randint(1, 99999))
+        
+        # Tải ảnh từ Pollinations
+        r = requests.get(ai_url, timeout=90)
+        r.raise_for_status() # Bắt lỗi server (404, 500...)
+        
+        with open(dest, "wb") as f:
+            f.write(r.content)
+            
+        # Thử mở ảnh. Nếu đây là HTML/Text báo lỗi, lệnh này sẽ văng lỗi ngay lập tức
+        with Image.open(dest) as img:
+            fitted = ImageOps.fit(img.convert("RGB"), (W, H), Image.LANCZOS)
+            fitted.save(dest, "JPEG", quality=90)
+            
+        return dest
+        
+    except Exception:
+        # 3. LỚP BẢO VỆ CUỐI CÙNG: Mạng rớt, server quá tải, hoặc trả về ảnh giả
+        # Tạo ảnh đen trơn để chèn vào video, giúp quá trình chạy tiếp không bị sập
+        img = Image.new('RGB', (W, H), color=(30, 30, 30))
+        img.save(dest, "JPEG")
+        return dest
 
 if st.button("⚡ Bắt Đầu Tạo Video", use_container_width=True, type="primary"):
     if not groq_key or not groq_key.strip():
