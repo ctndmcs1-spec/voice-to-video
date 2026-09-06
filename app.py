@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import os
+import re
 import json
 import random
 import shutil
@@ -22,7 +23,7 @@ LLM_MODEL = "openai/gpt-oss-20b"
 PEXELS_PHOTO_URL = "https://api.pexels.com/v1/search"
 
 st.title("🎬 Video Kể Chuyện Điện Ảnh 16:9")
-st.caption("Ken Burns mượt mà, đồng bộ nhịp voice và chống trùng lặp ảnh 100%")
+st.caption("Khử rung Ken Burns, chống trùng ảnh và tối ưu file âm thanh dài")
 
 groq_key = st.text_input("Groq API Key (Bắt buộc)", type="password", placeholder="gsk_...")
 pexels_key = st.text_input("Pexels API Key (Tùy chọn)", type="password", placeholder="Nhập key Pexels để tải ảnh thật siêu tốc")
@@ -31,33 +32,30 @@ audio_file = st.file_uploader("Tải lên file Voice / Âm thanh", type=["mp3", 
 def fetch_unique_media(query: str, idx: int, p_key: str, workdir: str, used_urls: set) -> str:
     dest = os.path.join(workdir, f"media_{idx:03d}.jpg")
     downloaded = False
-    
-    # 1. Thử lấy Pexels (Có cơ chế chống lặp bằng used_urls và phân trang)
+
     if p_key and p_key.strip():
         search_candidates = [
             query,
             query.split(",")[0],
             "student studying focus",
-            "psychology concept thinking",
-            "books and learning desk"
+            "psychology thinking desk",
+            "reading book library"
         ]
         for term in search_candidates:
             if downloaded:
                 break
             try:
-                # Tìm kiếm 15 ảnh mỗi lần để có nhiều lựa chọn khác nhau
-                page = (idx % 3) + 1
+                page = (idx % 4) + 1
                 url = f"{PEXELS_PHOTO_URL}?query={urllib.parse.quote(term)}&per_page=15&page={page}&orientation=landscape"
                 r = requests.get(url, headers={"Authorization": p_key.strip()}, timeout=6)
                 if r.ok and r.json().get("photos"):
                     photos = r.json()["photos"]
-                    # Lọc ra những ảnh chưa từng dùng ở các cảnh trước
                     new_photos = [p for p in photos if p["src"]["large2x"] not in used_urls]
                     selected = new_photos[0] if new_photos else photos[0]
-                    
+
                     img_url = selected["src"]["large2x"]
                     used_urls.add(img_url)
-                    
+
                     img_data = requests.get(img_url, timeout=10).content
                     with open(dest, "wb") as f:
                         f.write(img_data)
@@ -65,19 +63,18 @@ def fetch_unique_media(query: str, idx: int, p_key: str, workdir: str, used_urls
             except Exception:
                 continue
 
-    # 2. Kho Lexica (Nếu không có Pexels hoặc Pexels hỏng)
     if not downloaded:
         try:
-            lexica_url = f"https://lexica.art/api/v1/search?q={urllib.parse.quote(query + ' cinematic realistic lighting')}"
+            lexica_url = f"https://lexica.art/api/v1/search?q={urllib.parse.quote(query + ' cinematic lighting realistic')}"
             r = requests.get(lexica_url, timeout=7)
             if r.ok and r.json().get("images"):
                 images = r.json()["images"]
                 new_images = [img for img in images if img["src"] not in used_urls]
                 selected_img = new_images[0] if new_images else images[0]
-                
+
                 img_url = selected_img["src"]
                 used_urls.add(img_url)
-                
+
                 img_data = requests.get(img_url, timeout=10).content
                 with open(dest, "wb") as f:
                     f.write(img_data)
@@ -85,7 +82,6 @@ def fetch_unique_media(query: str, idx: int, p_key: str, workdir: str, used_urls
         except Exception:
             pass
 
-    # 3. Fallback màu nền nếu mất mạng
     if not downloaded:
         img = Image.new('RGB', (W, H), color=(20, 24, 32))
         img.save(dest, "JPEG")
@@ -102,7 +98,6 @@ def fetch_unique_media(query: str, idx: int, p_key: str, workdir: str, used_urls
     return dest
 
 def create_kenburns_clip(img_path: str, duration: float, out_clip: str, mode: int = 0):
-    """Zoom mượt khử rung bằng bộ lọc 2K nội bộ"""
     frames = max(25, int(duration * FPS))
     step = 0.18 / frames
 
@@ -137,9 +132,9 @@ if st.button("⚡ Bắt Đầu Dựng Video", use_container_width=True, type="pr
         st.error("Vui lòng tải file âm thanh lên trước!")
     else:
         status = st.status("Đang khởi động tiến trình dựng phim...", expanded=True)
-        workdir = tempfile.mkdtemp(prefix="kb_unique_")
+        workdir = tempfile.mkdtemp(prefix="kb_fix_")
         used_urls = set()
-        
+
         try:
             audio_path = os.path.join(workdir, audio_file.name)
             with open(audio_path, "wb") as f:
@@ -150,8 +145,8 @@ if st.button("⚡ Bắt Đầu Dựng Video", use_container_width=True, type="pr
 
             client = Groq(api_key=groq_key.strip())
 
-            # 1. Bóc tách giọng nói
-            status.update(label="🎙️ 1/4: Phân tích mốc thời gian từng câu thoại...")
+            # 1. Bóc tách âm thanh
+            status.update(label="🎙️ 1/4: Đang phân tích lời thoại...")
             with open(audio_path, "rb") as fh:
                 resp = client.audio.transcriptions.create(
                     file=fh, model=STT_MODEL, response_format="verbose_json"
@@ -159,61 +154,85 @@ if st.button("⚡ Bắt Đầu Dựng Video", use_container_width=True, type="pr
             data = resp.model_dump() if hasattr(resp, "model_dump") else dict(resp)
             raw_segs = data.get("segments") or []
 
+            # Gộp các câu quá ngắn để cảnh giữ tối thiểu 4-6s
             segments = []
+            cur_text = ""
+            cur_start = 0.0
+
             for seg in raw_segs:
                 t = (seg.get("text") or "").strip()
-                if t:
-                    segments.append({"start": float(seg["start"]), "end": float(seg["end"]), "text": t})
+                if not t:
+                    continue
+                if not cur_text:
+                    cur_start = float(seg["start"])
+                    cur_text = t
+                else:
+                    cur_text += " " + t
+
+                # Mỗi cảnh tối thiểu 4.5s hoặc câu kết
+                if float(seg["end"]) - cur_start >= 4.5:
+                    segments.append({"start": cur_start, "end": float(seg["end"]), "text": cur_text})
+                    cur_text = ""
+
+            if cur_text:
+                end_time = float(raw_segs[-1]["end"]) if raw_segs else total_audio_dur
+                segments.append({"start": cur_start, "end": end_time, "text": cur_text})
 
             if not segments:
-                segments.append({"start": 0.0, "end": total_audio_dur, "text": "learning and psychology"})
+                segments.append({"start": 0.0, "end": total_audio_dur, "text": "learning and education"})
 
-            # Khớp nhịp thời lượng
             for i in range(len(segments)):
                 if i < len(segments) - 1:
-                    segments[i]["duration"] = max(1.0, segments[i+1]["start"] - segments[i]["start"])
+                    segments[i]["duration"] = max(2.0, segments[i+1]["start"] - segments[i]["start"])
                 else:
-                    segments[i]["duration"] = max(1.0, total_audio_dur - segments[i]["start"])
+                    segments[i]["duration"] = max(2.0, total_audio_dur - segments[i]["start"])
 
-            # 2. Ép LLM tạo từ khóa phong phú và không trùng lặp ý tưởng
-            status.update(label="🧠 2/4: AI lên kịch bản hình ảnh đa dạng (chống lặp cảnh)...")
-            transcript_text = "\n".join([f"[{i}] {s['text']}" for i, s in enumerate(segments)])
-            prompt = f"""
-            Bạn là đạo diễn hình ảnh cho video kiến thức/tâm lý học.
-            Dựa trên kịch bản sau gồm {len(segments)} đoạn, hãy trích xuất cho MỖI đoạn 1 từ khóa hình ảnh tiếng Anh cụ thể (3-5 từ).
-            YÊU CẦU QUAN TRỌNG:
-            - Mỗi cảnh phải là một hình ảnh HOÀN TOÀN MỚI LẠ và ĐA DẠNG (ví dụ: student writing notes, library bookshelf, ticking wall clock, exam paper stress, open notebook coffee, teacher whiteboard, person looking in mirror, high school hallway).
-            - KHÔNG lặp lại các từ khóa trừu tượng như 'illusion' hay 'brain mask' cho nhiều cảnh.
-            
-            Kịch bản:
-            {transcript_text}
+            # 2. Phân tích kịch bản (Xử lý an toàn tránh vỡ JSON)
+            status.update(label="🧠 2/4: AI lên danh sách hình ảnh phong phú...")
+            by_idx = {}
+            # Chia thành từng batch 15 cảnh nếu kịch bản quá dài
+            batch_size = 15
+            for b_start in range(0, len(segments), batch_size):
+                sub_segs = segments[b_start:b_start + batch_size]
+                transcript_text = "\n".join([f"[{i + b_start}] {s['text'][:80]}" for i, s in enumerate(sub_segs)])
+                prompt = f"""Extract 1 specific English visual keyword (3-5 words) for each index.
+Diverse subjects: student studying, classroom, library books, exam tension, writing on desk, clock ticking.
+Lines:
+{transcript_text}
 
-            Chỉ trả về JSON thuần túy theo định dạng:
-            {{"scenes": [{{"index": 0, "search_query": "student taking notes in notebook"}}]}}
-            """
+Return strictly a JSON object:
+{{"scenes": [{{"index": {b_start}, "search_query": "student writing exam paper"}}]}}"""
 
-            llm_resp = client.chat.completions.create(
-                model=LLM_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                response_format={"type": "json_object"}
-            )
-            parsed = json.loads(llm_resp.choices[0].message.content).get("scenes", [])
-            by_idx = {int(item.get("index", -1)): item.get("search_query", "") for item in parsed}
+                try:
+                    llm_resp = client.chat.completions.create(
+                        model=LLM_MODEL,
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.3
+                    )
+                    content = llm_resp.choices[0].message.content
+                    # Tìm khối JSON trong câu trả lời
+                    match = re.search(r'\{.*\}', content, re.DOTALL)
+                    if match:
+                        parsed = json.loads(match.group(0)).get("scenes", [])
+                        for item in parsed:
+                            by_idx[int(item.get("index", -1))] = item.get("search_query", "")
+                except Exception:
+                    pass
 
-            # 3. Tải ảnh duy nhất & dựng clip Ken Burns
-            status.update(label="🎥 3/4: Tải ảnh độc bản và render chuyển động Ken Burns...")
+            # 3. Gom ảnh và tạo clip Ken Burns
+            status.update(label="🎥 3/4: Tải ảnh độc bản & tạo chuyển động Ken Burns...")
             clips_txt = os.path.join(workdir, "clips.txt")
             with open(clips_txt, "w", encoding="utf-8") as f_clips:
                 for idx, sc in enumerate(segments):
                     query = by_idx.get(idx) or "college student studying desk"
                     img_path = fetch_unique_media(query, idx, pexels_key, workdir, used_urls)
                     clip_out = os.path.join(workdir, f"clip_{idx:03d}.mp4")
-                    
+
                     create_kenburns_clip(img_path, sc["duration"], clip_out, mode=idx)
                     f_clips.write(f"file '{os.path.abspath(clip_out)}'\n")
 
             # 4. Xuất video hoàn thiện
-            status.update(label="⚡ 4/4: Ghép video và xuất file MP4...")
+            status.update(label="⚡ 4/4: Ghép video và đồng bộ âm thanh...")
             out_path = os.path.join(workdir, "output.mp4")
             cmd = [
                 "ffmpeg", "-y",
@@ -226,8 +245,8 @@ if st.button("⚡ Bắt Đầu Dựng Video", use_container_width=True, type="pr
             ]
             subprocess.run(cmd, check=True)
 
-            status.update(label="✅ Đã tạo xong video hoàn chỉnh!", state="complete")
-            
+            status.update(label="✅ Hoàn thành dựng video!", state="complete")
+
             with open(out_path, "rb") as vid_file:
                 video_bytes = vid_file.read()
 
