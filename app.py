@@ -18,18 +18,16 @@ st.set_page_config(page_title="AI Voice to Video 16:9", layout="centered")
 W, H = 1280, 720
 FPS = 25
 STT_MODEL = "whisper-large-v3"
-LLM_MODEL = "llama-3.3-70b-versatile"
+LLM_MODEL = "openai/gpt-oss-20b"
 PEXELS_PHOTO_URL = "https://api.pexels.com/v1/search"
 POLLINATIONS_URL = "https://image.pollinations.ai/prompt/{prompt}?width=1280&height=720&nologo=true&seed={seed}"
 
 st.title("🎬 Tạo Video 16:9 Tự Động")
 st.caption("Bóc tách giọng nói, phân tích cảnh và ghép video MP4 chuẩn YouTube")
 
-with st.sidebar:
-    st.header("Cấu hình API")
-    groq_key = st.text_input("Groq API Key (Bắt buộc)", type="password", placeholder="gsk_...")
-    pexels_key = st.text_input("Pexels API Key (Tùy chọn)", type="password", placeholder="Để trống nếu dùng ảnh AI")
-    st.info("Nếu không có key Pexels, tool sẽ tự động tạo ảnh bối cảnh qua AI.")
+# Đưa thẳng ô nhập API ra màn hình chính cho dễ thao tác trên điện thoại
+groq_key = st.text_input("Groq API Key (Bắt buộc)", type="password", placeholder="gsk_...")
+pexels_key = st.text_input("Pexels API Key (Tùy chọn, để trống dùng ảnh AI)", type="password", placeholder="Để trống nếu muốn AI tự tạo ảnh")
 
 audio_file = st.file_uploader("Tải lên file Voice / Âm thanh", type=["mp3", "wav", "m4a", "ogg"])
 
@@ -63,24 +61,23 @@ def fetch_media(query: str, idx: int, p_key: str, workdir: str) -> str:
     return dest
 
 if st.button("⚡ Bắt Đầu Tạo Video", use_container_width=True, type="primary"):
-    if not audio_file:
+    if not groq_key or not groq_key.strip():
+        st.error("Vui lòng nhập Groq API Key!")
+    elif not audio_file:
         st.error("Vui lòng tải file âm thanh lên trước!")
-    elif not groq_key.strip():
-        st.error("Vui lòng nhập Groq API Key ở thanh bên trái!")
     else:
         status = st.status("Đang khởi động tiến trình...", expanded=True)
         workdir = tempfile.mkdtemp(prefix="s2v_")
         
         try:
-            # Lưu file âm thanh tạm thời
             audio_path = os.path.join(workdir, audio_file.name)
             with open(audio_path, "wb") as f:
                 f.write(audio_file.getbuffer())
 
             client = Groq(api_key=groq_key.strip())
 
-            # 1. Whisper bóc tách giọng nói
-            status.update(label="🎙️ Bước 1/4: Đang bóc tách lời thoại qua Groq Whisper...")
+            # 1. Bóc tách giọng nói
+            status.update(label="🎙️ Bước 1/4: Đang bóc tách lời thoại qua Whisper...")
             with open(audio_path, "rb") as fh:
                 resp = client.audio.transcriptions.create(
                     file=fh, model=STT_MODEL, response_format="verbose_json"
@@ -97,12 +94,12 @@ if st.button("⚡ Bắt Đầu Tạo Video", use_container_width=True, type="pri
                 dur = float(subprocess.run(cmd_dur, capture_output=True, text=True).stdout.strip() or 5.0)
                 segments.append({"start": 0.0, "end": dur, "text": data.get("text", "scenic landscape")})
 
-            # 2. LLM lập danh sách bối cảnh
+            # 2. Phân tích bối cảnh qua LLM
             status.update(label="🧠 Bước 2/4: AI đang phân tích nội dung và chọn bối cảnh...")
             transcript_text = "\n".join([f"[{i}] {s['text']}" for i, s in enumerate(segments)])
-            prompt = f"""Phân tích các đoạn sau và trích xuất cho MỖI đoạn 1 từ khóa tiếng Anh (2-4 từ, phong cảnh 16:9 cinematic):
+            prompt = f"""Phân tích các đoạn kịch bản sau và trích xuất cho MỖI đoạn 1 từ khóa tiếng Anh (2-4 từ, phong cảnh 16:9 cinematic):
 {transcript_text}
-Chỉ trả về JSON thuần túy: {{"scenes": [{{"index": 0, "search_query": "concrete visual keyword"}}]}}"""
+Chỉ trả về JSON thuần túy theo định dạng: {{"scenes": [{{"index": 0, "search_query": "concrete visual keyword"}}]}}"""
 
             llm_resp = client.chat.completions.create(
                 model=LLM_MODEL,
@@ -141,7 +138,6 @@ Chỉ trả về JSON thuần túy: {{"scenes": [{{"index": 0, "search_query": "
 
             status.update(label="✅ Đã tạo video thành công!", state="complete")
             
-            # Đọc video hiển thị ra màn hình
             with open(out_path, "rb") as vid_file:
                 video_bytes = vid_file.read()
 
