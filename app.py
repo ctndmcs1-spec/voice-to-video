@@ -228,17 +228,30 @@ def fetch_broll_clip(query_en: str, idx: int, duration: float, p_key: str, workd
     return None
 
 def create_kenburns_clip(img_path: str, duration: float, out_clip: str, mode: int = 0):
-    """Zoom/Lia máy 2K mượt mà cho 60% cảnh ảnh tĩnh"""
+    """Đa dạng hóa chuyển động: Zoom In, Zoom Out, Lia Trái -> Phải, Lia Phải -> Trái"""
     frames = max(25, int(duration * FPS))
-    step = 0.16 / frames
+    step = 0.15 / frames
+    m = mode % 4
 
-    if mode % 2 == 0:
-        z_expr = f"min(zoom+{step:.6f},1.16)"
+    if m == 0:
+        # 1. Slow Zoom In (Tiến vào tâm)
+        z_expr = f"min(zoom+{step:.6f},1.15)"
+        x_expr = "iw/2-(iw/zoom/2)"
+        y_expr = "ih/2-(ih/zoom/2)"
+    elif m == 1:
+        # 2. Pan Left -> Right (Phóng nhẹ 1.15x rồi lia máy từ trái sang phải)
+        z_expr = "1.15"
+        x_expr = f"(iw-iw/zoom)*(on/{frames})"
+        y_expr = "ih/2-(ih/zoom/2)"
+    elif m == 2:
+        # 3. Slow Zoom Out (Lùi từ tâm ra toàn cảnh)
+        z_expr = f"if(eq(on,1),1.15,max(1.0,zoom-{step:.6f}))"
         x_expr = "iw/2-(iw/zoom/2)"
         y_expr = "ih/2-(ih/zoom/2)"
     else:
-        z_expr = f"if(eq(on,1),1.16,max(1.0,zoom-{step:.6f}))"
-        x_expr = "iw/2-(iw/zoom/2)"
+        # 4. Pan Right -> Left (Phóng nhẹ 1.15x rồi lia máy từ phải sang trái)
+        z_expr = "1.15"
+        x_expr = f"(iw-iw/zoom)*(1-on/{frames})"
         y_expr = "ih/2-(ih/zoom/2)"
 
     filter_complex = (
@@ -255,6 +268,7 @@ def create_kenburns_clip(img_path: str, duration: float, out_clip: str, mode: in
         out_clip
     ]
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+
 
 # ==============================================================================
 # PIPELINE ĐIỀU PHỐI CHÍNH
