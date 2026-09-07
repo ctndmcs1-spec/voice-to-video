@@ -11,11 +11,11 @@ import urllib.parse
 
 import streamlit as st
 import requests
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageDraw
 from groq import Groq
 from duckduckgo_search import DDGS
 
-st.set_page_config(page_title="Production Story Video Engine", layout="centered")
+st.set_page_config(page_title="Visual Novel POV Engine Pro", layout="centered")
 
 W, H = 1280, 720
 FPS = 25
@@ -24,79 +24,78 @@ LLM_MODEL = "openai/gpt-oss-20b"
 PEXELS_PHOTO_URL = "https://api.pexels.com/v1/search"
 PEXELS_VIDEO_URL = "https://api.pexels.com/videos/search"
 
-st.title("🎬 Production Video Engine: Kể Chuyện Đời Thực & Tâm Lý")
-st.caption("Khử triệt để màn đen, chuẩn ngữ cảnh tâm lý, Ken Burns 2K và xen kẽ B-roll không trùng")
+st.title("🎬 Cỗ Máy Dựng Phim POV Hoạt Họa 2D")
+st.caption("Tự động tách nền trắng, dàn cảnh 3 lớp: Bối cảnh Việt Nam + Nhân vật hoạt họa + Hộp thoại")
 
 groq_key = st.text_input("Groq API Key (Bắt buộc)", type="password", placeholder="gsk_...")
-pexels_key = st.text_input("Pexels API Key (Khuyên dùng để lấy B-roll HD)", type="password", placeholder="Nhập key Pexels...")
-audio_file = st.file_uploader("Tải lên file Voice lời thoại", type=["mp3", "wav", "m4a", "ogg"])
+pexels_key = st.text_input("Pexels API Key (Tùy chọn B-roll HD)", type="password", placeholder="Key Pexels...")
+audio_file = st.file_uploader("Tải lên file Voice âm thanh", type=["mp3", "wav", "m4a", "ogg"])
 
-# Kho dự phòng an toàn (Không bao giờ để video bị màn đen)
-SAFE_FALLBACK_TERMS = [
-    "lonely person dark room shadow",
-    "man looking out window night city",
-    "stressed face dark cinematic lighting",
-    "empty dark room chair table lamp",
-    "silhouette walking alone street night",
-    "person sitting alone thinking moody"
+POSES = [
+    "nhan_vat_binh_thuong.png",
+    "nhan_vat_suy_nghi.png",
+    "nhan_vat_soc.png",
+    "nhan_vat_kiet_suc.png",
+    "nhan_vat_chi_tay.png"
 ]
 
-def fetch_safe_backup_image(query: str, idx: int, p_key: str, workdir: str, used_urls: set) -> str:
-    """Tải ảnh chất lượng cao dự phòng khi cào mạng nội địa thất bại, chặn đứng màn đen"""
-    dest = os.path.join(workdir, f"backup_{idx:03d}.jpg")
-    term = random.choice(SAFE_FALLBACK_TERMS) if not query else query
-
-    if p_key and p_key.strip():
-        try:
-            url = f"{PEXELS_PHOTO_URL}?query={urllib.parse.quote(term)}&per_page=10&page={(idx % 3) + 1}&orientation=landscape"
-            r = requests.get(url, headers={"Authorization": p_key.strip()}, timeout=6)
-            if r.ok and r.json().get("photos"):
-                for p in r.json()["photos"]:
-                    u = p["src"]["large2x"]
-                    if u not in used_urls:
-                        used_urls.add(u)
-                        data = requests.get(u, timeout=8).content
-                        with open(dest, "wb") as f:
-                            f.write(data)
-                        return dest
-        except Exception:
-            pass
-
-    # Nếu không có key Pexels: Lấy từ Lexica theo phong cách điện ảnh tối màu
+def make_white_transparent(img_path: str, temp_dir: str) -> str:
+    """Tự động chuyển pixel trắng hoặc gần trắng thành trong suốt (RGBA alpha=0)"""
     try:
-        l_url = f"https://lexica.art/api/v1/search?q={urllib.parse.quote(term + ' moody cinematic dark room shadows 35mm')}"
-        r = requests.get(l_url, timeout=6)
-        if r.ok and r.json().get("images"):
-            for img_obj in r.json()["images"]:
-                u = img_obj["src"]
-                if u not in used_urls:
-                    used_urls.add(u)
-                    data = requests.get(u, timeout=8).content
-                    with open(dest, "wb") as f:
-                        f.write(data)
-                    return dest
+        base_name = os.path.basename(img_path)
+        out_path = os.path.join(temp_dir, f"trans_{base_name}")
+        with Image.open(img_path) as raw_img:
+            img = raw_img.convert("RGBA")
+            datas = img.getdata()
+            new_data = []
+            for item in datas:
+                # Ngưỡng RGB > 225 coi là nền trắng sáng
+                if item[0] > 225 and item[1] > 225 and item[2] > 225:
+                    new_data.append((255, 255, 255, 0))
+                else:
+                    new_data.append(item)
+            img.putdata(new_data)
+            img.save(out_path, "PNG")
+            return out_path
     except Exception:
-        pass
+        return img_path
 
-    # Trường hợp hy hữu: Tạo gradient nền điện ảnh (tuyệt đối không để đen thui)
-    img = Image.new('RGB', (W, H), color=(22, 25, 33))
-    img.save(dest, "JPEG")
-    return dest
+def init_mock_characters(assets_dir: str):
+    """Tạo phôi nhân vật hoạt họa viền đậm dự phòng nếu thư mục chưa có file ảnh"""
+    os.makedirs(assets_dir, exist_ok=True)
+    palette = {
+        "nhan_vat_binh_thuong.png": ((245, 230, 215), "NEUTRAL"),
+        "nhan_vat_suy_nghi.png": ((220, 235, 255), "THINKING"),
+        "nhan_vat_soc.png": ((255, 215, 215), "SHOCKED"),
+        "nhan_vat_kiet_suc.png": ((215, 215, 225), "EXHAUSTED"),
+        "nhan_vat_chi_tay.png": ((255, 245, 205), "POINTING")
+    }
+    for fname, (bg_col, tag) in palette.items():
+        p = os.path.join(assets_dir, fname)
+        if not os.path.exists(p):
+            img = Image.new("RGBA", (380, 560), (0, 0, 0, 0))
+            d = ImageDraw.Draw(img)
+            d.ellipse([90, 40, 290, 240], fill=bg_col, outline=(15, 15, 15), width=7)
+            d.rectangle([120, 110, 175, 150], outline=(15, 15, 15), width=6)
+            d.rectangle([205, 110, 260, 150], outline=(15, 15, 15), width=6)
+            d.line([175, 130, 205, 130], fill=(15, 15, 15), width=6)
+            d.rectangle([110, 240, 270, 520], fill=(35, 40, 50), outline=(15, 15, 15), width=7)
+            d.text((135, 340), tag, fill=(255, 255, 255))
+            img.save(p, "PNG")
 
-def crawl_vietnam_media(query_vn: str, idx: int, workdir: str, used_urls: set, p_key: str) -> str:
-    """Cào ảnh thực tế từ mạng Việt Nam, kiểm tra kích thước và loại bỏ ảnh lỗi"""
-    dest = os.path.join(workdir, f"media_{idx:03d}.jpg")
+def crawl_vietnam_bg(query_vn: str, idx: int, workdir: str, used_urls: set, p_key: str) -> str:
+    """Cào ảnh bối cảnh Việt Nam, có cơ chế dự phòng chống màn đen"""
+    dest = os.path.join(workdir, f"bg_{idx:03d}.jpg")
     downloaded = False
-    
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    
-    search_list = [
-        f"{query_vn} đời sống thực tế",
-        f"{query_vn} chụp thực tế",
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+
+    search_queries = [
+        f"{query_vn} phòng trọ chung cư",
+        f"{query_vn} đời sống thực tế việt nam",
         query_vn
     ]
 
-    for q in search_list:
+    for q in search_queries:
         if downloaded:
             break
         try:
@@ -107,15 +106,11 @@ def crawl_vietnam_media(query_vn: str, idx: int, workdir: str, used_urls: set, p
                     if img_url and img_url.startswith("http") and img_url not in used_urls:
                         try:
                             resp = requests.get(img_url, headers=headers, timeout=5)
-                            # Bỏ qua các file ảnh quá bé hoặc thumbnail rác (< 25KB)
                             if resp.status_code == 200 and len(resp.content) > 25000:
                                 with open(dest, "wb") as f:
                                     f.write(resp.content)
-                                
-                                # Kiểm tra mở thử bằng PIL
-                                with Image.open(dest) as test_img:
-                                    w_raw, h_raw = test_img.size
-                                    if w_raw >= 600 and h_raw >= 400:
+                                with Image.open(dest) as t_img:
+                                    if t_img.size[0] >= 500:
                                         used_urls.add(img_url)
                                         downloaded = True
                                         break
@@ -124,109 +119,79 @@ def crawl_vietnam_media(query_vn: str, idx: int, workdir: str, used_urls: set, p
         except Exception:
             continue
 
-    # Nếu cào thất bại: Kích hoạt tầng dự phòng chất lượng cao ngay lập tức
     if not downloaded:
-        dest = fetch_safe_backup_image(query_vn, idx, p_key, workdir, used_urls)
+        fallback_term = "dark room window moody apartment interior"
+        if p_key and p_key.strip():
+            try:
+                url = f"{PEXELS_PHOTO_URL}?query={urllib.parse.quote(fallback_term)}&per_page=6&orientation=landscape"
+                r = requests.get(url, headers={"Authorization": p_key.strip()}, timeout=6)
+                if r.ok and r.json().get("photos"):
+                    u = r.json()["photos"][0]["src"]["large2x"]
+                    with open(dest, "wb") as f:
+                        f.write(requests.get(u, timeout=8).content)
+                    downloaded = True
+            except Exception:
+                pass
+
+    if not downloaded:
+        img = Image.new('RGB', (W, H), color=(25, 28, 36))
+        img.save(dest, "JPEG")
 
     try:
         with Image.open(dest) as img:
             fitted = ImageOps.fit(img.convert("RGB"), (W, H), Image.LANCZOS)
-            fitted.save(dest, "JPEG", quality=92)
+            fitted.save(dest, "JPEG", quality=90)
     except Exception:
-        dest = fetch_safe_backup_image(query_vn, idx, p_key, workdir, used_urls)
+        pass
 
     return dest
 
-def fetch_broll_clip(query_en: str, idx: int, duration: float, p_key: str, workdir: str, used_vid_ids: set) -> str:
-    """Lấy video clip chuyển động 5s, cắt ghép chuẩn và chống lặp ID 100%"""
-    if not p_key or not p_key.strip():
-        return None
-
-    clip_dest = os.path.join(workdir, f"clip_{idx:03d}.mp4")
-    raw_vid = os.path.join(workdir, f"raw_{idx:03d}.mp4")
-    downloaded = False
-
-    search_terms = [query_en, "night city walking silhouette", "clock ticking timelapse", "traffic moving blur"]
-
-    for term in search_terms:
-        if downloaded:
-            break
-        try:
-            url = f"{PEXELS_VIDEO_URL}?query={urllib.parse.quote(term)}&per_page=8&orientation=landscape"
-            r = requests.get(url, headers={"Authorization": p_key.strip()}, timeout=6)
-            if r.ok and r.json().get("videos"):
-                for v in r.json()["videos"]:
-                    v_id = v.get("id")
-                    if v_id and v_id not in used_vid_ids:
-                        used_vid_ids.add(v_id)
-                        vid_files = v.get("video_files", [])
-                        hd_files = [f for f in vid_files if f.get("height", 0) >= 720 and f.get("file_type") == "video/mp4"]
-                        target_url = hd_files[0]["link"] if hd_files else vid_files[0]["link"]
-                        
-                        with requests.get(target_url, stream=True, timeout=15) as stream:
-                            with open(raw_vid, "wb") as f_out:
-                                shutil.copyfileobj(stream.raw, f_out)
-                        downloaded = True
-                        break
-        except Exception:
-            continue
-
-    if downloaded and os.path.exists(raw_vid):
-        filter_str = f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},fps={FPS},format=yuv420p"
-        cmd = [
-            "ffmpeg", "-y", "-ss", "0", "-i", raw_vid,
-            "-t", f"{duration:.3f}",
-            "-vf", filter_str,
-            "-an",
-            "-c:v", "libx264", "-preset", "ultrafast",
-            clip_dest
-        ]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-        if os.path.exists(raw_vid):
-            os.remove(raw_vid)
-        return clip_dest
-
-    return None
-
-def create_kenburns_clip(img_path: str, duration: float, out_clip: str, mode: int = 0):
-    """Zoom/Lia máy 2K nội bộ, khử 100% hiện tượng rung giật pixel"""
+def render_multi_layer_scene(bg_img: str, char_png: str, dialog_text: str, duration: float, out_clip: str, pos: str = "right", mode: int = 0):
+    """FFmpeg ghép 3 tầng: Nền Ken Burns 2K + Nhân vật PNG trong suốt + Hộp thoại Visual Novel"""
     frames = max(25, int(duration * FPS))
-    step = 0.16 / frames
+    step = 0.14 / frames
 
     if mode % 2 == 0:
-        z_expr = f"min(zoom+{step:.6f},1.16)"
-        x_expr = "iw/2-(iw/zoom/2)"
-        y_expr = "ih/2-(ih/zoom/2)"
+        z_expr = f"min(zoom+{step:.6f},1.14)"
     else:
-        z_expr = f"if(eq(on,1),1.16,max(1.0,zoom-{step:.6f}))"
-        x_expr = "iw/2-(iw/zoom/2)"
-        y_expr = "ih/2-(ih/zoom/2)"
+        z_expr = f"if(eq(on,1),1.14,max(1.0,zoom-{step:.6f}))"
+
+    char_x = "W-w-50" if pos == "right" else "50"
+    char_y = "H-h"
+    clean_text = dialog_text.replace("'", "").replace('"', '').replace(":", " -")[:65]
 
     filter_complex = (
-        f"scale=2560:1440,"
-        f"zoompan=z='{z_expr}':x='{x_expr}':y='{y_expr}':d={frames}:s=2560x1440:fps={FPS},"
-        f"scale={W}:{H}:flags=lanczos,"
-        f"format=yuv420p"
+        f"[0:v]scale=2560:1440,zoompan=z='{z_expr}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s=2560x1440:fps={FPS},scale={W}:{H}:flags=lanczos[bg];"
+        f"[1:v]scale=-1:468[char];"
+        f"[bg][char]overlay={char_x}:{char_y}[comp];"
+        f"[comp]drawbox=x=60:y=H-115:w=W-120:h=85:color=0x111319@0.85:t=fill,"
+        f"drawbox=x=60:y=H-115:w=W-120:h=85:color=0xf39c12@0.9:t=3,"
+        f"drawtext=text='{clean_text}':fontcolor=white:fontsize=28:x=(W-text_w)/2:y=H-82[final]"
     )
+
     cmd = [
-        "ffmpeg", "-y", "-loop", "1", "-i", img_path,
-        "-vf", filter_complex,
+        "ffmpeg", "-y",
+        "-loop", "1", "-i", bg_img,
+        "-i", char_png,
+        "-filter_complex", filter_complex,
+        "-map", "[final]",
         "-t", f"{duration:.3f}",
         "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
         out_clip
     ]
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-if st.button("⚡ Bắt Đầu Dựng Video Hoàn Chỉnh", use_container_width=True, type="primary"):
+if st.button("⚡ Bắt Đầu Dựng Video Visual Novel", use_container_width=True, type="primary"):
     if not groq_key or not groq_key.strip():
         st.error("Vui lòng nhập Groq API Key!")
     elif not audio_file:
-        st.error("Vui lòng tải file âm thanh lên trước!")
+        st.error("Vui lòng tải file Voice âm thanh lên trước!")
     else:
-        status = st.status("Đang khởi động cỗ máy dựng video cao cấp...", expanded=True)
-        workdir = tempfile.mkdtemp(prefix="pro_engine_")
+        status = st.status("Đang kích hoạt cỗ máy dàn cảnh 3 lớp...", expanded=True)
+        workdir = tempfile.mkdtemp(prefix="vn_final_")
+        assets_dir = os.path.join(os.path.dirname(__file__), "assets")
+        init_mock_characters(assets_dir)
         used_urls = set()
-        used_vid_ids = set()
 
         try:
             audio_path = os.path.join(workdir, audio_file.name)
@@ -238,8 +203,8 @@ if st.button("⚡ Bắt Đầu Dựng Video Hoàn Chỉnh", use_container_width=
 
             client = Groq(api_key=groq_key.strip())
 
-            # 1. Bóc tách âm thanh & Đồng bộ nhịp thoại
-            status.update(label="🎙️ 1/4: Whisper phân tích mốc thời gian & khoảng lặng câu thoại...")
+            # 1. Bóc tách âm thanh qua Whisper
+            status.update(label="🎙️ 1/4: Whisper phân tích mốc thời gian từng câu thoại...")
             with open(audio_path, "rb") as fh:
                 resp = client.audio.transcriptions.create(
                     file=fh, model=STT_MODEL, response_format="verbose_json"
@@ -261,8 +226,7 @@ if st.button("⚡ Bắt Đầu Dựng Video Hoàn Chỉnh", use_container_width=
                 else:
                     cur_text += " " + t
 
-                # Đảm bảo mỗi cảnh duy trì 4.2 - 5.5 giây để đủ nhịp tiếp thu thị giác
-                if float(seg["end"]) - cur_start >= 4.2:
+                if float(seg["end"]) - cur_start >= 4.0:
                     segments.append({"start": cur_start, "end": float(seg["end"]), "text": cur_text})
                     cur_text = ""
 
@@ -279,26 +243,34 @@ if st.button("⚡ Bắt Đầu Dựng Video Hoàn Chỉnh", use_container_width=
                 else:
                     segments[i]["duration"] = max(2.0, total_audio_dur - segments[i]["start"])
 
-            # 2. Ép LLM chuyển đổi khái niệm trừu tượng thành hình ảnh đời thực/tâm lý cụ thể
-            status.update(label="🧠 2/4: AI đạo diễn lên bối cảnh tâm lý điện ảnh (Chặn đứng lạc đề)...")
+            # 2. Phân tích kịch bản bằng LLM
+            status.update(label="🧠 2/4: AI đạo diễn phân vai biểu cảm nhân vật & bối cảnh...")
             by_idx = {}
             batch_size = 12
 
             for b_start in range(0, len(segments), batch_size):
                 sub_segs = segments[b_start:b_start + batch_size]
-                transcript_text = "\n".join([f"[{i + b_start}] {s['text'][:90]}" for i, s in enumerate(sub_segs)])
-                prompt = f"""Bạn là đạo diễn hình ảnh cho video tâm lý và đời sống xã hội thực tế.
-Nhiệm vụ: Chuyển các câu thoại sau thành từ khóa hình ảnh đời thực hoặc ẩn dụ điện ảnh cụ thể (3-5 từ).
-QUY TẮC CỐT LÕI:
-- CẤM TUYỆT ĐỐI phong cảnh thiên nhiên, ruộng bậc thang, làng quê nón lá, đồng lúa.
-- Với các đoạn nói về thao túng, ái kỷ, kiệt sức, tội đồ: chuyển thành vật thể/bối cảnh cụ thể: 'người cô đơn trong phòng tối', 'bóng người qua khe cửa', 'người đàn ông nhìn qua cửa sổ đêm', 'bàn làm việc ngổn ngang ban đêm', 'người ngồi ôm đầu tuyệt vọng'.
-- Với các đoạn đời sống: 'phòng trọ nhỏ gác xép', 'xe máy dừng ngã tư đèn đỏ', 'hành lang chung cư cũ vắng người'.
+                transcript_text = "\n".join([f"[{i + b_start}] {s['text'][:85]}" for i, s in enumerate(sub_segs)])
+                prompt = f"""Bạn là đạo diễn phim hoạt họa tâm lý POV đời sống Việt Nam.
+Danh sách nhân vật:
+- 'nhan_vat_binh_thuong.png' (lắng nghe, đứng nhìn)
+- 'nhan_vat_suy_nghi.png' (nghi ngờ, phân tích)
+- 'nhan_vat_soc.png' (bị thao túng, sợ hãi)
+- 'nhan_vat_kiet_suc.png' (áp lực, mệt mỏi)
+- 'nhan_vat_chi_tay.png' (đối chất, bóc trần)
+
+Dựa trên câu thoại, trích xuất cho MỖI đoạn:
+1. Từ khóa bối cảnh đời thực Việt Nam (phòng trọ gác xép, hành lang chung cư cũ, ngã tư đèn đỏ, góc bàn làm việc tối, cửa sổ đêm). TUYỆT ĐỐI CẤM đồng lúa, ruộng bậc thang.
+2. Tên file nhân vật tương ứng.
+3. Vị trí: 'left' hoặc 'right'.
 
 Đoạn thoại:
 {transcript_text}
 
-Trả về DUY NHẤT JSON:
-{{"scenes": [{{"index": {b_start}, "query_vn": "người cô đơn trong phòng tối", "query_en": "lonely person dark room shadow"}}]}}"""
+Trả về JSON:
+{{"scenes": [
+  {{"index": {b_start}, "query_vn": "góc phòng trọ bừa bộn tối đèn", "pose": "nhan_vat_suy_nghi.png", "pos": "right"}}
+]}}"""
 
                 try:
                     llm_resp = client.chat.completions.create(
@@ -315,31 +287,39 @@ Trả về DUY NHẤT JSON:
                 except Exception:
                     pass
 
-            # 3. Gom ảnh/video xen kẽ và render
-            status.update(label="🎬 3/4: Đang gom tư liệu thực tế & dựng chuyển động Ken Burns...")
+            # 3. Dựng clip 3 lớp đa tầng
+            status.update(label="🎨 3/4: Đang tách nền nhân vật, ghép nền Ken Burns và hộp thoại...")
             clips_txt = os.path.join(workdir, "clips.txt")
             with open(clips_txt, "w", encoding="utf-8") as f_clips:
                 for idx, sc in enumerate(segments):
                     sc_data = by_idx.get(idx, {})
-                    query_vn = sc_data.get("query_vn") or "người ngồi trầm ngâm trong phòng tối"
-                    query_en = sc_data.get("query_en") or "silhouette person looking out window night"
-                    dur = sc["duration"]
+                    query_vn = sc_data.get("query_vn") or "căn phòng tối tĩnh lặng"
+                    pose_name = sc_data.get("pose") or POSES[idx % len(POSES)]
+                    char_pos = sc_data.get("pos") or ("right" if idx % 2 == 0 else "left")
 
-                    clip_path = None
-                    # Đan xen B-roll: Cảnh thứ 3 hoặc thứ 4 lấy video động (nếu có key Pexels)
-                    if idx % 3 == 1 and pexels_key:
-                        clip_path = fetch_broll_clip(query_en, idx, dur, pexels_key, workdir, used_vid_ids)
+                    raw_char_file = os.path.join(assets_dir, pose_name)
+                    if not os.path.exists(raw_char_file):
+                        raw_char_file = os.path.join(assets_dir, POSES[0])
 
-                    # Cảnh ảnh tĩnh: cào mạng Việt Nam hoặc fallback sang ảnh stock moody chất lượng cao
-                    if not clip_path:
-                        img_path = crawl_vietnam_media(query_vn, idx, workdir, used_urls, pexels_key)
-                        clip_path = os.path.join(workdir, f"clip_{idx:03d}.mp4")
-                        create_kenburns_clip(img_path, dur, clip_path, mode=idx)
+                    # Tự động tách nền trắng thành trong suốt
+                    clean_char_file = make_white_transparent(raw_char_file, workdir)
 
-                    f_clips.write(f"file '{os.path.abspath(clip_path)}'\n")
+                    bg_img = crawl_vietnam_bg(query_vn, idx, workdir, used_urls, pexels_key)
+                    clip_out = os.path.join(workdir, f"clip_{idx:03d}.mp4")
+
+                    render_multi_layer_scene(
+                        bg_img=bg_img,
+                        char_png=clean_char_file,
+                        dialog_text=sc["text"],
+                        duration=sc["duration"],
+                        out_clip=clip_out,
+                        pos=char_pos,
+                        mode=idx
+                    )
+                    f_clips.write(f"file '{os.path.abspath(clip_out)}'\n")
 
             # 4. Xuất video hoàn thiện
-            status.update(label="⚡ 4/4: Ghép video và đồng bộ audio hoàn chỉnh...")
+            status.update(label="⚡ 4/4: Ghép nối video và đồng bộ audio...")
             out_path = os.path.join(workdir, "output.mp4")
             cmd = [
                 "ffmpeg", "-y",
@@ -352,7 +332,7 @@ Trả về DUY NHẤT JSON:
             ]
             subprocess.run(cmd, check=True)
 
-            status.update(label="✅ Video hoàn thiện thành công với chuẩn chất lượng mới!", state="complete")
+            status.update(label="✅ Video Visual Novel hoàn thiện xuất sắc!", state="complete")
 
             with open(out_path, "rb") as vid_file:
                 video_bytes = vid_file.read()
@@ -361,7 +341,7 @@ Trả về DUY NHẤT JSON:
             st.download_button(
                 label="⬇️ Tải Video Về Máy",
                 data=video_bytes,
-                file_name=f"cinematic_story_{int(time.time())}.mp4",
+                file_name=f"pov_vn_{int(time.time())}.mp4",
                 mime="video/mp4",
                 use_container_width=True
             )
