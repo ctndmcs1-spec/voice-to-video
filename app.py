@@ -263,12 +263,23 @@ if st.button("⚡ Bắt Đầu Dựng Video Chuẩn Xác Tuyệt Đối", use_co
 
             client = Groq(api_key=groq_key.strip())
 
-            # 1. Bóc tách âm thanh
-            status.update(label="🎙️ 1/4: Whisper phân tích mốc thời gian chi tiết...")
-            with open(audio_path, "rb") as fh:
+            # 1. Bóc tách âm thanh (Tự động nén siêu nhẹ chống lỗi 413 Payload Too Large)
+            status.update(label="🎙️ 1/4: Đang tối ưu dung lượng audio & Whisper phân tích mốc thời gian...")
+            compressed_audio = os.path.join(workdir, "whisper_input.mp3")
+            
+            # Ép audio về chuẩn mono 16kHz 48kbps siêu nhẹ (chỉ tốn 1-3MB, Whisper nhận diện cực nhạy)
+            compress_cmd = [
+                "ffmpeg", "-y", "-i", audio_path,
+                "-vn", "-ar", "16000", "-ac", "1", "-b:a", "48k",
+                compressed_audio
+            ]
+            subprocess.run(compress_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+
+            with open(compressed_audio, "rb") as fh:
                 resp = client.audio.transcriptions.create(
                     file=fh, model=STT_MODEL, response_format="verbose_json"
                 )
+    
             data = resp.model_dump() if hasattr(resp, "model_dump") else dict(resp)
             raw_segs = data.get("segments") or []
 
