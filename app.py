@@ -160,7 +160,7 @@ def crawl_vietnam_bg(query_vn: str, idx: int, workdir: str, used_urls: set, p_ke
     return dest
 
 def render_multi_layer_scene(bg_img: str, char_png: str, dialog_text: str, duration: float, out_clip: str, pos: str = "right", mode: int = 0):
-    """FFmpeg ghép 3 tầng: Nền Ken Burns 2K + Wojak đục nền + Hộp thoại Visual Novel"""
+    """FFmpeg ghép 3 tầng: Nền Ken Burns + Wojak trong suốt + Hộp thoại Visual Novel bo viền"""
     frames = max(25, int(duration * FPS))
     step = 0.14 / frames
 
@@ -169,18 +169,21 @@ def render_multi_layer_scene(bg_img: str, char_png: str, dialog_text: str, durat
     else:
         z_expr = f"if(eq(on,1),1.14,max(1.0,zoom-{step:.6f}))"
 
-    # Chiều cao Wojak chiếm 65% khung hình (468px), chân chạm sát mép dưới
     char_x = "W-w-50" if pos == "right" else "50"
     char_y = "H-h"
-    clean_text = dialog_text.replace("'", "").replace('"', '').replace(":", " -")[:65]
+
+    # Làm sạch text tuyệt đối: thay dấu phẩy, hai chấm, nháy đơn để không làm vỡ cú pháp FFmpeg
+    safe_text = dialog_text.replace("'", "").replace('"', '').replace(":", " -").replace(",", " -")[:65]
 
     filter_complex = (
-        f"[0:v]scale=2560:1440,zoompan=z='{z_expr}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s=2560x1440:fps={FPS},scale={W}:{H}:flags=lanczos[bg];"
-        f"[1:v]scale=-1:468[char];"
+        f"[0:v]scale=2560:1440,"
+        f"zoompan=z='{z_expr}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s=2560x1440:fps={FPS},"
+        f"scale={W}:{H}:flags=lanczos[bg];"
+        f"[1:v]format=rgba,scale=-1:468[char];"
         f"[bg][char]overlay={char_x}:{char_y}[comp];"
-        f"[comp]drawbox=x=60:y=H-115:w=W-120:h=85:color=0x111319@0.85:t=fill,"
-        f"drawbox=x=60:y=H-115:w=W-120:h=85:color=0xf39c12@0.9:t=3,"
-        f"drawtext=text='{clean_text}':fontcolor=white:fontsize=28:x=(W-text_w)/2:y=H-82[final]"
+        f"[comp]drawbox=x=60:y=H-115:w=W-120:h=85:color=black@0.85:t=fill,"
+        f"drawbox=x=60:y=H-115:w=W-120:h=85:color=orange@0.9:t=3,"
+        f"drawtext=text='{safe_text}':fontcolor=white:fontsize=28:x=(W-text_w)/2:y=H-80[final]"
     )
 
     cmd = [
