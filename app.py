@@ -11,11 +11,11 @@ import urllib.parse
 
 import streamlit as st
 import requests
-from PIL import Image, ImageOps, ImageDraw
+from PIL import Image, ImageOps, ImageDraw, ImageFont
 from groq import Groq
 from duckduckgo_search import DDGS
 
-st.set_page_config(page_title="Auto Wojak POV Engine", layout="centered")
+st.set_page_config(page_title="Auto Wojak POV Engine Pro", layout="centered")
 
 W, H = 1280, 720
 FPS = 25
@@ -23,11 +23,11 @@ STT_MODEL = "whisper-large-v3"
 LLM_MODEL = "openai/gpt-oss-20b"
 PEXELS_PHOTO_URL = "https://api.pexels.com/v1/search"
 
-st.title("🎬 Cỗ Máy Dựng Phim POV Tự Động 100%")
-st.caption("Tự cào bối cảnh đời thực, tự tìm meme Wojak theo cảm xúc & tự đục nền trong suốt")
+st.title("🎬 Cỗ Máy Dựng Phim POV Hoạt Họa 2D (Tự Động 100%)")
+st.caption("Tự cào bối cảnh Việt Nam, tự cào meme Wojak theo cảm xúc & ghép nối 3 lớp an toàn")
 
 groq_key = st.text_input("Groq API Key (Bắt buộc)", type="password", placeholder="gsk_...")
-pexels_key = st.text_input("Pexels API Key (Tùy chọn)", type="password", placeholder="Key Pexels...")
+pexels_key = st.text_input("Pexels API Key (Tùy chọn B-roll HD)", type="password", placeholder="Key Pexels...")
 audio_file = st.file_uploader("Tải lên file Voice âm thanh", type=["mp3", "wav", "m4a", "ogg"])
 
 WOJAK_EMOTION_QUERIES = {
@@ -48,7 +48,6 @@ def make_white_transparent(img_path: str, out_path: str) -> str:
             datas = img.getdata()
             new_data = []
             for item in datas:
-                # Nếu pixel gần trắng (RGB > 220) thì biến thành trong suốt
                 if item[0] > 220 and item[1] > 220 and item[2] > 220:
                     new_data.append((255, 255, 255, 0))
                 else:
@@ -88,7 +87,7 @@ def fetch_wojak_character(emotion: str, idx: int, workdir: str) -> str:
     if downloaded:
         return make_white_transparent(raw_dest, clean_dest)
 
-    # Fallback tự vẽ Wojak nét vẽ cơ bản nếu rớt mạng
+    # Ảnh dự phòng nếu không tải được mạng
     fallback_img = Image.new("RGBA", (360, 500), (0, 0, 0, 0))
     d = ImageDraw.Draw(fallback_img)
     d.ellipse([90, 40, 270, 220], fill=(245, 235, 225), outline=(15, 15, 15), width=6)
@@ -97,7 +96,7 @@ def fetch_wojak_character(emotion: str, idx: int, workdir: str) -> str:
     return clean_dest
 
 def crawl_vietnam_bg(query_vn: str, idx: int, workdir: str, used_urls: set, p_key: str) -> str:
-    """Cào ảnh bối cảnh Việt Nam, có cơ chế dự phòng chống màn đen"""
+    """Cào ảnh bối cảnh Việt Nam đời thực, có dự phòng chống màn đen"""
     dest = os.path.join(workdir, f"bg_{idx:03d}.jpg")
     downloaded = False
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -159,8 +158,41 @@ def crawl_vietnam_bg(query_vn: str, idx: int, workdir: str, used_urls: set, p_ke
 
     return dest
 
-def render_multi_layer_scene(bg_img: str, char_png: str, dialog_text: str, duration: float, out_clip: str, pos: str = "right", mode: int = 0):
-    """FFmpeg ghép 3 tầng: Nền Ken Burns + Wojak trong suốt + Hộp thoại Visual Novel bo viền"""
+def create_composite_overlay(char_png: str, dialog_text: str, pos: str, workdir: str, idx: int) -> str:
+    """Tạo 1 layer PNG trong suốt chứa nhân vật Wojak và hộp thoại phụ đề bằng Pillow"""
+    overlay_path = os.path.join(workdir, f"overlay_{idx:03d}.png")
+    canvas = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+
+    # Đặt nhân vật Wojak
+    try:
+        if os.path.exists(char_png):
+            with Image.open(char_png).convert("RGBA") as char_img:
+                c_w, c_h = char_img.size
+                new_h = 460
+                new_w = int(c_w * (new_h / c_h))
+                resized_char = char_img.resize((new_w, new_h), Image.LANCZOS)
+
+                x_pos = (W - new_w - 50) if pos == "right" else 50
+                y_pos = H - new_h
+                canvas.paste(resized_char, (x_pos, y_pos), resized_char)
+    except Exception:
+        pass
+
+    # Vẽ hộp thoại Visual Novel
+    draw = ImageDraw.Draw(canvas)
+    box_x1, box_y1 = 60, H - 120
+    box_x2, box_y2 = W - 60, H - 35
+
+    draw.rectangle([box_x1, box_y1, box_x2, box_y2], fill=(18, 20, 26, 215), outline=(243, 156, 18, 240), width=3)
+
+    clean_text = dialog_text.strip()[:65]
+    draw.text((box_x1 + 30, box_y1 + 26), clean_text, fill=(255, 255, 255))
+
+    canvas.save(overlay_path, "PNG")
+    return overlay_path
+
+def render_multi_layer_scene(bg_img: str, char_png: str, dialog_text: str, duration: float, out_clip: str, pos: str, mode: int, workdir: str, idx: int):
+    """FFmpeg thực hiện Ken Burns trên nền và đè layer PNG với tọa độ 0:0"""
     frames = max(25, int(duration * FPS))
     step = 0.14 / frames
 
@@ -169,27 +201,19 @@ def render_multi_layer_scene(bg_img: str, char_png: str, dialog_text: str, durat
     else:
         z_expr = f"if(eq(on,1),1.14,max(1.0,zoom-{step:.6f}))"
 
-    char_x = "W-w-50" if pos == "right" else "50"
-    char_y = "H-h"
-
-    # Làm sạch text tuyệt đối: thay dấu phẩy, hai chấm, nháy đơn để không làm vỡ cú pháp FFmpeg
-    safe_text = dialog_text.replace("'", "").replace('"', '').replace(":", " -").replace(",", " -")[:65]
+    overlay_png = create_composite_overlay(char_png, dialog_text, pos, workdir, idx)
 
     filter_complex = (
         f"[0:v]scale=2560:1440,"
         f"zoompan=z='{z_expr}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s=2560x1440:fps={FPS},"
         f"scale={W}:{H}:flags=lanczos[bg];"
-        f"[1:v]format=rgba,scale=-1:468[char];"
-        f"[bg][char]overlay={char_x}:{char_y}[comp];"
-        f"[comp]drawbox=x=60:y=H-115:w=W-120:h=85:color=black@0.85:t=fill,"
-        f"drawbox=x=60:y=H-115:w=W-120:h=85:color=orange@0.9:t=3,"
-        f"drawtext=text='{safe_text}':fontcolor=white:fontsize=28:x=(W-text_w)/2:y=H-80[final]"
+        f"[bg][1:v]overlay=0:0:format=auto[final]"
     )
 
     cmd = [
         "ffmpeg", "-y",
         "-loop", "1", "-i", bg_img,
-        "-i", char_png,
+        "-i", overlay_png,
         "-filter_complex", filter_complex,
         "-map", "[final]",
         "-t", f"{duration:.3f}",
@@ -258,7 +282,7 @@ if st.button("⚡ Bắt Đầu Dựng Video Wojak Tự Động", use_container_w
                 else:
                     segments[i]["duration"] = max(2.0, total_audio_dur - segments[i]["start"])
 
-            # 2. Phân tích kịch bản: Gán cảm xúc Wojak + Bối cảnh đời thực
+            # 2. Phân tích kịch bản bằng LLM
             status.update(label="🧠 2/4: AI chọn biểu cảm Wojak & bối cảnh tâm lý đời thực...")
             by_idx = {}
             batch_size = 12
@@ -304,8 +328,8 @@ Trả về JSON:
                 except Exception:
                     pass
 
-            # 3. Tự động cào ảnh Wojak, đục nền & dựng cảnh 3 lớp
-            status.update(label="🎨 3/4: Đang tự cào Wojak, tự đục nền trong suốt & ghép cảnh...")
+            # 3. Dựng cảnh 3 lớp qua Pillow & FFmpeg
+            status.update(label="🎨 3/4: Đang tự cào Wojak, đục nền trong suốt & dán hộp thoại...")
             clips_txt = os.path.join(workdir, "clips.txt")
             with open(clips_txt, "w", encoding="utf-8") as f_clips:
                 for idx, sc in enumerate(segments):
@@ -325,11 +349,13 @@ Trả về JSON:
                         duration=sc["duration"],
                         out_clip=clip_out,
                         pos=char_pos,
-                        mode=idx
+                        mode=idx,
+                        workdir=workdir,
+                        idx=idx
                     )
                     f_clips.write(f"file '{os.path.abspath(clip_out)}'\n")
 
-            # 4. Xuất video
+            # 4. Xuất video hoàn thiện
             status.update(label="⚡ 4/4: Ghép nối video và đồng bộ audio hoàn chỉnh...")
             out_path = os.path.join(workdir, "output.mp4")
             cmd = [
