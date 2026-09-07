@@ -15,7 +15,7 @@ from PIL import Image, ImageOps, ImageEnhance, ImageFilter, ImageDraw
 from groq import Groq
 from duckduckgo_search import DDGS
 
-st.set_page_config(page_title="Cinematic POV Video Engine", layout="centered")
+st.set_page_config(page_title="Multi-Genre POV Video Engine", page_icon="🎬", layout="centered")
 
 W, H = 1280, 720
 FPS = 25
@@ -24,44 +24,78 @@ LLM_MODEL = "openai/gpt-oss-20b"
 PEXELS_PHOTO_URL = "https://api.pexels.com/v1/search"
 PEXELS_VIDEO_URL = "https://api.pexels.com/videos/search"
 
-st.title("🎬 Cinematic POV Video Engine (Ảnh + Video B-Roll)")
-st.caption("Khớp nhịp thoại 100%, đan xen video chuyển động, mở rộng tìm kiếm Việt - Ngoại")
+st.title("🎬 Multi-Genre POV Studio Engine")
+st.caption("Tỷ lệ 40% Video B-roll + 60% Ảnh tĩnh, đa dạng Tone cảm xúc, hình ảnh sát voice 100%")
+
+# GIAO DIỆN CHỌN TONE PHONG CÁCH
+genre_mode = st.selectbox(
+    "Chọn phong cách & Tone màu chủ đạo của Video:",
+    [
+        "Nghề nghiệp / Tươi sáng & Động lực (Bright Career)",
+        "Tâm lý / Góc khuất & U tối (Dark Moody POV)",
+        "Tài chính / Khởi nghiệp & Kịch tính (Corporate / Hustle)",
+        "Đời sống thường nhật & Hoài niệm (Vintage Lofi Life)"
+    ]
+)
 
 groq_key = st.text_input("Groq API Key (Bắt buộc)", type="password", placeholder="gsk_...")
-pexels_key = st.text_input("Pexels API Key (Khuyên dùng để lấy B-roll HD & stock ngoại)", type="password", placeholder="Key Pexels...")
+pexels_key = st.text_input("Pexels API Key (Để lấy video B-roll 40% HD)", type="password", placeholder="Key Pexels...")
 audio_file = st.file_uploader("Tải lên file Voice âm thanh", type=["mp3", "wav", "m4a", "ogg"])
 
-SAFE_BACKUP_QUERIES = [
-    "lonely person dark room window night",
-    "silhouette walking street night rain",
-    "stressed man dark room cinematic shadow",
-    "dimly lit hallway empty apartment",
-    "traffic blur night city street"
-]
+# ==============================================================================
+# HỆ THỐNG PHỦ MÀU COLOR GRADING THEO TONE PHONG CÁCH
+# ==============================================================================
+def apply_genre_color_grading(img: Image.Image, genre: str) -> Image.Image:
+    """Tự động đổi tông màu sắc tương ứng theo phong cách được chọn"""
+    if "Bright Career" in genre:
+        # Tươi sáng, ấm áp, rực rỡ
+        enhancer = ImageEnhance.Brightness(img)
+        img = enhancer.enhance(1.06)
+        enhancer = ImageEnhance.Color(img)
+        img = enhancer.enhance(1.20)
+        enhancer = ImageEnhance.Contrast(img)
+        img = enhancer.enhance(1.10)
+        return img
 
-def apply_cinematic_grade(img: Image.Image) -> Image.Image:
-    """Nâng độ tương phản và phủ vignette tối góc tạo chiều sâu"""
-    enhancer = ImageEnhance.Contrast(img)
-    graded = enhancer.enhance(1.18)
-    enhancer = ImageEnhance.Brightness(graded)
-    graded = enhancer.enhance(0.90)
+    elif "Dark Moody" in genre:
+        # U tối, tương phản gắt, phủ vignette đen 4 góc
+        enhancer = ImageEnhance.Contrast(img)
+        graded = enhancer.enhance(1.25)
+        enhancer = ImageEnhance.Brightness(graded)
+        graded = enhancer.enhance(0.85)
 
-    # Phủ Vignette mềm mại
-    vignette = Image.new("L", (W, H), 255)
-    d_v = ImageDraw.Draw(vignette)
-    d_v.ellipse([-W * 0.15, -H * 0.15, W * 1.15, H * 1.15], fill=0)
-    vignette = vignette.filter(ImageFilter.GaussianBlur(radius=100))
+        vignette = Image.new("L", (W, H), 255)
+        d_v = ImageDraw.Draw(vignette)
+        d_v.ellipse([-W * 0.15, -H * 0.15, W * 1.15, H * 1.15], fill=0)
+        vignette = vignette.filter(ImageFilter.GaussianBlur(radius=110))
+        black_layer = Image.new("RGB", (W, H), (10, 12, 16))
+        return Image.composite(black_layer, graded, vignette)
 
-    black_layer = Image.new("RGB", (W, H), (10, 12, 16))
-    return Image.composite(black_layer, graded, vignette)
+    elif "Corporate" in genre:
+        # Ánh xanh công nghệ, sắc sảo, tương phản cao
+        enhancer = ImageEnhance.Contrast(img)
+        graded = enhancer.enhance(1.20)
+        r, g, b = graded.split()
+        b = b.point(lambda i: min(255, int(i * 1.08)))
+        return Image.merge("RGB", (r, g, b))
 
-def fetch_media_image(query_vn: str, query_en: str, idx: int, workdir: str, used_urls: set, p_key: str) -> str:
-    """Tìm ảnh Việt Nam trước, nếu thiếu hụt tự động tìm qua nguồn ảnh ngoại"""
+    else: # Vintage Lofi
+        # Ấm vàng hoài cổ, giảm tương phản nhẹ
+        enhancer = ImageEnhance.Color(img)
+        graded = enhancer.enhance(0.95)
+        r, g, b = graded.split()
+        r = r.point(lambda i: min(255, int(i * 1.06)))
+        return Image.merge("RGB", (r, g, b))
+
+# ==============================================================================
+# BỘ TÌM KIẾM ẢNH SÁT NGHĨA SONG NGỮ (VIỆT + NGOẠI)
+# ==============================================================================
+def fetch_matching_image(query_vn: str, query_en: str, idx: int, workdir: str, used_urls: set, p_key: str, genre: str) -> str:
     dest = os.path.join(workdir, f"bg_{idx:03d}.jpg")
     downloaded = False
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
-    # 1. Tìm ảnh bối cảnh Việt Nam thực tế
+    # 1. Tìm ảnh Việt Nam thực tế
     vn_terms = [f"{query_vn} chụp thực tế", query_vn]
     for q in vn_terms:
         if downloaded:
@@ -87,9 +121,9 @@ def fetch_media_image(query_vn: str, query_en: str, idx: int, workdir: str, used
         except Exception:
             continue
 
-    # 2. Mở rộng tìm ảnh ngoại qua Pexels / DDGS nếu ảnh Việt không đủ chất lượng
+    # 2. Tìm ảnh kho ngoại Pexels chất lượng cao
     if not downloaded and p_key and p_key.strip():
-        en_terms = [query_en, f"{query_en} dark cinematic"]
+        en_terms = [query_en, f"{query_en} authentic"]
         for q in en_terms:
             if downloaded:
                 break
@@ -108,9 +142,9 @@ def fetch_media_image(query_vn: str, query_en: str, idx: int, workdir: str, used
             except Exception:
                 continue
 
-    # 3. Fallback an toàn tuyệt đối
+    # 3. Fallback an toàn
     if not downloaded:
-        fb_term = random.choice(SAFE_BACKUP_QUERIES)
+        fb_term = query_en if query_en else "daily work activity"
         try:
             with DDGS() as ddgs:
                 results = list(ddgs.images(fb_term, max_results=4))
@@ -127,21 +161,23 @@ def fetch_media_image(query_vn: str, query_en: str, idx: int, workdir: str, used
             pass
 
     if not downloaded:
-        img = Image.new('RGB', (W, H), color=(22, 25, 33))
+        img = Image.new('RGB', (W, H), color=(40, 45, 55))
         img.save(dest, "JPEG")
 
     try:
         with Image.open(dest) as raw_img:
             fitted = ImageOps.fit(raw_img.convert("RGB"), (W, H), Image.LANCZOS)
-            graded = apply_cinematic_grade(fitted)
+            graded = apply_genre_color_grading(fitted, genre)
             graded.save(dest, "JPEG", quality=92)
     except Exception:
         pass
 
     return dest
 
+# ==============================================================================
+# BỘ LẤY VIDEO B-ROLL (ĐẠT TỶ LỆ 40%, KHÔNG TRÙNG LẶP)
+# ==============================================================================
 def fetch_broll_clip(query_en: str, idx: int, duration: float, p_key: str, workdir: str, used_vid_ids: set) -> str:
-    """Lấy video clip chuyển động 5s, cắt ghép chuẩn và chống lặp ID 100%"""
     if not p_key or not p_key.strip():
         return None
 
@@ -149,7 +185,7 @@ def fetch_broll_clip(query_en: str, idx: int, duration: float, p_key: str, workd
     raw_vid = os.path.join(workdir, f"raw_{idx:03d}.mp4")
     downloaded = False
 
-    search_terms = [query_en, "night city walking silhouette", "traffic moving blur night", "empty dark office"]
+    search_terms = [query_en, f"{query_en} action", "person working close up", "city street traffic"]
 
     for term in search_terms:
         if downloaded:
@@ -192,7 +228,7 @@ def fetch_broll_clip(query_en: str, idx: int, duration: float, p_key: str, workd
     return None
 
 def create_kenburns_clip(img_path: str, duration: float, out_clip: str, mode: int = 0):
-    """Zoom/Lia máy 2K khử rung mượt mà"""
+    """Zoom/Lia máy 2K mượt mà cho 60% cảnh ảnh tĩnh"""
     frames = max(25, int(duration * FPS))
     step = 0.16 / frames
 
@@ -220,14 +256,17 @@ def create_kenburns_clip(img_path: str, duration: float, out_clip: str, mode: in
     ]
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-if st.button("⚡ Bắt Đầu Dựng Video Điện Ảnh (Ảnh + Video)", use_container_width=True, type="primary"):
+# ==============================================================================
+# PIPELINE ĐIỀU PHỐI CHÍNH
+# ==============================================================================
+if st.button("⚡ Bắt Đầu Dựng Video Đa Phong Cách (40% Video + 60% Ảnh)", use_container_width=True, type="primary"):
     if not groq_key or not groq_key.strip():
         st.error("Vui lòng nhập Groq API Key!")
     elif not audio_file:
         st.error("Vui lòng tải file Voice âm thanh lên trước!")
     else:
-        status = st.status("Đang kích hoạt cỗ máy dựng video...", expanded=True)
-        workdir = tempfile.mkdtemp(prefix="cinematic_pov_")
+        status = st.status("Đang kích hoạt cỗ máy dựng video đa phong cách...", expanded=True)
+        workdir = tempfile.mkdtemp(prefix="multi_pov_")
         used_urls = set()
         used_vid_ids = set()
 
@@ -264,7 +303,6 @@ if st.button("⚡ Bắt Đầu Dựng Video Điện Ảnh (Ảnh + Video)", use_
                 else:
                     cur_text += " " + t
 
-                # Giữ nhịp cắt cảnh từ 4.0 - 5.5s
                 if float(seg["end"]) - cur_start >= 4.2:
                     segments.append({"start": cur_start, "end": float(seg["end"]), "text": cur_text})
                     cur_text = ""
@@ -274,7 +312,7 @@ if st.button("⚡ Bắt Đầu Dựng Video Điện Ảnh (Ảnh + Video)", use_
                 segments.append({"start": cur_start, "end": end_time, "text": cur_text})
 
             if not segments:
-                segments.append({"start": 0.0, "end": total_audio_dur, "text": "câu chuyện tâm lý"})
+                segments.append({"start": 0.0, "end": total_audio_dur, "text": "câu chuyện đời sống"})
 
             for i in range(len(segments)):
                 if i < len(segments) - 1:
@@ -282,26 +320,27 @@ if st.button("⚡ Bắt Đầu Dựng Video Điện Ảnh (Ảnh + Video)", use_
                 else:
                     segments[i]["duration"] = max(2.0, total_audio_dur - segments[i]["start"])
 
-            # 2. AI bóc tách từ khóa Việt - Ngoại
-            status.update(label="🧠 2/4: AI đạo diễn trích xuất bối cảnh tâm lý điện ảnh...")
+            # 2. AI Đạo diễn bóc tách từ khóa hành động sát voice theo Tone
+            status.update(label=f"🧠 2/4: AI đạo diễn trích xuất hình ảnh sát nghĩa theo phong cách {genre_mode}...")
             by_idx = {}
             batch_size = 12
 
             for b_start in range(0, len(segments), batch_size):
                 sub_segs = segments[b_start:b_start + batch_size]
                 transcript_text = "\n".join([f"[{i + b_start}] {s['text'][:90]}" for i, s in enumerate(sub_segs)])
-                prompt = f"""Bạn là đạo diễn hình ảnh cho video tâm lý góc khuất đời sống.
-Nhiệm vụ: Trích xuất cho MỖI đoạn thoại 1 cụm từ tiếng Việt và 1 cụm từ tiếng Anh tương ứng miêu tả bối cảnh tâm lý cụ thể.
+                prompt = f"""Bạn là đạo diễn hình ảnh cho video phong cách: "{genre_mode}".
+Nhiệm vụ: Trích xuất cho MỖI câu thoại một hành động/vật thể cụ thể SÁT VỚI NỘI DUNG NÓI (3-5 từ), gồm cả tiếng Việt và tiếng Anh.
 QUY TẮC:
-- CẤM ruộng lúa, làng quê, thiên nhiên vui tươi.
-- Miêu tả bối cảnh đô thị, phòng tối, ánh sáng tương phản: 'căn phòng tối le lói đèn', 'bóng người qua khe cửa', 'hành lang chung cư cũ', 'ngã tư đêm vắng', 'bàn làm việc ngổn ngang'.
+- Nếu phong cách là Bright Career (Nghề nghiệp tươi sáng): chọn hành động làm việc tích cực, tay nghề, dụng cụ, quán xá, nụ cười (ví dụ: 'pha cà phê espresso', 'thợ làm bánh nhào bột', 'nhân viên thu ngân tính tiền', 'bàn làm việc sáng sủa').
+- Nếu phong cách là Dark Moody (Tâm lý u tối): chọn bối cảnh trầm ngâm, góc tối, ánh sáng hắt, phòng vắng.
+- CẤM ruộng lúa, làng quê trừ khi lời thoại nhắc trực tiếp đến đồng quê.
 
 Đoạn thoại:
 {transcript_text}
 
-Trả về DUY NHẤT JSON:
+Trả về DUY NHẤT định dạng JSON:
 {{"scenes": [
-  {{"index": {b_start}, "query_vn": "người ngồi trầm ngâm trong phòng tối", "query_en": "lonely person dark room shadow"}}
+  {{"index": {b_start}, "query_vn": "pha cà phê latte art", "query_en": "barista making coffee"}}
 ]}}"""
 
                 try:
@@ -319,31 +358,32 @@ Trả về DUY NHẤT JSON:
                 except Exception:
                     pass
 
-            # 3. Gom tài nguyên: Đan xen Ảnh + Video B-roll
-            status.update(label="🎬 3/4: Đang gom ảnh Việt/Ngoại và xen kẽ video B-roll...")
+            # 3. Gom tài nguyên theo tỷ lệ 40% Video B-roll + 60% Ảnh
+            status.update(label="🎬 3/4: Đang ghép 40% Video B-roll + 60% Ảnh tĩnh Color Graded...")
             clips_txt = os.path.join(workdir, "clips.txt")
             with open(clips_txt, "w", encoding="utf-8") as f_clips:
                 for idx, sc in enumerate(segments):
                     sc_data = by_idx.get(idx, {})
-                    query_vn = sc_data.get("query_vn") or "căn phòng tối tĩnh lặng ban đêm"
-                    query_en = sc_data.get("query_en") or "dark moody room silhouette"
+                    query_vn = sc_data.get("query_vn") or "hoạt động đời sống"
+                    query_en = sc_data.get("query_en") or "daily work life"
                     dur = sc["duration"]
 
                     clip_path = None
-                    # Đan xen B-roll video: Cứ cảnh thứ 3 thử lấy video clip chuyển động
-                    if idx % 3 == 2 and pexels_key:
+                    # TỶ LỆ 40% VIDEO: Cảnh thứ 2 và thứ 4 trong mỗi chu kỳ 5 cảnh (idx % 5 in [1, 3]) sẽ lấy video clip
+                    is_video_slot = (idx % 5 in [1, 3])
+                    if is_video_slot and pexels_key:
                         clip_path = fetch_broll_clip(query_en, idx, dur, pexels_key, workdir, used_vid_ids)
 
-                    # Cảnh ảnh tĩnh: Ken Burns 2K
+                    # 60% ẢNH TĨNH: Chạy Ken Burns 2K với Color Grading đúng Tone
                     if not clip_path:
-                        img_path = fetch_media_image(query_vn, query_en, idx, workdir, used_urls, pexels_key)
+                        img_path = fetch_matching_image(query_vn, query_en, idx, workdir, used_urls, pexels_key, genre_mode)
                         clip_path = os.path.join(workdir, f"clip_{idx:03d}.mp4")
                         create_kenburns_clip(img_path, dur, clip_path, mode=idx)
 
                     f_clips.write(f"file '{os.path.abspath(clip_path)}'\n")
 
             # 4. Xuất video hoàn thiện
-            status.update(label="⚡ 4/4: Nối các cảnh và đồng bộ âm thanh...", state="running")
+            status.update(label="⚡ 4/4: Nối các cảnh và đồng bộ âm thanh hoàn chỉnh...")
             out_path = os.path.join(workdir, "output.mp4")
             cmd = [
                 "ffmpeg", "-y",
@@ -356,16 +396,16 @@ Trả về DUY NHẤT JSON:
             ]
             subprocess.run(cmd, check=True)
 
-            status.update(label="✅ Video Cinematic hoàn thiện thành công!", state="complete")
+            status.update(label="✅ Video đa phong cách hoàn thiện xuất sắc!", state="complete")
 
             with open(out_path, "rb") as vid_file:
                 video_bytes = vid_file.read()
 
             st.video(video_bytes)
             st.download_button(
-                label="⬇️ Tải Video Về Máy",
+                label="⬇️ Tải Video Hoàn Chỉnh Về Máy",
                 data=video_bytes,
-                file_name=f"cinematic_story_{int(time.time())}.mp4",
+                file_name=f"multi_pov_{int(time.time())}.mp4",
                 mime="video/mp4",
                 use_container_width=True
             )
