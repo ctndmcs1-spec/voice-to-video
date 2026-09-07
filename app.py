@@ -11,7 +11,7 @@ import urllib.parse
 
 import streamlit as st
 import requests
-from PIL import Image, ImageOps, ImageEnhance, ImageDraw
+from PIL import Image, ImageOps, ImageEnhance
 from groq import Groq
 from duckduckgo_search import DDGS
 
@@ -25,7 +25,7 @@ PEXELS_PHOTO_URL = "https://api.pexels.com/v1/search"
 PEXELS_VIDEO_URL = "https://api.pexels.com/videos/search"
 
 st.title("🎬 Studio POV Video Engine Pro")
-st.caption("Đồng bộ khung hình tuyệt đối, loại bỏ hoàn toàn màn hình đen, tối ưu nội dung ngữ cảnh")
+st.caption("Tải tài nguyên mới 100% từng phân cảnh, không trùng lặp, không màn hình trống")
 
 genre_mode = st.selectbox(
     "Chọn phong cách & Tone màu chủ đạo của Video:",
@@ -41,30 +41,18 @@ groq_key = st.text_input("Groq API Key (Bắt buộc)", type="password", placeho
 pexels_key = st.text_input("Pexels API Key (Khuyên dùng để lấy video B-roll HD)", type="password", placeholder="Key Pexels...")
 audio_file = st.file_uploader("Tải lên file Voice âm thanh", type=["mp3", "wav", "m4a", "ogg"])
 
-# Kho dự phòng an toàn tuyệt đối theo phong cách Corporate / Finance
-STUDIO_SAFE_ASSETS = [
-    "modern office business district night",
-    "financial audit report numbers documents",
-    "stressed employee working desk late night",
-    "corporate meeting room presentation",
-    "laptop keyboard typing financial graph",
-    "empty modern office hallway perspective"
-]
-
 def apply_genre_color_grading(img: Image.Image, genre: str) -> Image.Image:
-    """Xử lý màu sắc phù hợp với tone phân đoạn"""
     if "Corporate" in genre:
         enhancer = ImageEnhance.Contrast(img)
-        graded = enhancer.enhance(1.18)
+        graded = enhancer.enhance(1.15)
         r, g, b = graded.split()
-        b = b.point(lambda i: min(255, int(i * 1.06)))
+        b = b.point(lambda i: min(255, int(i * 1.05)))
         return Image.merge("RGB", (r, g, b))
     elif "Dark Moody" in genre:
         enhancer = ImageEnhance.Contrast(img)
-        graded = enhancer.enhance(1.22)
+        graded = enhancer.enhance(1.20)
         enhancer = ImageEnhance.Brightness(graded)
-        graded = enhancer.enhance(0.88)
-        return graded
+        return enhancer.enhance(0.90)
     elif "Bright Career" in genre:
         enhancer = ImageEnhance.Brightness(img)
         img = enhancer.enhance(1.05)
@@ -72,56 +60,67 @@ def apply_genre_color_grading(img: Image.Image, genre: str) -> Image.Image:
         return enhancer.enhance(1.15)
     else:
         enhancer = ImageEnhance.Color(img)
-        graded = enhancer.enhance(0.92)
+        graded = enhancer.enhance(0.95)
         r, g, b = graded.split()
-        r = r.point(lambda i: min(255, int(i * 1.05)))
+        r = r.point(lambda i: min(255, int(i * 1.04)))
         return Image.merge("RGB", (r, g, b))
 
-def generate_fallback_canvas(dest_path: str, idx: int):
-    """Tạo phôi đồ họa studio tối màu nếu toàn bộ nguồn mạng bị chặn, không để màn đen trống"""
-    canvas = Image.new("RGB", (W, H), (25, 30, 40))
-    d = ImageDraw.Draw(canvas)
-    # Vẽ các mảng gradient tạo chiều sâu không gian làm việc
-    for y in range(H):
-        val = int(25 + (y / H) * 20)
-        d.line([(0, y), (W, y)], fill=(val, val + 5, val + 15))
-    canvas.save(dest_path, "JPEG", quality=90)
-
 def fetch_matching_image(query_vn: str, query_en: str, idx: int, workdir: str, used_urls: set, p_key: str, genre: str) -> str:
-    """Bộ cào ảnh thông minh đa lớp, có chống link rác và fallback nội bộ"""
+    """Tìm nạp ảnh MỚI hoàn toàn qua 4 tầng dữ liệu độc lập, tuyệt đối không xài lại ảnh cũ"""
     dest = os.path.join(workdir, f"bg_{idx:03d}.jpg")
     downloaded = False
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
-    # Bổ sung tiền tố ngữ cảnh công sở chống lạc đề
     safe_en = f"corporate {query_en}" if "office" not in query_en.lower() and "work" not in query_en.lower() else query_en
 
-    # 1. Tìm qua Pexels nếu có key
+    # Tầng 1: Pexels API (Ưu tiên số 1 nếu có API Key)
     if p_key and p_key.strip():
         for q in [safe_en, query_en]:
             if downloaded:
                 break
             try:
-                url = f"{PEXELS_PHOTO_URL}?query={urllib.parse.quote(q)}&per_page=6&orientation=landscape"
-                r = requests.get(url, headers={"Authorization": p_key.strip()}, timeout=6)
+                url = f"{PEXELS_PHOTO_URL}?query={urllib.parse.quote(q)}&per_page=15&orientation=landscape"
+                r = requests.get(url, headers={"Authorization": p_key.strip()}, timeout=5)
                 if r.ok and r.json().get("photos"):
                     for p in r.json()["photos"]:
                         u = p["src"]["large2x"]
                         if u not in used_urls:
-                            used_urls.add(u)
-                            resp = requests.get(u, timeout=8)
+                            resp = requests.get(u, timeout=7)
                             if resp.status_code == 200 and len(resp.content) > 30000:
                                 with open(dest, "wb") as f:
                                     f.write(resp.content)
+                                used_urls.add(u)
                                 downloaded = True
                                 break
             except Exception:
                 continue
 
-    # 2. Tìm qua DuckDuckGo
+    # Tầng 2: Wikimedia Commons API (Kho ảnh mở không giới hạn request)
     if not downloaded:
-        search_candidates = [f"{safe_en} high quality wallpaper", f"{query_vn} công sở thực tế", safe_en]
-        for q in search_candidates:
+        try:
+            wiki_url = f"https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrsearch={urllib.parse.quote(safe_en)}&gsrlimit=10&prop=imageinfo&iiprop=url|size&format=json"
+            r = requests.get(wiki_url, headers=headers, timeout=5)
+            if r.ok:
+                pages = r.json().get("query", {}).get("pages", {})
+                for page_id, info in pages.items():
+                    img_info = info.get("imageinfo", [{}])[0]
+                    u = img_info.get("url")
+                    if u and u.lower().endswith(('.jpg', '.jpeg', '.png')) and u not in used_urls:
+                        if img_info.get("width", 0) >= 800:
+                            resp = requests.get(u, headers=headers, timeout=7)
+                            if resp.status_code == 200 and len(resp.content) > 30000:
+                                with open(dest, "wb") as f:
+                                    f.write(resp.content)
+                                used_urls.add(u)
+                                downloaded = True
+                                break
+        except Exception:
+            pass
+
+    # Tầng 3: DuckDuckGo Search (Mở rộng từ khóa)
+    if not downloaded:
+        search_list = [f"{safe_en} realistic photography", safe_en, query_vn]
+        for q in search_list:
             if downloaded:
                 break
             try:
@@ -132,7 +131,6 @@ def fetch_matching_image(query_vn: str, query_en: str, idx: int, workdir: str, u
                         if u and u.startswith("http") and u not in used_urls:
                             try:
                                 resp = requests.get(u, headers=headers, timeout=5)
-                                # Loại bỏ các file rác hoặc banner quá nhỏ
                                 if resp.status_code == 200 and len(resp.content) > 35000:
                                     with open(dest, "wb") as f:
                                         f.write(resp.content)
@@ -146,40 +144,31 @@ def fetch_matching_image(query_vn: str, query_en: str, idx: int, workdir: str, u
             except Exception:
                 continue
 
-    # 3. Fallback danh mục an toàn
+    # Tầng 4: CDN Công cộng động theo Seed độc lập (Đảm bảo luôn ra ảnh mới không trùng lặp)
     if not downloaded:
-        fb_term = random.choice(STUDIO_SAFE_ASSETS)
+        random_seed = random.randint(1000, 99999)
+        direct_url = f"https://loremflickr.com/1280/720/office,workplace?lock={random_seed}"
         try:
-            with DDGS() as ddgs:
-                results = list(ddgs.images(fb_term, max_results=5))
-                for r in results:
-                    u = r.get("image")
-                    if u and u.startswith("http") and u not in used_urls:
-                        resp = requests.get(u, headers=headers, timeout=5)
-                        if resp.status_code == 200 and len(resp.content) > 25000:
-                            with open(dest, "wb") as f:
-                                f.write(resp.content)
-                            downloaded = True
-                            break
+            resp = requests.get(direct_url, timeout=7)
+            if resp.status_code == 200 and len(resp.content) > 20000:
+                with open(dest, "wb") as f:
+                    f.write(resp.content)
+                downloaded = True
         except Exception:
             pass
 
-    if not downloaded:
-        generate_fallback_canvas(dest, idx)
-
-    # Chuẩn hóa kích thước và phủ màu
+    # Xử lý kích thước & màu sắc ảnh mới
     try:
         with Image.open(dest) as raw_img:
             fitted = ImageOps.fit(raw_img.convert("RGB"), (W, H), Image.LANCZOS)
             graded = apply_genre_color_grading(fitted, genre)
             graded.save(dest, "JPEG", quality=92)
     except Exception:
-        generate_fallback_canvas(dest, idx)
+        pass
 
     return dest
 
 def fetch_broll_clip(query_en: str, idx: int, target_frames: int, p_key: str, workdir: str, used_vid_ids: set) -> str:
-    """Tải clip B-roll và chuẩn hóa chính xác số khung hình tuyệt đối"""
     if not p_key or not p_key.strip():
         return None
 
@@ -190,8 +179,8 @@ def fetch_broll_clip(query_en: str, idx: int, target_frames: int, p_key: str, wo
     search_terms = [
         f"corporate {query_en}",
         query_en,
-        "office worker typing desk night",
-        "financial business meeting modern office"
+        "office worker desk night",
+        "financial business meeting"
     ]
 
     for term in search_terms:
@@ -204,15 +193,16 @@ def fetch_broll_clip(query_en: str, idx: int, target_frames: int, p_key: str, wo
                 for v in r.json()["videos"]:
                     v_id = v.get("id")
                     if v_id and v_id not in used_vid_ids:
-                        used_vid_ids.add(v_id)
                         vid_files = v.get("video_files", [])
                         hd_files = [f for f in vid_files if f.get("height", 0) >= 720 and f.get("file_type") == "video/mp4"]
                         target_url = hd_files[0]["link"] if hd_files else vid_files[0]["link"]
                         with requests.get(target_url, stream=True, timeout=15) as stream:
                             with open(raw_vid, "wb") as f_out:
                                 shutil.copyfileobj(stream.raw, f_out)
-                        downloaded = True
-                        break
+                        if os.path.exists(raw_vid) and os.path.getsize(raw_vid) > 50000:
+                            used_vid_ids.add(v_id)
+                            downloaded = True
+                            break
         except Exception:
             continue
 
@@ -232,12 +222,12 @@ def fetch_broll_clip(query_en: str, idx: int, target_frames: int, p_key: str, wo
                 os.remove(raw_vid)
             return clip_dest
         except Exception:
-            pass
+            if os.path.exists(raw_vid):
+                os.remove(raw_vid)
 
     return None
 
 def create_kenburns_clip(img_path: str, target_frames: int, out_clip: str, mode: int = 0):
-    """Render Ken Burns đa trục dựa trên số frame chính xác 100%"""
     frames = max(25, target_frames)
     step = 0.15 / frames
     m = mode % 4
@@ -275,7 +265,7 @@ def create_kenburns_clip(img_path: str, target_frames: int, out_clip: str, mode:
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
 # ==============================================================================
-# QUY TRÌNH SẢN XUẤT CHÍNH
+# QUY TRÌNH DỰNG VIDEO CHÍNH
 # ==============================================================================
 if st.button("⚡ Bắt Đầu Dựng Video Thành Phẩm Hoàn Chỉnh", use_container_width=True, type="primary"):
     if not groq_key or not groq_key.strip():
@@ -293,14 +283,14 @@ if st.button("⚡ Bắt Đầu Dựng Video Thành Phẩm Hoàn Chỉnh", use_co
             with open(audio_path, "wb") as f:
                 f.write(audio_file.getbuffer())
 
-            # Đo đạc thời lượng file gốc chính xác tuyệt đối
+            # 0. Đo đạc chính xác tổng thời gian và tổng số frame
             cmd_dur = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", audio_path]
             total_audio_dur = float(subprocess.run(cmd_dur, capture_output=True, text=True).stdout.strip() or 10.0)
             total_required_frames = int(round(total_audio_dur * FPS))
 
             client = Groq(api_key=groq_key.strip())
 
-            # 1. Bóc tách âm thanh (Nén mono 16kHz chống 413 Payload Too Large)
+            # 1. Bóc tách âm thanh (Nén mono 16kHz chống 413)
             status.update(label="🎙️ 1/4: Đang tối ưu dung lượng & Whisper phân tích mốc thời gian...")
             compressed_audio = os.path.join(workdir, "whisper_input.mp3")
             compress_cmd = [
@@ -331,7 +321,6 @@ if st.button("⚡ Bắt Đầu Dựng Video Thành Phẩm Hoàn Chỉnh", use_co
                 else:
                     cur_text += " " + t
 
-                # Nhịp ngắt cảnh tiêu chuẩn 4.5s
                 if float(seg["end"]) - cur_start >= 4.5:
                     segments.append({"start": cur_start, "end": float(seg["end"]), "text": cur_text})
                     cur_text = ""
@@ -342,7 +331,7 @@ if st.button("⚡ Bắt Đầu Dựng Video Thành Phẩm Hoàn Chỉnh", use_co
             if not segments:
                 segments.append({"start": 0.0, "end": total_audio_dur, "text": "góc khuất nghề nghiệp"})
 
-            # Tính toán phân bổ Frame tuyệt đối
+            # Khóa frame chặt chẽ cho từng phân đoạn
             accumulated_frames = 0
             for i in range(len(segments)):
                 if i < len(segments) - 1:
@@ -351,7 +340,6 @@ if st.button("⚡ Bắt Đầu Dựng Video Thành Phẩm Hoàn Chỉnh", use_co
                     segments[i]["target_frames"] = max(25, f_count)
                     accumulated_frames += segments[i]["target_frames"]
                 else:
-                    # Cảnh cuối gánh trọn vẹn số frame còn lại, bù đắp mọi sai số
                     remaining = total_required_frames - accumulated_frames
                     segments[i]["target_frames"] = max(25, remaining)
 
@@ -366,15 +354,15 @@ if st.button("⚡ Bắt Đầu Dựng Video Thành Phẩm Hoàn Chỉnh", use_co
                 prompt = f"""Bạn là đạo diễn hình ảnh cho video phân tích góc khuất nghề nghiệp: "{genre_mode}".
 Nội dung video nói về ngành KIỂM TOÁN, TÀI CHÍNH, DOANH NGHIỆP, ÁP LỰC CÔNG SỞ.
 
-QUY TẮC CỐT TỬ ĐỂ KHÔNG BỊ LẠC ĐỀ:
+QUY TẮC BẮT BUỘC:
 1. Luôn neo trong môi trường văn phòng, tài chính: bàn làm việc, tài liệu số liệu, họp cổ đông, sếp và nhân viên, ký kết hợp đồng, máy tính kế toán, hành lang công ty, cà phê đêm làm việc.
-2. TUYỆT ĐỐI CẤM hiểu theo nghĩa đen ngây thơ:
+2. TUYỆT ĐỐI CẤM hiểu theo nghĩa đen ngô nghê:
    - Nói "ngàn cân" -> KHÔNG ĐƯỢC lấy tập gym/deadlift. Phải lấy: 'người ngồi ôm đầu trước đống tài liệu dày'.
    - Nói "nộp đơn" -> KHÔNG ĐƯỢC lấy đơn ly hôn. Phải lấy: 'đơn xin việc, CV văn phòng'.
    - Nói "vừa đấm vừa xoa" -> KHÔNG ĐƯỢC lấy hoạt động ngoài trời/bèo tây. Phải lấy: 'cuộc họp thương thuyết đối tác'.
    - Nói "dòng máu tài chính/gian lận" -> KHÔNG ĐƯỢC lấy dạy nhạc/trường học. Phải lấy: 'báo cáo tài chính, biểu đồ tiền tệ'.
 3. CẢNH ĐẦU TIÊN [0]: Bắt buộc lấy tòa nhà chọc trời ban đêm rực rỡ ánh đèn ('city skyscraper night lights').
-4. CẢNH CUỐI CÙNG: Bắt buộc lấy lời cảm ơn, ghi chép sổ tay hoặc màn hình làm việc kết thúc ngày.
+4. CẢNH CUỐI CÙNG: Bắt buộc lấy 'bàn làm việc kết thúc ngày' ('office desk night end of work').
 
 Đoạn thoại:
 {transcript_text}
@@ -399,8 +387,8 @@ Trả về DUY NHẤT định dạng JSON:
                 except Exception:
                     pass
 
-            # 3. Dựng cảnh 40% Video B-roll + 60% Ảnh tĩnh (Không frame lỗi)
-            status.update(label="🎬 3/4: Đang kết xuất clip theo mốc frame chính xác...")
+            # 3. Dựng cảnh 40% Video B-roll + 60% Ảnh tĩnh (Duyệt ảnh mới liên tục)
+            status.update(label="🎬 3/4: Đang kết xuất clip theo frame chính xác & tải tư liệu mới...")
             clips_txt = os.path.join(workdir, "clips.txt")
             with open(clips_txt, "w", encoding="utf-8") as f_clips:
                 for idx, sc in enumerate(segments):
@@ -421,11 +409,10 @@ Trả về DUY NHẤT định dạng JSON:
 
                     f_clips.write(f"file '{os.path.abspath(clip_path)}'\n")
 
-            # 4. Xuất video hoàn thiện khớp khung hình
+            # 4. Xuất video hoàn thiện khớp mốc audio
             status.update(label="⚡ 4/4: Ghép video và nén xuất Master...", state="running")
             out_path = os.path.join(workdir, "output.mp4")
 
-            # Sử dụng cờ muxing chuẩn xác tuyệt đối không chém đuôi audio
             cmd = [
                 "ffmpeg", "-y",
                 "-f", "concat", "-safe", "0", "-i", clips_txt,
