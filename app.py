@@ -15,42 +15,41 @@ from PIL import Image, ImageOps, ImageDraw
 from groq import Groq
 from duckduckgo_search import DDGS
 
-st.set_page_config(page_title="Visual Novel POV Engine Pro", layout="centered")
+st.set_page_config(page_title="Auto Wojak POV Engine", layout="centered")
 
 W, H = 1280, 720
 FPS = 25
 STT_MODEL = "whisper-large-v3"
 LLM_MODEL = "openai/gpt-oss-20b"
 PEXELS_PHOTO_URL = "https://api.pexels.com/v1/search"
-PEXELS_VIDEO_URL = "https://api.pexels.com/videos/search"
 
-st.title("🎬 Cỗ Máy Dựng Phim POV Hoạt Họa 2D")
-st.caption("Tự động tách nền trắng, dàn cảnh 3 lớp: Bối cảnh Việt Nam + Nhân vật hoạt họa + Hộp thoại")
+st.title("🎬 Cỗ Máy Dựng Phim POV Tự Động 100%")
+st.caption("Tự cào bối cảnh đời thực, tự tìm meme Wojak theo cảm xúc & tự đục nền trong suốt")
 
 groq_key = st.text_input("Groq API Key (Bắt buộc)", type="password", placeholder="gsk_...")
-pexels_key = st.text_input("Pexels API Key (Tùy chọn B-roll HD)", type="password", placeholder="Key Pexels...")
+pexels_key = st.text_input("Pexels API Key (Tùy chọn)", type="password", placeholder="Key Pexels...")
 audio_file = st.file_uploader("Tải lên file Voice âm thanh", type=["mp3", "wav", "m4a", "ogg"])
 
-POSES = [
-    "nhan_vat_binh_thuong.png",
-    "nhan_vat_suy_nghi.png",
-    "nhan_vat_soc.png",
-    "nhan_vat_kiet_suc.png",
-    "nhan_vat_chi_tay.png"
-]
+WOJAK_EMOTION_QUERIES = {
+    "neutral": "wojak standing transparent png",
+    "thinking": "wojak thinking hand on chin transparent png",
+    "shocked": "wojak shocked screaming transparent png",
+    "stressed": "wojak stressed holding head transparent png",
+    "depressed": "doomer depressed smoking transparent png",
+    "smug": "smug wojak smiling transparent png",
+    "pointing": "wojak pointing transparent png"
+}
 
-def make_white_transparent(img_path: str, temp_dir: str) -> str:
-    """Tự động chuyển pixel trắng hoặc gần trắng thành trong suốt (RGBA alpha=0)"""
+def make_white_transparent(img_path: str, out_path: str) -> str:
+    """Quét và biến mọi pixel màu trắng/xám sáng thành trong suốt (Alpha = 0)"""
     try:
-        base_name = os.path.basename(img_path)
-        out_path = os.path.join(temp_dir, f"trans_{base_name}")
         with Image.open(img_path) as raw_img:
             img = raw_img.convert("RGBA")
             datas = img.getdata()
             new_data = []
             for item in datas:
-                # Ngưỡng RGB > 225 coi là nền trắng sáng
-                if item[0] > 225 and item[1] > 225 and item[2] > 225:
+                # Nếu pixel gần trắng (RGB > 220) thì biến thành trong suốt
+                if item[0] > 220 and item[1] > 220 and item[2] > 220:
                     new_data.append((255, 255, 255, 0))
                 else:
                     new_data.append(item)
@@ -60,28 +59,42 @@ def make_white_transparent(img_path: str, temp_dir: str) -> str:
     except Exception:
         return img_path
 
-def init_mock_characters(assets_dir: str):
-    """Tạo phôi nhân vật hoạt họa viền đậm dự phòng nếu thư mục chưa có file ảnh"""
-    os.makedirs(assets_dir, exist_ok=True)
-    palette = {
-        "nhan_vat_binh_thuong.png": ((245, 230, 215), "NEUTRAL"),
-        "nhan_vat_suy_nghi.png": ((220, 235, 255), "THINKING"),
-        "nhan_vat_soc.png": ((255, 215, 215), "SHOCKED"),
-        "nhan_vat_kiet_suc.png": ((215, 215, 225), "EXHAUSTED"),
-        "nhan_vat_chi_tay.png": ((255, 245, 205), "POINTING")
-    }
-    for fname, (bg_col, tag) in palette.items():
-        p = os.path.join(assets_dir, fname)
-        if not os.path.exists(p):
-            img = Image.new("RGBA", (380, 560), (0, 0, 0, 0))
-            d = ImageDraw.Draw(img)
-            d.ellipse([90, 40, 290, 240], fill=bg_col, outline=(15, 15, 15), width=7)
-            d.rectangle([120, 110, 175, 150], outline=(15, 15, 15), width=6)
-            d.rectangle([205, 110, 260, 150], outline=(15, 15, 15), width=6)
-            d.line([175, 130, 205, 130], fill=(15, 15, 15), width=6)
-            d.rectangle([110, 240, 270, 520], fill=(35, 40, 50), outline=(15, 15, 15), width=7)
-            d.text((135, 340), tag, fill=(255, 255, 255))
-            img.save(p, "PNG")
+def fetch_wojak_character(emotion: str, idx: int, workdir: str) -> str:
+    """Tự động cào ảnh Wojak theo biểu cảm từ mạng và đục nền trong suốt"""
+    raw_dest = os.path.join(workdir, f"raw_wojak_{idx:03d}.png")
+    clean_dest = os.path.join(workdir, f"clean_wojak_{idx:03d}.png")
+    query = WOJAK_EMOTION_QUERIES.get(emotion, WOJAK_EMOTION_QUERIES["neutral"])
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    downloaded = False
+
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.images(query, max_results=5))
+            for r in results:
+                img_url = r.get("image")
+                if img_url and img_url.startswith("http"):
+                    try:
+                        resp = requests.get(img_url, headers=headers, timeout=5)
+                        if resp.status_code == 200 and len(resp.content) > 10000:
+                            with open(raw_dest, "wb") as f:
+                                f.write(resp.content)
+                            downloaded = True
+                            break
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+
+    if downloaded:
+        return make_white_transparent(raw_dest, clean_dest)
+
+    # Fallback tự vẽ Wojak nét vẽ cơ bản nếu rớt mạng
+    fallback_img = Image.new("RGBA", (360, 500), (0, 0, 0, 0))
+    d = ImageDraw.Draw(fallback_img)
+    d.ellipse([90, 40, 270, 220], fill=(245, 235, 225), outline=(15, 15, 15), width=6)
+    d.rectangle([110, 220, 250, 480], fill=(40, 45, 55), outline=(15, 15, 15), width=6)
+    fallback_img.save(clean_dest, "PNG")
+    return clean_dest
 
 def crawl_vietnam_bg(query_vn: str, idx: int, workdir: str, used_urls: set, p_key: str) -> str:
     """Cào ảnh bối cảnh Việt Nam, có cơ chế dự phòng chống màn đen"""
@@ -90,7 +103,7 @@ def crawl_vietnam_bg(query_vn: str, idx: int, workdir: str, used_urls: set, p_ke
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
     search_queries = [
-        f"{query_vn} phòng trọ chung cư",
+        f"{query_vn} phòng trọ chung cư hà nội",
         f"{query_vn} đời sống thực tế việt nam",
         query_vn
     ]
@@ -120,7 +133,7 @@ def crawl_vietnam_bg(query_vn: str, idx: int, workdir: str, used_urls: set, p_ke
             continue
 
     if not downloaded:
-        fallback_term = "dark room window moody apartment interior"
+        fallback_term = "dark moody room apartment window"
         if p_key and p_key.strip():
             try:
                 url = f"{PEXELS_PHOTO_URL}?query={urllib.parse.quote(fallback_term)}&per_page=6&orientation=landscape"
@@ -134,7 +147,7 @@ def crawl_vietnam_bg(query_vn: str, idx: int, workdir: str, used_urls: set, p_ke
                 pass
 
     if not downloaded:
-        img = Image.new('RGB', (W, H), color=(25, 28, 36))
+        img = Image.new('RGB', (W, H), color=(22, 25, 33))
         img.save(dest, "JPEG")
 
     try:
@@ -147,7 +160,7 @@ def crawl_vietnam_bg(query_vn: str, idx: int, workdir: str, used_urls: set, p_ke
     return dest
 
 def render_multi_layer_scene(bg_img: str, char_png: str, dialog_text: str, duration: float, out_clip: str, pos: str = "right", mode: int = 0):
-    """FFmpeg ghép 3 tầng: Nền Ken Burns 2K + Nhân vật PNG trong suốt + Hộp thoại Visual Novel"""
+    """FFmpeg ghép 3 tầng: Nền Ken Burns 2K + Wojak đục nền + Hộp thoại Visual Novel"""
     frames = max(25, int(duration * FPS))
     step = 0.14 / frames
 
@@ -156,6 +169,7 @@ def render_multi_layer_scene(bg_img: str, char_png: str, dialog_text: str, durat
     else:
         z_expr = f"if(eq(on,1),1.14,max(1.0,zoom-{step:.6f}))"
 
+    # Chiều cao Wojak chiếm 65% khung hình (468px), chân chạm sát mép dưới
     char_x = "W-w-50" if pos == "right" else "50"
     char_y = "H-h"
     clean_text = dialog_text.replace("'", "").replace('"', '').replace(":", " -")[:65]
@@ -181,16 +195,14 @@ def render_multi_layer_scene(bg_img: str, char_png: str, dialog_text: str, durat
     ]
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-if st.button("⚡ Bắt Đầu Dựng Video Visual Novel", use_container_width=True, type="primary"):
+if st.button("⚡ Bắt Đầu Dựng Video Wojak Tự Động", use_container_width=True, type="primary"):
     if not groq_key or not groq_key.strip():
         st.error("Vui lòng nhập Groq API Key!")
     elif not audio_file:
         st.error("Vui lòng tải file Voice âm thanh lên trước!")
     else:
-        status = st.status("Đang kích hoạt cỗ máy dàn cảnh 3 lớp...", expanded=True)
-        workdir = tempfile.mkdtemp(prefix="vn_final_")
-        assets_dir = os.path.join(os.path.dirname(__file__), "assets")
-        init_mock_characters(assets_dir)
+        status = st.status("Đang kích hoạt cỗ máy dựng video tự động...", expanded=True)
+        workdir = tempfile.mkdtemp(prefix="auto_wojak_")
         used_urls = set()
 
         try:
@@ -203,8 +215,8 @@ if st.button("⚡ Bắt Đầu Dựng Video Visual Novel", use_container_width=T
 
             client = Groq(api_key=groq_key.strip())
 
-            # 1. Bóc tách âm thanh qua Whisper
-            status.update(label="🎙️ 1/4: Whisper phân tích mốc thời gian từng câu thoại...")
+            # 1. Bóc tách âm thanh
+            status.update(label="🎙️ 1/4: Whisper phân tích mốc thời gian câu thoại...")
             with open(audio_path, "rb") as fh:
                 resp = client.audio.transcriptions.create(
                     file=fh, model=STT_MODEL, response_format="verbose_json"
@@ -226,7 +238,7 @@ if st.button("⚡ Bắt Đầu Dựng Video Visual Novel", use_container_width=T
                 else:
                     cur_text += " " + t
 
-                if float(seg["end"]) - cur_start >= 4.0:
+                if float(seg["end"]) - cur_start >= 4.2:
                     segments.append({"start": cur_start, "end": float(seg["end"]), "text": cur_text})
                     cur_text = ""
 
@@ -235,7 +247,7 @@ if st.button("⚡ Bắt Đầu Dựng Video Visual Novel", use_container_width=T
                 segments.append({"start": cur_start, "end": end_time, "text": cur_text})
 
             if not segments:
-                segments.append({"start": 0.0, "end": total_audio_dur, "text": "câu chuyện tâm lý đời thực"})
+                segments.append({"start": 0.0, "end": total_audio_dur, "text": "câu chuyện tâm lý"})
 
             for i in range(len(segments)):
                 if i < len(segments) - 1:
@@ -243,33 +255,35 @@ if st.button("⚡ Bắt Đầu Dựng Video Visual Novel", use_container_width=T
                 else:
                     segments[i]["duration"] = max(2.0, total_audio_dur - segments[i]["start"])
 
-            # 2. Phân tích kịch bản bằng LLM
-            status.update(label="🧠 2/4: AI đạo diễn phân vai biểu cảm nhân vật & bối cảnh...")
+            # 2. Phân tích kịch bản: Gán cảm xúc Wojak + Bối cảnh đời thực
+            status.update(label="🧠 2/4: AI chọn biểu cảm Wojak & bối cảnh tâm lý đời thực...")
             by_idx = {}
             batch_size = 12
 
             for b_start in range(0, len(segments), batch_size):
                 sub_segs = segments[b_start:b_start + batch_size]
                 transcript_text = "\n".join([f"[{i + b_start}] {s['text'][:85]}" for i, s in enumerate(sub_segs)])
-                prompt = f"""Bạn là đạo diễn phim hoạt họa tâm lý POV đời sống Việt Nam.
-Danh sách nhân vật:
-- 'nhan_vat_binh_thuong.png' (lắng nghe, đứng nhìn)
-- 'nhan_vat_suy_nghi.png' (nghi ngờ, phân tích)
-- 'nhan_vat_soc.png' (bị thao túng, sợ hãi)
-- 'nhan_vat_kiet_suc.png' (áp lực, mệt mỏi)
-- 'nhan_vat_chi_tay.png' (đối chất, bóc trần)
+                prompt = f"""Bạn là đạo diễn video recap tâm lý phong cách Bí Mập 666.
+Danh sách cảm xúc Wojak:
+- 'neutral': lắng nghe, bình thản
+- 'thinking': nghi ngờ, phân tích, đặt câu hỏi
+- 'shocked': sợ hãi, bàng hoàng, thao túng
+- 'stressed': ôm đầu, áp lực, bế tắc
+- 'depressed': kiệt sức, buồn bã
+- 'smug': tự mãn, mỉa mai, kẻ ái kỷ
+- 'pointing': chỉ trích, bóc trần
 
-Dựa trên câu thoại, trích xuất cho MỖI đoạn:
-1. Từ khóa bối cảnh đời thực Việt Nam (phòng trọ gác xép, hành lang chung cư cũ, ngã tư đèn đỏ, góc bàn làm việc tối, cửa sổ đêm). TUYỆT ĐỐI CẤM đồng lúa, ruộng bậc thang.
-2. Tên file nhân vật tương ứng.
-3. Vị trí: 'left' hoặc 'right'.
+Trích xuất cho MỖI dòng:
+1. 'query_vn': Từ khóa bối cảnh đời thực cụ thể (phòng trọ nhỏ, hành lang chung cư, góc làm việc tối, cửa sổ đêm). CẤM ruộng đồng, phong cảnh thiên nhiên.
+2. 'emotion': Một trong các cảm xúc Wojak ở trên.
+3. 'pos': 'left' hoặc 'right'.
 
 Đoạn thoại:
 {transcript_text}
 
 Trả về JSON:
 {{"scenes": [
-  {{"index": {b_start}, "query_vn": "góc phòng trọ bừa bộn tối đèn", "pose": "nhan_vat_suy_nghi.png", "pos": "right"}}
+  {{"index": {b_start}, "query_vn": "góc phòng trọ bừa bộn tối đèn", "emotion": "thinking", "pos": "right"}}
 ]}}"""
 
                 try:
@@ -287,29 +301,23 @@ Trả về JSON:
                 except Exception:
                     pass
 
-            # 3. Dựng clip 3 lớp đa tầng
-            status.update(label="🎨 3/4: Đang tách nền nhân vật, ghép nền Ken Burns và hộp thoại...")
+            # 3. Tự động cào ảnh Wojak, đục nền & dựng cảnh 3 lớp
+            status.update(label="🎨 3/4: Đang tự cào Wojak, tự đục nền trong suốt & ghép cảnh...")
             clips_txt = os.path.join(workdir, "clips.txt")
             with open(clips_txt, "w", encoding="utf-8") as f_clips:
                 for idx, sc in enumerate(segments):
                     sc_data = by_idx.get(idx, {})
                     query_vn = sc_data.get("query_vn") or "căn phòng tối tĩnh lặng"
-                    pose_name = sc_data.get("pose") or POSES[idx % len(POSES)]
+                    emotion = sc_data.get("emotion") or "neutral"
                     char_pos = sc_data.get("pos") or ("right" if idx % 2 == 0 else "left")
 
-                    raw_char_file = os.path.join(assets_dir, pose_name)
-                    if not os.path.exists(raw_char_file):
-                        raw_char_file = os.path.join(assets_dir, POSES[0])
-
-                    # Tự động tách nền trắng thành trong suốt
-                    clean_char_file = make_white_transparent(raw_char_file, workdir)
-
                     bg_img = crawl_vietnam_bg(query_vn, idx, workdir, used_urls, pexels_key)
+                    char_png = fetch_wojak_character(emotion, idx, workdir)
                     clip_out = os.path.join(workdir, f"clip_{idx:03d}.mp4")
 
                     render_multi_layer_scene(
                         bg_img=bg_img,
-                        char_png=clean_char_file,
+                        char_png=char_png,
                         dialog_text=sc["text"],
                         duration=sc["duration"],
                         out_clip=clip_out,
@@ -318,8 +326,8 @@ Trả về JSON:
                     )
                     f_clips.write(f"file '{os.path.abspath(clip_out)}'\n")
 
-            # 4. Xuất video hoàn thiện
-            status.update(label="⚡ 4/4: Ghép nối video và đồng bộ audio...")
+            # 4. Xuất video
+            status.update(label="⚡ 4/4: Ghép nối video và đồng bộ audio hoàn chỉnh...")
             out_path = os.path.join(workdir, "output.mp4")
             cmd = [
                 "ffmpeg", "-y",
@@ -332,7 +340,7 @@ Trả về JSON:
             ]
             subprocess.run(cmd, check=True)
 
-            status.update(label="✅ Video Visual Novel hoàn thiện xuất sắc!", state="complete")
+            status.update(label="✅ Video Wojak Visual Novel hoàn thành 100%!", state="complete")
 
             with open(out_path, "rb") as vid_file:
                 video_bytes = vid_file.read()
@@ -341,7 +349,7 @@ Trả về JSON:
             st.download_button(
                 label="⬇️ Tải Video Về Máy",
                 data=video_bytes,
-                file_name=f"pov_vn_{int(time.time())}.mp4",
+                file_name=f"wojak_story_{int(time.time())}.mp4",
                 mime="video/mp4",
                 use_container_width=True
             )
