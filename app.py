@@ -19,8 +19,8 @@ st.set_page_config(page_title="Studio POV Master Engine", page_icon="🎬", layo
 
 W, H = 1280, 720
 FPS = 25
-STT_MODEL = "whisper-large-v3"
-LLM_MODEL = "openai/gpt-oss-20b"
+STT_MODEL = "whisper-large-v3-turbo"
+LLM_MODEL = "qwen/qwen3.6-27b"
 PEXELS_PHOTO_URL = "https://api.pexels.com/v1/search"
 PEXELS_VIDEO_URL = "https://api.pexels.com/videos/search"
 
