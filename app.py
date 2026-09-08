@@ -25,29 +25,28 @@ PEXELS_PHOTO_URL = "https://api.pexels.com/v1/search"
 PEXELS_VIDEO_URL = "https://api.pexels.com/videos/search"
 
 st.title("🎬 Studio POV Master Engine")
-st.caption("Bám sát 100% hành động trong câu thoại, chống lỗi 254 và khóa chuẩn khung hình")
+st.caption("Khớp 100% ngữ cảnh đời thực của Voice, không ép khuôn mẫu, chống lỗi 254 tuyệt đối")
 
 genre_mode = st.selectbox(
     "Chọn phong cách & Tone màu chủ đạo của Video:",
     [
-        "Tài chính / Khởi nghiệp & Kịch tính (Corporate / Hustle)",
-        "Nghề nghiệp / Tươi sáng & Động lực (Bright Career)",
+        "Đời sống thường nhật & Bụi bặm (Street Life / Realistic)",
         "Tâm lý / Góc khuất & U tối (Dark Moody POV)",
-        "Đời sống thường nhật & Hoài niệm (Vintage Lofi Life)"
+        "Nghề nghiệp / Tươi sáng & Động lực (Bright Career)",
+        "Tài chính / Khởi nghiệp & Kịch tính (Corporate / Hustle)"
     ]
 )
 
 groq_key = st.text_input("Groq API Key (Bắt buộc)", type="password", placeholder="gsk_...")
 pexels_key = st.text_input("Pexels API Key (Để lấy video B-roll HD)", type="password", placeholder="Key Pexels...")
-audio_file = st.file_uploader("Tải lên file Voice âm thanh (Hỗ trợ cả Tiếng Việt & Tiếng Anh)", type=["mp3", "wav", "m4a", "ogg"])
+audio_file = st.file_uploader("Tải lên file Voice âm thanh", type=["mp3", "wav", "m4a", "ogg"])
 
 def apply_genre_color_grading(img: Image.Image, genre: str) -> Image.Image:
-    if "Corporate" in genre:
-        enhancer = ImageEnhance.Contrast(img)
-        graded = enhancer.enhance(1.15)
-        r, g, b = graded.split()
-        b = b.point(lambda i: min(255, int(i * 1.05)))
-        return Image.merge("RGB", (r, g, b))
+    if "Street Life" in genre or "Đời sống" in genre:
+        enhancer = ImageEnhance.Color(img)
+        graded = enhancer.enhance(1.05)
+        enhancer = ImageEnhance.Contrast(graded)
+        return enhancer.enhance(1.08)
     elif "Dark Moody" in genre:
         enhancer = ImageEnhance.Contrast(img)
         graded = enhancer.enhance(1.20)
@@ -59,23 +58,22 @@ def apply_genre_color_grading(img: Image.Image, genre: str) -> Image.Image:
         enhancer = ImageEnhance.Color(img)
         return enhancer.enhance(1.15)
     else:
-        enhancer = ImageEnhance.Color(img)
-        graded = enhancer.enhance(0.95)
+        enhancer = ImageEnhance.Contrast(img)
+        graded = enhancer.enhance(1.15)
         r, g, b = graded.split()
-        r = r.point(lambda i: min(255, int(i * 1.04)))
+        b = b.point(lambda i: min(255, int(i * 1.05)))
         return Image.merge("RGB", (r, g, b))
 
 def fetch_matching_image(query_vn: str, query_en: str, idx: int, workdir: str, used_urls: set, p_key: str, genre: str, is_english: bool) -> str:
-    """Tìm ảnh bám sát 100% từ khóa do LLM trích xuất, không chèn tiền tố cưỡng bức"""
     dest = os.path.join(workdir, f"bg_{idx:03d}.jpg")
     downloaded = False
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
-    search_en = query_en.strip() if query_en else "cinematic scene"
+    search_en = query_en.strip() if query_en else "everyday life street"
 
     # Tầng 1: Pexels API
     if p_key and p_key.strip():
-        for q in [search_en, f"{search_en} cinematic"]:
+        for q in [search_en, f"{search_en} realistic"]:
             if downloaded:
                 break
             try:
@@ -119,7 +117,7 @@ def fetch_matching_image(query_vn: str, query_en: str, idx: int, workdir: str, u
 
     # Tầng 3: DuckDuckGo Search
     if not downloaded:
-        search_list = [f"{search_en} photography", search_en]
+        search_list = [f"{search_en} photo", search_en]
         if not is_english and query_vn:
             search_list.append(query_vn)
 
@@ -148,10 +146,11 @@ def fetch_matching_image(query_vn: str, query_en: str, idx: int, workdir: str, u
             except Exception:
                 continue
 
-    # Tầng 4: CDN Công cộng động theo Seed độc lập
+    # Tầng 4: CDN Công cộng linh hoạt theo chủ đề thực tế (không ép văn phòng)
     if not downloaded:
         random_seed = random.randint(1000, 99999)
-        direct_url = f"https://loremflickr.com/1280/720/cinematic,atmosphere?lock={random_seed}"
+        topic = "street,people,city" if ("Street" in genre or "Đời sống" in genre) else "cinematic,lifestyle"
+        direct_url = f"https://loremflickr.com/1280/720/{topic}?lock={random_seed}"
         try:
             resp = requests.get(direct_url, timeout=7)
             if resp.status_code == 200 and len(resp.content) > 20000:
@@ -161,7 +160,7 @@ def fetch_matching_image(query_vn: str, query_en: str, idx: int, workdir: str, u
         except Exception:
             pass
 
-    # Xử lý kích thước & kiểm tra toàn vẹn chống crash 254
+    # Xử lý kích thước & kiểm tra toàn vẹn
     try:
         with Image.open(dest) as raw_img:
             fitted = ImageOps.fit(raw_img.convert("RGB"), (W, H), Image.LANCZOS)
@@ -182,11 +181,7 @@ def fetch_broll_clip(query_en: str, idx: int, target_frames: int, p_key: str, wo
     downloaded = False
     dur = target_frames / FPS
 
-    search_terms = [
-        query_en,
-        f"{query_en} action",
-        f"{query_en} cinematic"
-    ]
+    search_terms = [query_en, f"{query_en} realistic"]
 
     for term in search_terms:
         if downloaded:
@@ -233,13 +228,11 @@ def fetch_broll_clip(query_en: str, idx: int, target_frames: int, p_key: str, wo
     return None
 
 def create_kenburns_clip(img_path: str, target_frames: int, out_clip: str, mode: int = 0):
-    """Render Ken Burns an toàn, loại bỏ triệt để lỗi 254"""
     frames = max(25, target_frames)
     dur = frames / FPS
     step = 0.15 / frames
     m = mode % 4
 
-    # 1. Kiểm tra tính hợp lệ của file ảnh
     is_valid_img = False
     if os.path.exists(img_path) and os.path.getsize(img_path) > 3000:
         try:
@@ -253,7 +246,6 @@ def create_kenburns_clip(img_path: str, target_frames: int, out_clip: str, mode:
         safe_fallback = Image.new("RGB", (W, H), (30, 35, 45))
         safe_fallback.save(img_path, "JPEG", quality=90)
 
-    # 2. Quỹ đạo chuyển động
     if m == 0:
         z_expr = f"min(zoom+{step:.6f},1.15)"
         x_expr = "iw/2-(iw/zoom/2)"
@@ -278,7 +270,6 @@ def create_kenburns_clip(img_path: str, target_frames: int, out_clip: str, mode:
         f"format=yuv420p"
     )
 
-    # Dùng -t thay cho -vframes để triệt tiêu lỗi buffer 254
     cmd = [
         "ffmpeg", "-y", "-loop", "1", "-i", img_path,
         "-vf", filter_complex,
@@ -307,14 +298,13 @@ if st.button("⚡ Bắt Đầu Dựng Video Thành Phẩm Hoàn Chỉnh", use_co
             with open(audio_path, "wb") as f:
                 f.write(audio_file.getbuffer())
 
-            # Đo độ dài file gốc chuẩn xác
             cmd_dur = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", audio_path]
             total_audio_dur = float(subprocess.run(cmd_dur, capture_output=True, text=True).stdout.strip() or 10.0)
             total_required_frames = int(round(total_audio_dur * FPS))
 
             client = Groq(api_key=groq_key.strip())
 
-            # 1. Bóc tách âm thanh (Nén mono 16kHz chống lỗi 413)
+            # 1. Bóc tách âm thanh
             status.update(label="🎙️ 1/4: Whisper phân tích mốc thời gian & nhận diện ngôn ngữ...")
             compressed_audio = os.path.join(workdir, "whisper_input.mp3")
             compress_cmd = [
@@ -355,9 +345,8 @@ if st.button("⚡ Bắt Đầu Dựng Video Thành Phẩm Hoàn Chỉnh", use_co
                 segments.append({"start": cur_start, "end": total_audio_dur, "text": cur_text})
 
             if not segments:
-                segments.append({"start": 0.0, "end": total_audio_dur, "text": "workplace scene"})
+                segments.append({"start": 0.0, "end": total_audio_dur, "text": "story scene"})
 
-            # Khóa frame tuyệt đối
             accumulated_frames = 0
             for i in range(len(segments)):
                 if i < len(segments) - 1:
@@ -369,8 +358,8 @@ if st.button("⚡ Bắt Đầu Dựng Video Thành Phẩm Hoàn Chỉnh", use_co
                     remaining = total_required_frames - accumulated_frames
                     segments[i]["target_frames"] = max(25, remaining)
 
-            # 2. AI Đạo diễn bóc tách từ khóa (TẬP TRUNG 100% VÀO HÀNH ĐỘNG VÀ VẬT THỂ THỰC TẾ)
-            status.update(label=f"🧠 2/4: AI bóc tách hành động sát voice (Ngôn ngữ: {detected_lang.upper()})...")
+            # 2. AI Đạo diễn bóc tách từ khóa LINH HOẠT THEO TỪNG CÂU NÓI (KHÔNG ÉP KHUÔN)
+            status.update(label=f"🧠 2/4: AI trích xuất hành động chuẩn xác theo nội dung voice...")
             by_idx = {}
             batch_size = 12
 
@@ -379,42 +368,39 @@ if st.button("⚡ Bắt Đầu Dựng Video Thành Phẩm Hoàn Chỉnh", use_co
                 transcript_text = "\n".join([f"[{i + b_start}] {s['text'][:90]}" for i, s in enumerate(sub_segs)])
 
                 if is_english:
-                    prompt = f"""You are an elite visual scene director for a video: "{genre_mode}".
-Your highest priority: VISUALS MUST MATCH THE SPOKEN ACTION AND SUBJECT PRECISELY.
+                    prompt = f"""You are an elite visual scene director for a video with tone: "{genre_mode}".
+YOUR MISSION: EXTRACT THE EXACT VISUAL ACTION AND SUBJECT FROM EACH LINE OF THE SCRIPT.
 
-RULES:
-1. Extract the EXACT PHYSICAL OBJECT or ACTION spoken in each line (e.g. "holding a hot cup of coffee" -> "person holding cup of black coffee desk"; "staring at numbers on computer late night" -> "tired person looking at computer screen").
-2. NO literal childish interpretations (no gym deadlifts, divorce papers, outdoor farming, or music boards).
-3. CONVERT METAPHORS TO PHYSICAL VISUALS: If the sentence is abstract (e.g., "heavy burden"), show emotional human visuals (e.g., "exhausted person head in hands desk").
-4. CẤM text signs, logos, or literal banners.
+CORE RULES:
+1. Listen carefully to what is being described. If it talks about delivery, motorcycle, rain, food package, phone app -> extract delivery, motorcycle, rain, street visuals. If it talks about office -> extract office visuals.
+2. NEVER force any unrelated theme. Follow the script 100%.
+3. DO NOT search for text signs, quote banners, or literal abstract words. Capture physical actions and real-world scenes.
 
-Transcript:
+Script:
 {transcript_text}
 
-Output ONLY valid JSON:
+Return ONLY valid JSON:
 {{"scenes": [
-  {{"index": {b_start}, "query_vn": "", "query_en": "person holding cup of black coffee desk"}}
+  {{"index": {b_start}, "query_vn": "", "query_en": "delivery driver on motorcycle in rain"}}
 ]}}"""
                 else:
-                    prompt = f"""Bạn là đạo diễn hình ảnh điện ảnh cho video: "{genre_mode}".
-Nhiệm vụ tối thượng: HÌNH ẢNH PHẢI KHỚP TỪNG HÀNH ĐỘNG VÀ VẬT THỂ CỤ THỂ VỚI LỜI THOẠI.
+                    prompt = f"""Bạn là đạo diễn hình ảnh điện ảnh cho video với phong cách: "{genre_mode}".
+NHIỆM VỤ TỐI THƯỢNG: TRÍCH XUẤT ĐÚNG HÀNH ĐỘNG VÀ VẬT THỂ THỰC TẾ TRONG TỪNG CÂU NÓI CỦA BÀI.
 
 QUY TẮC BẮT BUỘC:
-1. Bóc tách ĐÚNG VẬT THỂ & HÀNH ĐỘNG đang nói (Ví dụ: nói 'cầm ly cà phê' -> tìm 'cầm ly cà phê đen trên bàn'; nói 'dán mắt vào màn hình máy tính' -> tìm 'mắt mệt mỏi nhìn màn hình máy tính'; nói 'đồng hồ điểm 3 giờ sáng' -> tìm 'đồng hồ treo tường ban đêm').
-2. TUYỆT ĐỐI CẤM hiểu theo nghĩa đen ngô nghê:
-   - Nói "ngàn cân" -> KHÔNG ĐƯỢC lấy tập gym/deadlift. Phải lấy: 'người ngồi ôm đầu trước đống tài liệu dày'.
-   - Nói "nộp đơn" -> KHÔNG ĐƯỢC lấy đơn ly hôn. Phải lấy: 'đơn xin việc, CV văn phòng'.
-   - Nói "vừa đấm vừa xoa" -> KHÔNG ĐƯỢC lấy hoạt động ngoài trời/bèo tây. Phải lấy: 'cuộc họp thương thuyết căng thẳng'.
-   - Nói "dòng máu tài chính/gian lận" -> KHÔNG ĐƯỢC lấy dạy nhạc/trường học. Phải lấy: 'báo cáo tài chính, biểu đồ tiền tệ'.
-3. CẢNH ĐẦU TIÊN [0]: Bắt buộc là 'tòa nhà chọc trời ban đêm rực rỡ' ('city skyscraper night lights').
-4. CẢNH CUỐI CÙNG: Bắt buộc là 'bàn làm việc kết thúc ngày' ('office desk night end of work').
+1. NÓI VỀ CÁI GÌ THÌ TÌM CÁI ĐÓ:
+   - Nói về chạy xe máy, shipper, né ổ gà, né công an, đội mũ bảo hiểm -> Tìm: 'shipper lái xe máy', 'con đường đất ổ gà', 'mũ bảo hiểm xe máy'.
+   - Nói về giao đồ ăn, khách bom hàng, đứng chờ dưới mưa -> Tìm: 'hộp đồ ăn giao hàng', 'người đứng chờ dưới mưa', 'màn hình điện thoại đơn hàng'.
+   - TUYỆT ĐỐI KHÔNG tự động nhồi nhét văn phòng, tòa nhà chọc trời, kiểm toán nếu trong câu thoại không nhắc đến.
+2. CẢNH ĐẦU TIÊN [0]: Bám sát nội dung câu mở đầu thực tế của đoạn thoại.
+3. CẤM tìm kiếm biển quảng cáo, chữ viết, tài liệu chữ vô nghĩa.
 
 Đoạn thoại:
 {transcript_text}
 
 Trả về DUY NHẤT JSON:
 {{"scenes": [
-  {{"index": {b_start}, "query_vn": "người cầm ly cà phê đặc góc bàn", "query_en": "person holding cup of black coffee desk"}}
+  {{"index": {b_start}, "query_vn": "tài xế giao hàng lái xe máy ngoài đường", "query_en": "delivery driver on motorcycle street"}}
 ]}}"""
 
                 try:
@@ -433,13 +419,13 @@ Trả về DUY NHẤT JSON:
                     pass
 
             # 3. Dựng cảnh 40% Video B-roll + 60% Ảnh tĩnh
-            status.update(label="🎬 3/4: Đang render từng clip (Chống lỗi 254 tuyệt đối)...")
+            status.update(label="🎬 3/4: Đang render từng clip, bám sát từng cảnh thoại...")
             clips_txt = os.path.join(workdir, "clips.txt")
             with open(clips_txt, "w", encoding="utf-8") as f_clips:
                 for idx, sc in enumerate(segments):
                     sc_data = by_idx.get(idx, {})
-                    query_vn = sc_data.get("query_vn") or "hồ sơ tài chính văn phòng"
-                    query_en = sc_data.get("query_en") or "corporate financial office work"
+                    query_vn = sc_data.get("query_vn") or "cuộc sống thường nhật"
+                    query_en = sc_data.get("query_en") or "daily life street reality"
                     t_frames = sc["target_frames"]
 
                     clip_path = None
@@ -454,8 +440,8 @@ Trả về DUY NHẤT JSON:
 
                     f_clips.write(f"file '{os.path.abspath(clip_path)}'\n")
 
-            # 4. Xuất video hoàn thiện khớp mốc audio
-            status.update(label="⚡ 4/4: Ghép video và nén xuất Master...", state="running")
+            # 4. Xuất video hoàn thiện
+            status.update(label="⚡ 4/4: Ghép video và xuất Master...", state="running")
             out_path = os.path.join(workdir, "output.mp4")
 
             cmd = [
@@ -471,7 +457,7 @@ Trả về DUY NHẤT JSON:
             ]
             subprocess.run(cmd, check=True)
 
-            status.update(label="✅ Thành phẩm xuất bản đã hoàn thành hoàn hảo!", state="complete")
+            status.update(label="✅ Video hoàn thành hoàn hảo, khớp chuẩn 100% voice!", state="complete")
 
             with open(out_path, "rb") as vid_file:
                 video_bytes = vid_file.read()
