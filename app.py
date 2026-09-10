@@ -22,23 +22,26 @@ from duckduckgo_search import DDGS
 st.set_page_config(page_title="Studio POV Master Engine Pro", page_icon="🎬", layout="centered")
 
 # ==============================================================================
-# FFMPEG RESOLVER — hoạt động cả trên Cloud lẫn local
+# FFMPEG RESOLVER — chạy trên Streamlit Cloud & local
 # ==============================================================================
 import imageio_ffmpeg
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
 def _resolve_ffprobe():
-    """Ưu tiên ffprobe cùng thư mục với ffmpeg; nếu không có → dùng ffmpeg -i parse."""
     for cand in ["ffprobe", "/usr/bin/ffprobe", "/usr/local/bin/ffprobe"]:
-        p = shutil.which(cand) if cand == "ffprobe" else (cand if os.path.exists(cand) else None)
-        if p:
-            return p
+        if cand == "ffprobe":
+            p = shutil.which(cand)
+            if p:
+                return p
+        elif os.path.exists(cand):
+            return cand
     return None
 
 FFPROBE_EXE = _resolve_ffprobe()
 
+
 def probe_duration(path):
-    """Lấy duration video/audio — fallback sang parse stderr nếu không có ffprobe."""
+    """Lấy duration — dùng ffprobe nếu có, fallback parse stderr ffmpeg."""
     if FFPROBE_EXE:
         try:
             r = subprocess.run(
@@ -49,7 +52,6 @@ def probe_duration(path):
             return float(r.stdout.strip() or 10.0)
         except Exception:
             pass
-    # Fallback: parse ffmpeg -i stderr
     try:
         r = subprocess.run([FFMPEG_EXE, "-i", path],
                            capture_output=True, text=True, timeout=15)
@@ -66,38 +68,53 @@ FPS = 25
 PEXELS_PHOTO_URL = "https://api.pexels.com/v1/search"
 PEXELS_VIDEO_URL = "https://api.pexels.com/videos/search"
 
+# Ngưỡng chia cảnh
 MIN_SCENE_DUR = 2.0
 MAX_SCENE_DUR = 4.0
 TARGET_SCENE_DUR = 2.8
 
 # ==============================================================================
-# MODEL CHAINS
+# MODEL CHAINS — CHỈ DÙNG CÁC MODEL CÓ TRONG DANH SÁCH CỦA BẠN
 # ==============================================================================
+# Query hình ảnh — ưu tiên gpt-oss-20b (khớp voice tốt nhất) → các model mạnh
 QUERY_MODEL_CHAIN = [
-    "qwen/qwen3.6-27b",
+    "openai/gpt-oss-20b",
     "openai/gpt-oss-120b",
     "llama-3.3-70b-versatile",
-    "openai/gpt-oss-20b",
-]
-ANALYSIS_MODEL_CHAIN = [
-    "openai/gpt-oss-20b",
-    "llama-3.1-8b-instant",
     "qwen/qwen3.6-27b",
 ]
-WHISPER_MODEL_CHAIN = ["whisper-large-v3-turbo", "whisper-large-v3"]
 
+# SFX + mood — task nhẹ, model nhỏ nhanh
+SFX_MODEL_CHAIN = [
+    "llama-3.1-8b-instant",
+    "openai/gpt-oss-20b",
+    "llama-3.3-70b-versatile",
+]
+
+MOOD_MODEL_CHAIN = [
+    "llama-3.1-8b-instant",
+    "openai/gpt-oss-20b",
+    "llama-3.3-70b-versatile",
+]
+
+# Whisper — turbo trước, full sau, cuối cùng faster-whisper local
+WHISPER_MODEL_CHAIN = [
+    "whisper-large-v3-turbo",
+    "whisper-large-v3",
+]
+
+# Mix gains
 VOICE_GAIN = 1.00
 SFX_GAIN = 0.30
 BGM_GAIN = 0.14
 
 # ==============================================================================
-# ĐỌC SECRETS TỪ st.secrets — không còn text_input cho key
+# SECRETS
 # ==============================================================================
 try:
     GROQ_API_KEY = st.secrets["GROQ_API_KEY"].strip()
 except Exception:
-    st.error("❌ Thiếu `GROQ_API_KEY` trong Streamlit Secrets. "
-             "Vào App Settings → Secrets để thêm.")
+    st.error("❌ Thiếu `GROQ_API_KEY` trong Streamlit Secrets.")
     st.stop()
 
 PEXELS_API_KEY = st.secrets.get("PEXELS_API_KEY", "").strip()
@@ -113,9 +130,10 @@ for key in ("used_img_hashes", "used_vid_ids", "used_sfx_urls"):
 # UI
 # ==============================================================================
 st.title("🎬 Studio POV Master Engine Pro")
-st.caption("Query đa tầng • SFX ambient theo cảnh • BGM mood • Ducking chuyên nghiệp")
+st.caption("Khớp voice 100% • SFX ambient • BGM mood • Ducking chuyên nghiệp")
 
-audio_file = st.file_uploader("Tải lên file Voice (MP3, WAV, M4A, OGG)", type=["mp3", "wav", "m4a", "ogg"])
+audio_file = st.file_uploader("Tải lên file Voice (MP3, WAV, M4A, OGG)",
+                              type=["mp3", "wav", "m4a", "ogg"])
 
 col_a, col_b = st.columns(2)
 with col_a:
@@ -126,14 +144,14 @@ with col_b:
     enable_ducking = st.checkbox("🎚️ Auto-ducking BGM", value=True)
 
 if not PEXELS_API_KEY:
-    st.warning("⚠️ Chưa có `PEXELS_API_KEY` — video sẽ chỉ dùng ảnh Wikimedia/DDG (chất lượng thấp hơn).")
+    st.warning("⚠️ Chưa có `PEXELS_API_KEY` — sẽ dùng ảnh Wikimedia/DDG (chất lượng thấp hơn).")
 
 # ==============================================================================
 # HELPERS
 # ==============================================================================
 def log(msg):
-    """In ra Cloud logs + ghi vào session để debug."""
     print(f"[POV] {msg}", flush=True)
+
 
 def download_file(url, dest, headers=None, min_size=30000, timeout=8):
     try:
@@ -148,6 +166,7 @@ def download_file(url, dest, headers=None, min_size=30000, timeout=8):
     except Exception:
         return False
 
+
 def image_content_hash(path):
     try:
         with Image.open(path) as im:
@@ -156,12 +175,15 @@ def image_content_hash(path):
     except Exception:
         return hashlib.md5(str(random.random()).encode()).hexdigest()
 
+
 def has_audio_stream(fp):
     try:
-        r = subprocess.run([FFMPEG_EXE, "-i", fp], capture_output=True, text=True, timeout=10)
+        r = subprocess.run([FFMPEG_EXE, "-i", fp],
+                           capture_output=True, text=True, timeout=10)
         return "Audio:" in r.stderr
     except Exception:
         return False
+
 
 # ==============================================================================
 # MODEL CALLERS
@@ -176,9 +198,10 @@ def call_llm(client, messages, model_chain, temperature=0.2):
             log(f"LLM OK: {model}")
             return content, model
         except Exception as e:
-            log(f"LLM FAIL {model}: {str(e)[:120]}")
+            log(f"LLM FAIL {model}: {str(e)[:140]}")
             continue
     return None, None
+
 
 def call_whisper(client, audio_path):
     with open(audio_path, "rb") as f:
@@ -193,7 +216,7 @@ def call_whisper(client, audio_path):
             log(f"Whisper OK: {model}")
             return data
         except Exception as e:
-            log(f"Whisper FAIL {model}: {str(e)[:120]}")
+            log(f"Whisper FAIL {model}: {str(e)[:140]}")
     log("Thử faster-whisper local...")
     try:
         from faster_whisper import WhisperModel
@@ -207,6 +230,7 @@ def call_whisper(client, audio_path):
         log(f"faster-whisper fail: {e}")
         return None
 
+
 # ==============================================================================
 # CHIA CẢNH
 # ==============================================================================
@@ -217,6 +241,7 @@ def split_text_by_punctuation(text):
     )
     parts = [p.strip() for p in parts if p.strip() and len(p.strip()) > 2]
     return parts or [text]
+
 
 def build_segments_from_whisper(raw_segs, total_dur):
     raw_sentences, buf_text, buf_start = [], "", 0.0
@@ -247,7 +272,7 @@ def build_segments_from_whisper(raw_segs, total_dur):
             words = text.split()
             n_chunks = max(2, math.ceil(dur / TARGET_SCENE_DUR))
             cs = max(2, len(words) // n_chunks)
-            parts = [" ".join(words[i:i+cs]) for i in range(0, len(words), cs)]
+            parts = [" ".join(words[i:i + cs]) for i in range(0, len(words), cs)]
         total_chars = sum(len(p) for p in parts) or 1
         cur_t = sent["start"]
         for p in parts:
@@ -267,6 +292,7 @@ def build_segments_from_whisper(raw_segs, total_dur):
         else:
             merged.append(s)
     return merged or [{"start": 0.0, "end": total_dur, "text": "story scene"}]
+
 
 # ==============================================================================
 # FETCH ẢNH
@@ -291,11 +317,13 @@ def fetch_image_pexels(query, p_key, used_urls, used_hashes, dest):
                     ch = image_content_hash(dest)
                     if ch in used_hashes:
                         continue
-                    used_urls.add(u); used_hashes.add(ch)
+                    used_urls.add(u)
+                    used_hashes.add(ch)
                     return True
         except Exception:
             continue
     return False
+
 
 def fetch_image_wikimedia(query, used_urls, used_hashes, dest):
     try:
@@ -320,14 +348,15 @@ def fetch_image_wikimedia(query, used_urls, used_hashes, dest):
                 ch = image_content_hash(dest)
                 if ch in used_hashes:
                     continue
-                used_urls.add(u); used_hashes.add(ch)
+                used_urls.add(u)
+                used_hashes.add(ch)
                 return True
     except Exception:
         pass
     return False
 
+
 def fetch_image_ddg(query, used_urls, used_hashes, dest, is_english):
-    """DDG có thể rate-limit trên Cloud — giới hạn 1 lần thử/query."""
     try:
         region = "wt-wt" if is_english else "vn-vi"
         with DDGS() as ddgs:
@@ -348,11 +377,13 @@ def fetch_image_ddg(query, used_urls, used_hashes, dest, is_english):
                 ch = image_content_hash(dest)
                 if ch in used_hashes:
                     continue
-                used_urls.add(u); used_hashes.add(ch)
+                used_urls.add(u)
+                used_hashes.add(ch)
                 return True
     except Exception as e:
         log(f"DDG fail: {str(e)[:80]}")
     return False
+
 
 def _finalize_image(path):
     try:
@@ -363,35 +394,48 @@ def _finalize_image(path):
         Image.new("RGB", (W, H), (18, 22, 32)).save(path, "JPEG", quality=88)
     return path
 
+
 def fetch_matching_image(query_candidates, idx, workdir, used_urls, used_hashes, p_key, is_english):
+    """Thử lần lượt các candidate + biến thể từ khóa trên 3 tầng Pexels → Wikimedia → DDG."""
     dest = os.path.join(workdir, f"img_{idx:03d}.jpg")
+
     all_variants = []
     for q in query_candidates:
         q = (q or "").strip()
         if not q:
             continue
         all_variants.append(q)
-        words = re.findall(r'[\wàáảãạăằắẳẵặâầấẩẫậèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵđ]+', q, re.IGNORECASE)
+        words = re.findall(r'[\wàáảãạăằắẳẵặâầấẩẫậèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵđ]+',
+                           q, re.IGNORECASE)
         if len(words) >= 4:
             all_variants.append(" ".join(words[:4]))
         if len(words) >= 2:
             all_variants.append(" ".join(words[:2]))
+
     seen, variants = set(), []
     for v in all_variants:
         if v.lower() not in seen:
-            seen.add(v.lower()); variants.append(v)
+            seen.add(v.lower())
+            variants.append(v)
 
+    # Tầng 1: Pexels
     for q in variants:
         if fetch_image_pexels(q, p_key, used_urls, used_hashes, dest):
             return _finalize_image(dest)
+
+    # Tầng 2: Wikimedia
     for q in variants:
         if fetch_image_wikimedia(q, used_urls, used_hashes, dest):
             return _finalize_image(dest)
+
+    # Tầng 3: DuckDuckGo (chỉ 3 variant đầu, tránh rate-limit)
     for q in variants[:3]:
         if fetch_image_ddg(q, used_urls, used_hashes, dest, is_english):
             return _finalize_image(dest)
+
     Image.new("RGB", (W, H), (18, 22, 32)).save(dest, "JPEG", quality=88)
     return dest
+
 
 # ==============================================================================
 # FETCH VIDEO B-ROLL
@@ -446,7 +490,8 @@ def fetch_broll_clip(query_candidates, idx, target_frames, p_key, workdir, used_
                                       f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
                                       f"d={target_frames}:s={W}x{H}:fps={FPS},format=yuv420p")
                             else:
-                                vf = f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},fps={FPS},format=yuv420p"
+                                vf = (f"scale={W}:{H}:force_original_aspect_ratio=increase,"
+                                      f"crop={W}:{H},fps={FPS},format=yuv420p")
                             cmd = [FFMPEG_EXE, "-y", "-i", raw_vid, "-t", f"{dur:.3f}", "-vf", vf]
                             if keep_audio:
                                 cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "22",
@@ -465,6 +510,7 @@ def fetch_broll_clip(query_candidates, idx, target_frames, p_key, workdir, used_
             except Exception:
                 continue
     return None
+
 
 # ==============================================================================
 # KEN BURNS
@@ -493,41 +539,69 @@ def create_kenburns_clip(img_path, target_frames, out_clip, mode=0):
         "-pix_fmt", "yuv420p", out_clip
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
+
 # ==============================================================================
-# AI BÓC TÁCH
+# AI — TÁCH 2 TASK: QUERY HÌNH ẢNH (PROMPT FEW-SHOT BẢN CŨ) + SFX
 # ==============================================================================
-def ai_extract_all(client, seg_batch, b_start, is_english):
+def ai_extract_queries(client, seg_batch, b_start, is_english):
+    """
+    Trích xuất 3 query tiếng Anh + 1 query VN cho mỗi câu thoại.
+    PROMPT GIỮ NGUYÊN few-shot examples của bản cũ để khớp voice.
+    """
     lines = "\n".join([f"[{i + b_start}] {s['text']}" for i, s in enumerate(seg_batch)])
-    prompt = f"""Bạn là Visual + Sound Director. Với MỖI câu thoại tiếng {"Anh" if is_english else "Việt"}, trả về:
 
-1) **queries**: 3 query tiếng Anh KHÁC NHAU để tìm stock footage:
-   - q1: chính xác nhất — [CHỦ THỂ] + [HÀNH ĐỘNG] + [BỐI CẢNH]
-   - q2: biến thể đồng nghĩa / góc máy khác
-   - q3: mở rộng cùng chủ đề
+    prompt = f"""Bạn là một đạo diễn hình ảnh có khả năng thích ứng linh hoạt tuyệt đối.
+Nhiệm vụ: Lắng nghe từng câu thoại tiếng {"Anh" if is_english else "Việt"} và trích xuất ĐÚNG HÀNH ĐỘNG, ĐỊA ĐIỂM, VẬT THỂ được nói đến.
 
-2) **query_vn**: bản dịch tiếng Việt 4–8 từ.
+QUY TẮC CỐT LÕI:
 
-3) **sfx**: 1–3 từ tiếng Anh mô tả âm thanh nền ("rain heavy", "birds chirping",
-   "footsteps street", "traffic city", "ocean waves", "cafe ambience", "room tone").
+1. KHÔNG ÉP BẤT KỲ ĐỊNH KIẾN NÀO — BÁM SÁT TỪNG TỪ TRONG CÂU GỐC:
+   - "đi uống cà phê, nhân viên nữ nhìn trộm" → 'coffee shop barista girl smiling customer table'
+   - "hai người bạn đi cạnh nhau, so sánh ngoại hình" → 'two young men walking street outdoor candid'
+   - "xin chụp ảnh, đưa điện thoại" → 'people taking selfie photo smartphone smiling outdoor'
+   - "xe máy, đường mưa" → 'motorcycle road heavy rain'
+   - "ngồi trong lớp học nhìn ra cửa sổ" → 'student sitting classroom window looking outside'
+   - "mẹ nấu ăn trong bếp" → 'mother cooking kitchen home warm'
+   - "đêm khuya, thành phố sáng đèn" → 'city street night neon lights traffic'
+   - "bãi biển, sóng vỗ" → 'beach ocean waves sunset'
+   - "đứa trẻ khóc giữa đám đông" → 'crying child crowded market square'
+   - "nhân viên văn phòng gõ bàn phím" → 'office worker typing laptop keyboard desk'
 
-QUY TẮC:
-- Bám sát DANH TỪ + ĐỘNG TỪ trong câu gốc.
-- CẤM: sad, lonely, depressed, thinking, moody, vibe, feeling, life, moment, scene.
-- Query 4–8 từ tiếng Anh.
+2. BẮT BUỘC dùng cấu trúc: [ĐỐI TƯỢNG CỤ THỂ] + [HÀNH ĐỘNG THỰC TẾ] + [ĐỊA ĐIỂM / BỐI CẢNH].
+
+3. TUYỆT ĐỐI CẤM dùng các từ cảm xúc mơ hồ: 'sad', 'depressed', 'lonely', 'thinking', 'suffering', 'moody', 'vibe', 'feeling', 'emotional'.
+
+4. CẤM các từ chung chung: 'life', 'moment', 'scene', 'person', 'thing', 'concept', 'abstract'.
+
+5. Nếu câu thoại nhắc đến VẬT THỂ cụ thể (điện thoại, ly cà phê, quyển sách, xe, áo, cửa, bàn, ghế...) → PHẢI đưa vật đó vào query tiếng Anh.
+
+6. Nếu câu thoại nhắc đến ĐỊA ĐIỂM cụ thể (quán ăn, trường học, công viên, văn phòng, biển, chợ...) → PHẢI đưa địa điểm đó vào query.
+
+7. Trả về 3 query tiếng Anh KHÁC NHAU:
+   - q1: CHÍNH XÁC NHẤT — bám sát từng danh từ + động từ của câu gốc
+   - q2: biến thể dùng từ đồng nghĩa hoặc góc máy khác (close-up / wide / action)
+   - q3: mở rộng vẫn cùng chủ đề, dùng khi q1 và q2 fail
+
+8. Mỗi query 4–8 từ tiếng Anh, viết như search query thực tế (không viết câu hoàn chỉnh).
+
+9. query_vn: bản dịch tiếng Việt ngắn 4–8 từ (giữ NGUYÊN danh từ riêng + động từ của câu gốc để backup search).
 
 Đoạn thoại:
 {lines}
 
-Trả về JSON:
-{{"scenes": [{{"index": {b_start}, "queries": ["q1","q2","q3"], "query_vn": "...", "sfx": "..."}}]}}"""
+Trả về DUY NHẤT JSON:
+{{"scenes": [
+  {{"index": {b_start}, "queries": ["q1", "q2", "q3"], "query_vn": "cụm tiếng Việt"}}
+]}}"""
 
-    content, _ = call_llm(
+    content, model = call_llm(
         client,
         messages=[
-            {"role": "system", "content": "CHỈ trả JSON hợp lệ, không markdown."},
+            {"role": "system", "content": "Bạn CHỈ trả về JSON hợp lệ, không markdown, không giải thích."},
             {"role": "user", "content": prompt},
         ],
-        model_chain=QUERY_MODEL_CHAIN, temperature=0.15,
+        model_chain=QUERY_MODEL_CHAIN,
+        temperature=0.25,
     )
     if not content:
         return {}
@@ -549,25 +623,70 @@ Trả về JSON:
         result[idx] = {
             "queries": [q for q in qs if q],
             "query_vn": (it.get("query_vn") or "").strip(),
-            "sfx": (it.get("sfx") or "").strip(),
         }
+    log(f"Queries extracted by {model}: {len(result)} scenes")
     return result
 
 
+def ai_extract_sfx(client, seg_batch, b_start):
+    """Trích xuất SFX keyword — task nhẹ, dùng model nhỏ."""
+    lines = "\n".join([f"[{i + b_start}] {s['text']}" for i, s in enumerate(seg_batch)])
+
+    prompt = f"""Với MỖI câu thoại dưới đây, trả về 1 cụm 2-3 từ tiếng Anh mô tả âm thanh nền phù hợp nhất.
+
+Danh sách gợi ý: rain heavy, rain light, birds chirping, footsteps street, traffic city,
+ocean waves, wind trees, engine car, motorcycle, cafe ambience, crowd chatter,
+typing keyboard, waterfall, thunder storm, night crickets, church bells, room tone.
+
+Quy tắc:
+- Nếu câu nói về hành động ở ngoài trời → chọn âm thanh ngoài trời.
+- Nếu câu nói về cảm xúc nội tâm / suy nghĩ → "room tone".
+- Nếu không có âm thanh đặc trưng → "room tone".
+
+Đoạn thoại:
+{lines}
+
+Trả về DUY NHẤT JSON:
+{{"sfx": [{{"index": {b_start}, "sound": "rain heavy"}}]}}"""
+
+    content, _ = call_llm(
+        client,
+        messages=[
+            {"role": "system", "content": "CHỈ trả về JSON."},
+            {"role": "user", "content": prompt},
+        ],
+        model_chain=SFX_MODEL_CHAIN,
+        temperature=0.1,
+    )
+    if not content:
+        return {}
+    m = re.search(r'\{.*\}', content, re.DOTALL)
+    if not m:
+        return {}
+    try:
+        parsed = json.loads(m.group(0)).get("sfx", [])
+    except Exception:
+        return {}
+    return {int(it["index"]): (it.get("sound") or "").strip()
+            for it in parsed if "index" in it}
+
+
 def ai_pick_bgm_mood(client, full_transcript):
-    prompt = f"""Đọc transcript và chọn 1 mood nhạc nền.
+    prompt = f"""Đọc transcript sau và chọn 1 mood nhạc nền phù hợp.
 
-Mood có sẵn: epic, sad, happy, chill, tense, mystery, motivational, romantic.
+Mood: epic, sad, happy, chill, tense, mystery, motivational, romantic.
 
-Chỉ trả về 1 từ.
+Chỉ trả về 1 từ tiếng Anh (không markdown, không giải thích).
 
 Transcript:
 {full_transcript[:2000]}
 
 Mood:"""
     content, _ = call_llm(
-        client, messages=[{"role": "user", "content": prompt}],
-        model_chain=ANALYSIS_MODEL_CHAIN, temperature=0.1,
+        client,
+        messages=[{"role": "user", "content": prompt}],
+        model_chain=MOOD_MODEL_CHAIN,
+        temperature=0.1,
     )
     if not content:
         return "chill"
@@ -575,8 +694,9 @@ Mood:"""
     valid = {"epic", "sad", "happy", "chill", "tense", "mystery", "motivational", "romantic"}
     return mood if mood in valid else "chill"
 
+
 # ==============================================================================
-# SFX + BGM
+# SFX + BGM FETCHERS
 # ==============================================================================
 def fetch_sfx_myinstants(sfx_query, dest, used_sfx_urls):
     try:
@@ -596,6 +716,7 @@ def fetch_sfx_myinstants(sfx_query, dest, used_sfx_urls):
     except Exception:
         pass
     return False
+
 
 def fetch_sfx_wikimedia(sfx_query, dest, used_sfx_urls):
     try:
@@ -620,8 +741,9 @@ def fetch_sfx_wikimedia(sfx_query, dest, used_sfx_urls):
         pass
     return False
 
+
 def fetch_sfx(sfx_query, idx, workdir, used_sfx_urls):
-    if not sfx_query:
+    if not sfx_query or sfx_query == "room tone":
         return None
     dest = os.path.join(workdir, f"sfx_{idx:03d}.mp3")
     if fetch_sfx_myinstants(sfx_query, dest, used_sfx_urls):
@@ -629,6 +751,7 @@ def fetch_sfx(sfx_query, idx, workdir, used_sfx_urls):
     if fetch_sfx_wikimedia(sfx_query, dest, used_sfx_urls):
         return dest
     return None
+
 
 BGM_LIBRARY = {
     "epic":         ["https://upload.wikimedia.org/wikipedia/commons/4/4c/Scott_Buckley_-_Aurora.mp3"],
@@ -641,6 +764,7 @@ BGM_LIBRARY = {
     "romantic":     ["https://upload.wikimedia.org/wikipedia/commons/f/f1/Kai_Engel_-_08_-_Soft.ogg"],
 }
 
+
 def fetch_bgm(mood, workdir):
     urls = BGM_LIBRARY.get(mood, BGM_LIBRARY["chill"])
     dest = os.path.join(workdir, "bgm.mp3")
@@ -649,10 +773,12 @@ def fetch_bgm(mood, workdir):
             return dest
     return None
 
+
 # ==============================================================================
 # AUDIO MIXER
 # ==============================================================================
-def build_audio_track(voice_path, sfx_entries, bgm_path, total_dur, out_audio, duck=True):
+def build_audio_track(voice_path, sfx_entries, bgm_path, total_dur, out_audio):
+    """Voice 100% + SFX 30% (chèn tại timestamp) + BGM 14% (loop) → amix → loudnorm."""
     inputs = ["-i", voice_path]
     filter_parts = [f"[0:a]volume={VOICE_GAIN},apad=pad_dur={total_dur},atrim=0:{total_dur}[v]"]
     mix_streams = ["[v]"]
@@ -693,8 +819,9 @@ def build_audio_track(voice_path, sfx_entries, bgm_path, total_dur, out_audio, d
     ]
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
+
 # ==============================================================================
-# PIPELINE
+# PIPELINE CHÍNH
 # ==============================================================================
 if st.button("⚡ Bắt Đầu Dựng Video Thành Phẩm", use_container_width=True, type="primary"):
     if not audio_file:
@@ -717,7 +844,7 @@ if st.button("⚡ Bắt Đầu Dựng Video Thành Phẩm", use_container_width=
             client = Groq(api_key=GROQ_API_KEY)
             log(f"Audio duration: {total_audio_dur:.2f}s")
 
-            # 1. Whisper
+            # ---------- 1. WHISPER ----------
             status.update(label="🎙️ 1/5: Whisper bóc tách timestamp...")
             compressed = os.path.join(workdir, "whisper_input.mp3")
             subprocess.run([
@@ -727,16 +854,19 @@ if st.button("⚡ Bắt Đầu Dựng Video Thành Phẩm", use_container_width=
 
             data = call_whisper(client, compressed)
             if not data:
-                st.error("❌ Không transcribe được. Bật Whisper trong Groq console hoặc thêm faster-whisper vào requirements.")
+                st.error("❌ Không transcribe được. Bật Whisper trong Groq console "
+                         "(tab Audio) hoặc thêm `faster-whisper` vào requirements.txt.")
                 st.stop()
 
             raw_segs = data.get("segments") or []
             detected_lang = (data.get("language") or "vietnamese").lower()
             is_english = "en" in detected_lang
+            log(f"Detected language: {detected_lang}")
 
-            # 2. Chia cảnh
+            # ---------- 2. CHIA CẢNH ----------
             segments = build_segments_from_whisper(raw_segs, total_audio_dur)
-            status.write(f"📊 **{len(segments)} cảnh** (~{total_audio_dur / len(segments):.1f}s/cảnh)")
+            status.write(f"📊 Chia thành **{len(segments)} cảnh** "
+                         f"(~{total_audio_dur / len(segments):.1f}s/cảnh)")
 
             accumulated = 0
             for i in range(len(segments)):
@@ -747,36 +877,57 @@ if st.button("⚡ Bắt Đầu Dựng Video Thành Phẩm", use_container_width=
                 else:
                     segments[i]["target_frames"] = max(15, total_required_frames - accumulated)
 
-            # 3. AI analysis
-            status.update(label="🧠 2/5: AI sinh query + SFX + mood...")
+            # ---------- 3. AI — QUERY HÌNH ẢNH (task chính, prompt few-shot) ----------
+            status.update(label="🧠 2/5: AI bóc tách query hình ảnh theo từng câu thoại...")
             by_idx = {}
             batch_size = 8
             for b_start in range(0, len(segments), batch_size):
                 sub = segments[b_start:b_start + batch_size]
-                by_idx.update(ai_extract_all(client, sub, b_start, is_english))
+                by_idx.update(ai_extract_queries(client, sub, b_start, is_english))
+                status.write(f"✓ Query: câu {b_start + 1}–{b_start + len(sub)}")
 
+            # ---------- 4. AI — SFX (task phụ, model nhẹ, tách riêng) ----------
+            sfx_by_idx = {}
+            if enable_sfx:
+                status.update(label="🔊 2.5/5: AI chọn SFX ambient cho từng cảnh...")
+                for b_start in range(0, len(segments), batch_size):
+                    sub = segments[b_start:b_start + batch_size]
+                    sfx_by_idx.update(ai_extract_sfx(client, sub, b_start))
+                non_tone = sum(1 for v in sfx_by_idx.values() if v and v != "room tone")
+                status.write(f"✓ SFX: {non_tone}/{len(segments)} cảnh có âm thanh riêng")
+
+            # ---------- 5. MOOD NHẠC + TẢI BGM ----------
             full_transcript = " ".join([s["text"] for s in segments])
             bgm_mood = ai_pick_bgm_mood(client, full_transcript) if enable_bgm else "chill"
-            status.write(f"🎵 Mood: **{bgm_mood}**")
+            status.write(f"🎵 Mood nhạc nền: **{bgm_mood}**")
 
-            bgm_path = fetch_bgm(bgm_mood, workdir) if enable_bgm else None
+            bgm_path = None
+            if enable_bgm:
+                bgm_path = fetch_bgm(bgm_mood, workdir)
+                if bgm_path:
+                    status.write("✓ Đã tải nhạc nền")
 
-            # 4. Build scenes
-            status.update(label="🎬 3/5: Dựng cảnh + tải SFX...")
+            # ---------- 6. DỰNG CẢNH + TẢI SFX ----------
+            status.update(label="🎬 3/5: Tìm ảnh/video khớp voice + tải SFX...")
             clips_txt = os.path.join(workdir, "clips.txt")
             sfx_entries = []
+            progress = st.progress(0.0)
 
             with open(clips_txt, "w", encoding="utf-8") as f_clips:
-                progress = st.progress(0.0)
                 for idx, sc in enumerate(segments):
                     sc_data = by_idx.get(idx, {})
                     queries = sc_data.get("queries") or []
                     query_vn = sc_data.get("query_vn") or ""
-                    sfx_kw = sc_data.get("sfx") or ""
 
+                    # Fallback nếu AI fail
                     if not queries:
-                        words = [w for w in re.findall(r'[a-zA-Z]+', sc["text"]) if len(w) > 3]
-                        queries = [" ".join(words[:5])] if words else ["everyday scene"]
+                        if is_english:
+                            words = [w for w in re.findall(r'[a-zA-Z]+', sc["text"]) if len(w) > 3]
+                            queries = [" ".join(words[:5])] if words else ["everyday scene"]
+                        else:
+                            clean = re.sub(r'[^\w\sàáảãạăằắẳẵặâầấẩẫậèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵđ]',
+                                           '', sc["text"], flags=re.IGNORECASE).strip()
+                            queries = [clean[:80] if clean else "everyday scene"]
 
                     candidates = list(queries)
                     if query_vn and query_vn not in candidates:
@@ -802,20 +953,33 @@ if st.button("⚡ Bắt Đầu Dựng Video Thành Phẩm", use_container_width=
 
                     f_clips.write(f"file '{os.path.abspath(clip_path)}'\n")
 
-                    if enable_sfx and sfx_kw:
-                        sfx_p = fetch_sfx(sfx_kw, idx, workdir, used_sfx_urls)
-                        if sfx_p:
-                            sfx_entries.append((sfx_p, sc["start"], sc["end"] - sc["start"]))
+                    # SFX của cảnh này
+                    if enable_sfx:
+                        sfx_kw = sfx_by_idx.get(idx, "")
+                        if sfx_kw and sfx_kw != "room tone":
+                            sfx_p = fetch_sfx(sfx_kw, idx, workdir, used_sfx_urls)
+                            if sfx_p:
+                                sfx_entries.append((sfx_p, sc["start"], sc["end"] - sc["start"]))
 
+                    tag = "VIDEO" if (is_video_slot and clip_path and os.path.exists(clip_path)) else "IMG"
+                    first_q = candidates[0] if candidates else ""
+                    status.write(f"✓ [{tag}] Cảnh {idx + 1}/{len(segments)}: `{first_q[:55]}`")
                     progress.progress((idx + 1) / len(segments))
 
-            # 5. Mix + Export
-            status.update(label="⚡ 4/5: Trộn audio...")
+            # ---------- 7. TRỘN AUDIO ----------
+            status.update(label="⚡ 4/5: Trộn voice + SFX + BGM...")
             mixed_audio = os.path.join(workdir, "mixed_audio.m4a")
-            build_audio_track(audio_path, sfx_entries, bgm_path,
-                              total_audio_dur, mixed_audio, duck=enable_ducking)
+            build_audio_track(
+                voice_path=audio_path,
+                sfx_entries=sfx_entries,
+                bgm_path=bgm_path,
+                total_dur=total_audio_dur,
+                out_audio=mixed_audio,
+            )
+            status.write(f"✓ Audio mix: {len(sfx_entries)} SFX + BGM {bgm_mood}")
 
-            status.update(label="⚡ 5/5: Ghép master...")
+            # ---------- 8. XUẤT MASTER ----------
+            status.update(label="⚡ 5/5: Ghép video master...")
             out_path = os.path.join(workdir, "output.mp4")
             subprocess.run([
                 FFMPEG_EXE, "-y",
