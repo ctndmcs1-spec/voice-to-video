@@ -3,3 +3,5 @@ requests
 Pillow
 groq
 duckduckgo_search
+imageio-ffmpeg
+faster-whisper
