@@ -26,25 +26,30 @@ LLM_MODEL = "openai/gpt-oss-20b"
 PEXELS_PHOTO_URL = "https://api.pexels.com/v1/search"
 PEXELS_VIDEO_URL = "https://api.pexels.com/videos/search"
 
-# Chống trùng qua session
+# Ngưỡng chia cảnh MỚI — nhiều cảnh hơn
+MIN_SCENE_DUR = 2.0    # tối thiểu 2s/cảnh
+MAX_SCENE_DUR = 4.0    # tối đa 4s/cảnh trước khi chẻ
+TARGET_SCENE_DUR = 2.8 # mục tiêu ~2.8s/cảnh
+
 if "used_img_hashes" not in st.session_state:
     st.session_state.used_img_hashes = set()
 if "used_vid_ids" not in st.session_state:
     st.session_state.used_vid_ids = set()
 
 st.title("🎬 Studio POV Master Engine Pro")
-st.caption("Bám sát 100% ngữ cảnh voice • Tự động nhận diện • Chống lệch đề & trùng lặp")
+st.caption("Cảnh dày hơn • Query đa tầng • Khớp voice 100%")
 
 groq_key = st.text_input("Groq API Key (Bắt buộc)", type="password", placeholder="gsk_...")
-pexels_key = st.text_input("Pexels API Key (Khuyến nghị - để có video + ảnh chất lượng)", type="password", placeholder="Key Pexels...")
+pexels_key = st.text_input("Pexels API Key (Khuyến nghị)", type="password")
 audio_file = st.file_uploader("Tải lên file Voice (MP3, WAV, M4A, OGG)", type=["mp3", "wav", "m4a", "ogg"])
 
 # ==============================================================================
 # HÀM PHỤ TRỢ
 # ==============================================================================
-def download_file(url: str, dest: str, headers=None, min_size: int = 30000, timeout: int = 8) -> bool:
+def download_file(url, dest, headers=None, min_size=30000, timeout=8):
     try:
-        r = requests.get(url, headers=headers or {"User-Agent": "Mozilla/5.0"}, timeout=timeout, stream=True)
+        r = requests.get(url, headers=headers or {"User-Agent": "Mozilla/5.0"},
+                         timeout=timeout, stream=True)
         if r.status_code != 200:
             return False
         with open(dest, "wb") as f:
@@ -55,8 +60,7 @@ def download_file(url: str, dest: str, headers=None, min_size: int = 30000, time
         return False
 
 
-def image_content_hash(path: str) -> str:
-    """Hash nội dung ảnh để chống trùng."""
+def image_content_hash(path):
     try:
         with Image.open(path) as im:
             small = im.convert("L").resize((32, 32))
@@ -65,7 +69,7 @@ def image_content_hash(path: str) -> str:
         return hashlib.md5(str(random.random()).encode()).hexdigest()
 
 
-def has_audio_stream(filepath: str) -> bool:
+def has_audio_stream(filepath):
     try:
         r = subprocess.run(["ffmpeg", "-i", filepath], capture_output=True, text=True, timeout=10)
         return "Audio:" in r.stderr
@@ -73,7 +77,7 @@ def has_audio_stream(filepath: str) -> bool:
         return False
 
 
-def get_duration(path: str) -> float:
+def get_duration(path):
     try:
         r = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -85,9 +89,97 @@ def get_duration(path: str) -> float:
         return 10.0
 
 # ==============================================================================
-# FETCH ẢNH — 3 tầng, ưu tiên khớp ngữ nghĩa cao
+# CHIA CẢNH DÀY — CHIA THEO DẤU CÂU + CẮT NHỎ CÂU DÀI
 # ==============================================================================
-def fetch_image_pexels(query: str, p_key: str, used_urls: set, used_hashes: set, dest: str) -> bool:
+def split_text_by_punctuation(text):
+    """Chia câu thành các mệnh đề theo dấu câu: . ! ? , ; —"""
+    parts = re.split(r'(?<=[.!?;])\s+|(?<=,)\s+(?=[A-ZĐÀÁẢÃẠĂẰẮẲẴẶÂẦẤẨẪẬÈÉẺẼẸÊỀẾỂỄỆÌÍỈĨỊÒÓỎÕỌÔỒỐỔỖỘƠỜỚỞỠỢÙÚỦŨỤƯỪỨỬỮỰỲÝỶỸỴ])', text)
+    parts = [p.strip() for p in parts if p.strip() and len(p.strip()) > 2]
+    return parts or [text]
+
+
+def build_segments_from_whisper(raw_segs, total_dur):
+    """
+    Xây dựng segment dày:
+    1. Gộp whisper segments nhỏ thành câu hoàn chỉnh (theo dấu câu)
+    2. Nếu câu > MAX_SCENE_DUR → chẻ tiếp
+    """
+    # Bước 1: gộp whisper segments thành "câu" theo dấu câu cuối
+    raw_sentences = []
+    buf_text = ""
+    buf_start = 0.0
+    for seg in raw_segs:
+        t = (seg.get("text") or "").strip()
+        if not t:
+            continue
+        if not buf_text:
+            buf_start = float(seg["start"])
+        buf_text = (buf_text + " " + t).strip()
+        # Nếu kết thúc bằng dấu câu mạnh → chốt câu
+        if re.search(r'[.!?]\s*$', buf_text):
+            raw_sentences.append({
+                "start": buf_start,
+                "end": float(seg["end"]),
+                "text": buf_text
+            })
+            buf_text = ""
+    if buf_text:
+        raw_sentences.append({
+            "start": buf_start,
+            "end": total_dur,
+            "text": buf_text
+        })
+    if not raw_sentences:
+        raw_sentences = [{"start": 0.0, "end": total_dur, "text": "story scene"}]
+
+    # Bước 2: chẻ câu dài thành nhiều cảnh ngắn
+    segments = []
+    for sent in raw_sentences:
+        dur = max(0.1, sent["end"] - sent["start"])
+        text = sent["text"]
+
+        # Nếu câu đã ngắn (< MAX) → giữ nguyên
+        if dur <= MAX_SCENE_DUR:
+            segments.append({"start": sent["start"], "end": sent["end"], "text": text})
+            continue
+
+        # Câu dài → chẻ theo dấu câu
+        parts = split_text_by_punctuation(text)
+        if len(parts) <= 1:
+            # Không có dấu câu phụ → chẻ theo số từ
+            words = text.split()
+            n_chunks = max(2, math.ceil(dur / TARGET_SCENE_DUR))
+            chunk_size = max(2, len(words) // n_chunks)
+            parts = [" ".join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size)]
+
+        # Phân bổ thời gian theo tỉ lệ độ dài ký tự
+        total_chars = sum(len(p) for p in parts) or 1
+        cur_t = sent["start"]
+        for p in parts:
+            ratio = len(p) / total_chars
+            part_dur = max(MIN_SCENE_DUR * 0.6, dur * ratio)
+            end_t = min(sent["end"], cur_t + part_dur)
+            segments.append({"start": cur_t, "end": end_t, "text": p.strip()})
+            cur_t = end_t
+        # Sửa lệch cuối
+        if segments and abs(segments[-1]["end"] - sent["end"]) > 0.05:
+            segments[-1]["end"] = sent["end"]
+
+    # Bước 3: gộp các mảnh quá ngắn (< MIN_SCENE_DUR) vào mảnh trước
+    merged = []
+    for s in segments:
+        if merged and (s["end"] - s["start"]) < MIN_SCENE_DUR * 0.6:
+            merged[-1]["text"] += " " + s["text"]
+            merged[-1]["end"] = s["end"]
+        else:
+            merged.append(s)
+
+    return merged or [{"start": 0.0, "end": total_dur, "text": "story scene"}]
+
+# ==============================================================================
+# FETCH ẢNH
+# ==============================================================================
+def fetch_image_pexels(query, p_key, used_urls, used_hashes, dest):
     if not p_key or not p_key.strip():
         return False
     headers = {"Authorization": p_key.strip()}
@@ -115,7 +207,7 @@ def fetch_image_pexels(query: str, p_key: str, used_urls: set, used_hashes: set,
     return False
 
 
-def fetch_image_wikimedia(query: str, used_urls: set, used_hashes: set, dest: str) -> bool:
+def fetch_image_wikimedia(query, used_urls, used_hashes, dest):
     try:
         url = (f"https://commons.wikimedia.org/w/api.php?action=query&generator=search"
                f"&gsrsearch={urllib.parse.quote(query)}&gsrlimit=15"
@@ -123,8 +215,7 @@ def fetch_image_wikimedia(query: str, used_urls: set, used_hashes: set, dest: st
         r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
         if not r.ok:
             return False
-        pages = r.json().get("query", {}).get("pages", {})
-        items = list(pages.values())
+        items = list(r.json().get("query", {}).get("pages", {}).values())
         random.shuffle(items)
         for info in items:
             img_info = info.get("imageinfo", [{}])[0]
@@ -147,7 +238,7 @@ def fetch_image_wikimedia(query: str, used_urls: set, used_hashes: set, dest: st
     return False
 
 
-def fetch_image_ddg(query: str, used_urls: set, used_hashes: set, dest: str, is_english: bool) -> bool:
+def fetch_image_ddg(query, used_urls, used_hashes, dest, is_english):
     try:
         region = "wt-wt" if is_english else "vn-vi"
         with DDGS() as ddgs:
@@ -176,69 +267,72 @@ def fetch_image_ddg(query: str, used_urls: set, used_hashes: set, dest: str, is_
     return False
 
 
-def fetch_matching_image(query_vn: str, query_en: str, idx: int, workdir: str,
-                         used_urls: set, used_hashes: set, p_key: str, is_english: bool) -> str:
-    """
-    Tìm ảnh khớp với query. Thử 3 tầng với nhiều biến thể query.
-    """
-    dest = os.path.join(workdir, f"img_{idx:03d}.jpg")
-    search_en = (query_en or "").strip() or "everyday life scene"
-    search_vn = (query_vn or "").strip()
-
-    # Nhiều biến thể query để tăng tỉ lệ khớp
-    query_variants = [search_en]
-    # Bỏ từ nhiễu và tạo biến thể ngắn hơn
-    words = [w for w in re.findall(r'[a-zA-Z]+', search_en) if len(w) > 2]
-    if len(words) >= 4:
-        query_variants.append(" ".join(words[:4]))
-    if len(words) >= 2:
-        query_variants.append(" ".join(words[:2]))
-
-    # Tầng 1: Pexels (chất lượng cao, khớp ngữ nghĩa tốt)
-    for q in query_variants:
-        if fetch_image_pexels(q, p_key, used_urls, used_hashes, dest):
-            return _finalize_image(dest)
-        if fetch_image_pexels(q + " realistic photo", p_key, used_urls, used_hashes, dest):
-            return _finalize_image(dest)
-
-    # Tầng 2: Wikimedia (miễn phí, đáng tin)
-    for q in query_variants:
-        if fetch_image_wikimedia(q, used_urls, used_hashes, dest):
-            return _finalize_image(dest)
-
-    # Tầng 3: DuckDuckGo (nhiều kết quả nhưng cần lọc)
-    for q in query_variants + ([search_vn] if search_vn and not is_english else []):
-        if fetch_image_ddg(q, used_urls, used_hashes, dest, is_english):
-            return _finalize_image(dest)
-        if fetch_image_ddg(q + " photo", used_urls, used_hashes, dest, is_english):
-            return _finalize_image(dest)
-
-    # Fallback an toàn cuối cùng
-    _make_safe_fallback(dest, idx)
-    return dest
-
-
-def _finalize_image(path: str) -> str:
-    """Cắt fit về 1280x720, giữ ảnh gốc chân thực (bỏ color grading giả tạo)."""
+def _finalize_image(path):
     try:
         with Image.open(path) as im:
             fitted = ImageOps.fit(im.convert("RGB"), (W, H), Image.LANCZOS)
             fitted.save(path, "JPEG", quality=92)
     except Exception:
-        _make_safe_fallback(path, 0)
+        _make_safe_fallback(path)
     return path
 
 
-def _make_safe_fallback(path: str, idx: int):
-    """Fallback tối thiểu: gradient tối giản (không random ảnh rác)."""
+def _make_safe_fallback(path):
     img = Image.new("RGB", (W, H), (18, 22, 32))
     img.save(path, "JPEG", quality=88)
 
+
+def fetch_matching_image(query_candidates, idx, workdir, used_urls, used_hashes, p_key, is_english):
+    """
+    query_candidates: list các query string (ưu tiên) — thử lần lượt.
+    """
+    dest = os.path.join(workdir, f"img_{idx:03d}.jpg")
+
+    # Mở rộng biến thể từ mỗi candidate
+    all_variants = []
+    for q in query_candidates:
+        q = (q or "").strip()
+        if not q:
+            continue
+        all_variants.append(q)
+        words = [w for w in re.findall(r'[a-zA-Z0-9àáảãạăằắẳẵặâầấẩẫậèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵđ]+',
+                                       q, re.IGNORECASE)]
+        if len(words) >= 4:
+            all_variants.append(" ".join(words[:4]))
+        if len(words) >= 2:
+            all_variants.append(" ".join(words[:2]))
+
+    # Loại trùng
+    seen = set()
+    variants = []
+    for v in all_variants:
+        vl = v.lower()
+        if vl not in seen:
+            seen.add(vl)
+            variants.append(v)
+
+    # Tầng 1: Pexels
+    for q in variants:
+        if fetch_image_pexels(q, p_key, used_urls, used_hashes, dest):
+            return _finalize_image(dest)
+
+    # Tầng 2: Wikimedia
+    for q in variants:
+        if fetch_image_wikimedia(q, used_urls, used_hashes, dest):
+            return _finalize_image(dest)
+
+    # Tầng 3: DuckDuckGo
+    for q in variants:
+        if fetch_image_ddg(q, used_urls, used_hashes, dest, is_english):
+            return _finalize_image(dest)
+
+    _make_safe_fallback(dest)
+    return dest
+
 # ==============================================================================
-# FETCH VIDEO B-ROLL (có âm thanh gốc)
+# FETCH VIDEO B-ROLL
 # ==============================================================================
-def fetch_broll_clip(query_en: str, idx: int, target_frames: int, p_key: str,
-                     workdir: str, used_vid_ids: set) -> str:
+def fetch_broll_clip(query_candidates, idx, target_frames, p_key, workdir, used_vid_ids):
     if not p_key or not p_key.strip():
         return None
 
@@ -247,11 +341,14 @@ def fetch_broll_clip(query_en: str, idx: int, target_frames: int, p_key: str,
     dur = target_frames / FPS
     headers = {"Authorization": p_key.strip()}
 
-    terms = [query_en]
-    words = [w for w in re.findall(r'[a-zA-Z]+', query_en) if len(w) > 2]
-    if len(words) >= 3:
-        terms.append(" ".join(words[:3]))
-    terms.append(f"{query_en} cinematic")
+    terms = []
+    for q in query_candidates:
+        q = (q or "").strip()
+        if q:
+            terms.append(q)
+            words = [w for w in re.findall(r'[a-zA-Z]+', q) if len(w) > 2]
+            if len(words) >= 3:
+                terms.append(" ".join(words[:3]))
 
     for term in terms:
         for page in random.sample(range(1, 4), 3):
@@ -300,16 +397,16 @@ def fetch_broll_clip(query_en: str, idx: int, target_frames: int, p_key: str,
     return None
 
 # ==============================================================================
-# KEN BURNS CLIP từ ảnh
+# KEN BURNS
 # ==============================================================================
-def create_kenburns_clip(img_path: str, target_frames: int, out_clip: str, mode: int = 0):
+def create_kenburns_clip(img_path, target_frames, out_clip, mode=0):
     frames = max(25, target_frames)
     dur = frames / FPS
     step = 0.15 / frames
     m = mode % 4
 
     if not os.path.exists(img_path) or os.path.getsize(img_path) < 3000:
-        _make_safe_fallback(img_path, 0)
+        _make_safe_fallback(img_path)
 
     if m == 0:
         z, x, y = f"min(zoom+{step:.6f},1.15)", "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
@@ -324,63 +421,84 @@ def create_kenburns_clip(img_path: str, target_frames: int, out_clip: str, mode:
           f"zoompan=z='{z}':x='{x}':y='{y}':d={frames}:s=2560x1440:fps={FPS},"
           f"scale={W}:{H}:flags=lanczos,format=yuv420p")
 
-    cmd = ["ffmpeg", "-y", "-loop", "1", "-i", img_path, "-vf", vf,
-           "-t", f"{dur:.3f}", "-c:v", "libx264", "-preset", "ultrafast",
-           "-pix_fmt", "yuv420p", out_clip]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    subprocess.run([
+        "ffmpeg", "-y", "-loop", "1", "-i", img_path, "-vf", vf,
+        "-t", f"{dur:.3f}", "-c:v", "libx264", "-preset", "ultrafast",
+        "-pix_fmt", "yuv420p", out_clip
+    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
 # ==============================================================================
-# AI TRÍCH XUẤT QUERY KHỚP VOICE
+# AI BÓC TÁCH — TRẢ 3 QUERY CANDIDATES / CẢNH
 # ==============================================================================
-def ai_extract_queries(client, segments_batch, b_start, is_english):
+def ai_extract_query_candidates(client, seg_batch, b_start, is_english):
     """
-    Bóc tách hành động-vật thể-bối cảnh CHÍNH XÁC theo từng câu thoại.
-    3 tầng bắt buộc: SUBJECT + ACTION + SETTING. Không bias theo genre.
+    Mỗi cảnh → 3 query candidates (EN ưu tiên, VN làm dự phòng).
     """
-    lines = "\n".join([f"[{i + b_start}] {s['text'][:140]}" for i, s in enumerate(segments_batch)])
+    lines = "\n".join([f"[{i + b_start}] {s['text']}" for i, s in enumerate(seg_batch)])
 
-    prompt = f"""Bạn là một Visual Director chuyên nghiệp, có nhiệm vụ chuyển từng câu thoại thành mô tả hình ảnh CỤ THỂ để tìm stock footage khớp 100%.
+    prompt = f"""Bạn là Visual Director chuyên tìm stock footage khớp 100% với lời thoại tiếng {"Anh" if is_english else "Việt"}.
+
+Với MỖI câu thoại, trả về 3 query tiếng Anh KHÁC NHAU để tìm hình ảnh/video khớp nhất:
+- query_1 (chính xác nhất): [CHỦ THỂ] + [HÀNH ĐỘNG] + [BỐI CẢNH cụ thể]
+- query_2 (gần nghĩa): biến thể dùng từ đồng nghĩa hoặc góc máy khác
+- query_3 (dự phòng): mở rộng vẫn cùng chủ đề
 
 QUY TẮC BẮT BUỘC:
-1. Bóc tách theo 3 tầng: [CHỦ THỂ CỤ THỂ] + [HÀNH ĐỘNG VẬT LÝ] + [BỐI CẢNH].
-   Ví dụ: "cô gái rót cà phê quán nhỏ", "nam sinh mở cửa lớp học", "xe máy chạy đường mưa".
-
-2. KHÔNG suy diễn cảm xúc trừu tượng. CHỈ mô tả những gì camera có thể quay được.
-   CẤM: sad, lonely, depressed, thinking, moody, deep, feeling, vibe.
-
-3. Nếu câu thoại nhắc đến vật thể cụ thể (điện thoại, ly cà phê, quyển sách, xe, áo, v.v.) → PHẢI đưa vật đó vào query.
-
-4. Nếu câu thoại nhắc địa điểm cụ thể (quán ăn, trường học, công viên, văn phòng) → PHẢI đưa địa điểm đó vào query.
-
-5. query_en PHẢI 4–8 từ tiếng Anh, dùng danh từ + động từ cụ thể. KHÔNG dùng từ chung chung như "life", "moment", "scene".
-
-6. Mỗi câu thoại → 1 query RIÊNG, KHÔNG trùng với câu khác.
+1. Phải bám vào DANH TỪ và ĐỘNG TỪ có trong câu thoại gốc (người, vật, hành động, địa điểm).
+2. CẤM từ cảm xúc trừu tượng: sad, lonely, depressed, thinking, moody, vibe, feeling.
+3. CẤM từ chung chung: life, moment, scene, person, thing.
+4. Mỗi query 4–8 từ tiếng Anh, có thể search được trên Pexels/Google.
+5. query_vn: bản dịch tiếng Việt ngắn gọn để backup search.
 
 Đoạn thoại:
 {lines}
 
 Trả về DUY NHẤT JSON:
 {{"scenes": [
-  {{"index": {b_start}, "query_en": "young woman pouring coffee small cafe", "query_vn": "cô gái rót cà phê quán nhỏ"}}
+  {{"index": {b_start},
+    "queries": ["specific query 1", "synonym query 2", "broader query 3"],
+    "query_vn": "cụm từ tiếng Việt ngắn"}}
 ]}}"""
 
     try:
         resp = client.chat.completions.create(
             model=LLM_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.15,
+            temperature=0.2,
         )
         content = resp.choices[0].message.content
         match = re.search(r'\{.*\}', content, re.DOTALL)
         if not match:
             return {}
         parsed = json.loads(match.group(0)).get("scenes", [])
-        return {int(it.get("index", -1)): it for it in parsed if "index" in it}
+        result = {}
+        for it in parsed:
+            if "index" not in it:
+                continue
+            idx = int(it["index"])
+            queries = it.get("queries") or []
+            if isinstance(queries, str):
+                queries = [queries]
+            vn = (it.get("query_vn") or "").strip()
+            result[idx] = {"queries": [q for q in queries if q], "query_vn": vn}
+        return result
     except Exception:
         return {}
 
+
+def fallback_query_from_text(text, is_english):
+    """Nếu AI fail → trích từ khóa trực tiếp từ câu thoại."""
+    if is_english:
+        words = [w for w in re.findall(r'[a-zA-Z]+', text) if len(w) > 3]
+        return [" ".join(words[:5]) if words else "everyday scene"]
+    else:
+        # Tiếng Việt: dùng nguyên câu làm query VN
+        clean = re.sub(r'[^\w\sàáảãạăằắẳẵặâầấẩẫậèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵđ]',
+                       '', text, flags=re.IGNORECASE).strip()
+        return [clean[:80] if clean else "everyday scene"]
+
 # ==============================================================================
-# PIPELINE CHÍNH
+# PIPELINE
 # ==============================================================================
 if st.button("⚡ Bắt Đầu Dựng Video Thành Phẩm", use_container_width=True, type="primary"):
     if not groq_key or not groq_key.strip():
@@ -403,8 +521,8 @@ if st.button("⚡ Bắt Đầu Dựng Video Thành Phẩm", use_container_width=
             total_required_frames = int(round(total_audio_dur * FPS))
             client = Groq(api_key=groq_key.strip())
 
-            # ---------- BƯỚC 1: WHISPER ----------
-            status.update(label="🎙️ 1/4: Whisper bóc tách timestamp + lời thoại...")
+            # ---------- 1. WHISPER ----------
+            status.update(label="🎙️ 1/4: Whisper bóc tách timestamp...")
             compressed = os.path.join(workdir, "whisper_input.mp3")
             subprocess.run([
                 "ffmpeg", "-y", "-i", audio_path, "-vn",
@@ -420,76 +538,70 @@ if st.button("⚡ Bắt Đầu Dựng Video Thành Phẩm", use_container_width=
             detected_lang = (data.get("language") or "vietnamese").lower()
             is_english = "en" in detected_lang
 
-            # Gộp segment thành câu ~4.5s trở lên
-            segments = []
-            cur_text, cur_start = "", 0.0
-            for seg in raw_segs:
-                t = (seg.get("text") or "").strip()
-                if not t:
-                    continue
-                if not cur_text:
-                    cur_start = float(seg["start"])
-                    cur_text = t
-                else:
-                    cur_text += " " + t
-                if float(seg["end"]) - cur_start >= 4.5:
-                    segments.append({"start": cur_start, "end": float(seg["end"]), "text": cur_text})
-                    cur_text = ""
-            if cur_text:
-                segments.append({"start": cur_start, "end": total_audio_dur, "text": cur_text})
-            if not segments:
-                segments.append({"start": 0.0, "end": total_audio_dur, "text": "story scene"})
+            # ---------- 2. CHIA CẢNH DÀY ----------
+            segments = build_segments_from_whisper(raw_segs, total_audio_dur)
+            status.write(f"📊 Chia thành **{len(segments)} cảnh** (~{total_audio_dur / len(segments):.1f}s/cảnh)")
 
-            # Phân bổ frame chính xác theo timestamp
+            # Phân bổ frame chính xác
             accumulated = 0
             for i in range(len(segments)):
                 if i < len(segments) - 1:
                     seg_dur = segments[i + 1]["start"] - segments[i]["start"]
-                    segments[i]["target_frames"] = max(25, int(round(seg_dur * FPS)))
+                    segments[i]["target_frames"] = max(15, int(round(seg_dur * FPS)))
                     accumulated += segments[i]["target_frames"]
                 else:
-                    segments[i]["target_frames"] = max(25, total_required_frames - accumulated)
+                    segments[i]["target_frames"] = max(15, total_required_frames - accumulated)
 
-            # ---------- BƯỚC 2: AI BÓC TÁCH QUERY ----------
-            status.update(label="🧠 2/4: AI bóc tách hành động–vật thể–bối cảnh theo voice...")
+            # ---------- 3. AI BÓC TÁCH 3 QUERY/CẢNH ----------
+            status.update(label="🧠 3/5: AI sinh 3 query candidates cho mỗi cảnh...")
             by_idx = {}
-            batch_size = 10
+            batch_size = 8
             for b_start in range(0, len(segments), batch_size):
                 sub = segments[b_start:b_start + batch_size]
-                parsed = ai_extract_queries(client, sub, b_start, is_english)
+                parsed = ai_extract_query_candidates(client, sub, b_start, is_english)
                 by_idx.update(parsed)
                 status.write(f"✓ Đã phân tích câu {b_start + 1}–{b_start + len(sub)}")
 
-            # ---------- BƯỚC 3: DỰNG CẢNH ----------
-            status.update(label="🎬 3/4: Tìm ảnh/video khớp voice + dựng cảnh...")
+            # ---------- 4. DỰNG CẢNH ----------
+            status.update(label="🎬 4/5: Tìm ảnh/video khớp voice...")
             clips_txt = os.path.join(workdir, "clips.txt")
             with open(clips_txt, "w", encoding="utf-8") as f_clips:
                 for idx, sc in enumerate(segments):
                     sc_data = by_idx.get(idx, {})
-                    query_vn = (sc_data.get("query_vn") or sc["text"][:60]).strip()
-                    query_en = (sc_data.get("query_en") or sc["text"][:60]).strip()
+                    queries = sc_data.get("queries") or []
+                    query_vn = sc_data.get("query_vn") or ""
+
+                    # Nếu AI fail → fallback từ chính câu thoại
+                    if not queries:
+                        queries = fallback_query_from_text(sc["text"], is_english)
+                    # Thêm query_vn làm candidate cuối
+                    candidates = list(queries)
+                    if query_vn and query_vn not in candidates:
+                        candidates.append(query_vn)
+
                     t_frames = sc["target_frames"]
 
-                    # Ưu tiên video B-roll ở một số slot, xen kẽ ảnh Ken Burns
+                    # Tăng tỉ lệ video B-roll lên 1/2 scene
                     clip_path = None
-                    is_video_slot = (idx % 4 == 1) and (idx != len(segments) - 1)
+                    is_video_slot = (idx % 2 == 1) and (idx != len(segments) - 1)
                     if is_video_slot and pexels_key:
-                        clip_path = fetch_broll_clip(query_en, idx, t_frames, pexels_key,
-                                                     workdir, used_vid_ids)
+                        clip_path = fetch_broll_clip(candidates, idx, t_frames,
+                                                     pexels_key, workdir, used_vid_ids)
 
                     if not clip_path:
                         img_path = fetch_matching_image(
-                            query_vn, query_en, idx, workdir,
+                            candidates, idx, workdir,
                             used_urls, used_img_hashes, pexels_key, is_english
                         )
                         clip_path = os.path.join(workdir, f"clip_{idx:03d}.mp4")
                         create_kenburns_clip(img_path, t_frames, clip_path, mode=idx)
 
                     f_clips.write(f"file '{os.path.abspath(clip_path)}'\n")
-                    status.write(f"✓ Cảnh {idx + 1}/{len(segments)}: `{query_en[:50]}`")
+                    tag = "VIDEO" if is_video_slot and clip_path else "IMG"
+                    status.write(f"✓ [{tag}] Cảnh {idx + 1}/{len(segments)}: `{(candidates[0] if candidates else '')[:55]}`")
 
-            # ---------- BƯỚC 4: XUẤT MASTER ----------
-            status.update(label="⚡ 4/4: Ghép master + chuẩn hóa audio...")
+            # ---------- 5. XUẤT MASTER ----------
+            status.update(label="⚡ 5/5: Ghép master + loudnorm...")
             out_path = os.path.join(workdir, "output.mp4")
 
             subprocess.run([
@@ -504,7 +616,7 @@ if st.button("⚡ Bắt Đầu Dựng Video Thành Phẩm", use_container_width=
                 out_path
             ], check=True)
 
-            status.update(label="✅ Video hoàn thành!", state="complete")
+            status.update(label=f"✅ Video hoàn thành ({len(segments)} cảnh)!", state="complete")
 
             with open(out_path, "rb") as vid_file:
                 video_bytes = vid_file.read()
