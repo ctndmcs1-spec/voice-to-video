@@ -15,7 +15,7 @@ from PIL import Image, ImageOps, ImageEnhance
 from groq import Groq
 from duckduckgo_search import DDGS
 
-st.set_page_config(page_title="Studio POV Master Engine", page_icon="🎬", layout="centered")
+st.set_page_config(page_title="Studio POV Master Engine - Dual Engine", page_icon="🎬", layout="centered")
 
 W, H = 1280, 720
 FPS = 25
@@ -24,39 +24,47 @@ LLM_MODEL = "qwen/qwen3.6-27b"
 PEXELS_PHOTO_URL = "https://api.pexels.com/v1/search"
 PEXELS_VIDEO_URL = "https://api.pexels.com/videos/search"
 
-st.title("🎬 Studio POV Master Engine")
-st.caption("Khớp 100% ngữ cảnh đời thực của Voice, không ép khuôn mẫu, chống lỗi 254 tuyệt đối")
+st.title("🎬 Studio POV Master Engine Pro")
+st.caption("Hỗ trợ cả Stock Người Thật và AI Gen Webtoon/Manhwa Tự Động Miễn Phí")
+
+render_engine = st.radio(
+    "Chọn phong cách dựng hình ảnh:",
+    [
+        "🎨 AI Gen: Webtoon / Manhwa POV (Tự vẽ 100% bằng AI Flux, đồng nhất nhân vật)",
+        "📷 Stock Footage: Người thật / B-roll (Pexels + DuckDuckGo + Wikimedia)"
+    ]
+)
 
 genre_mode = st.selectbox(
-    "Chọn phong cách & Tone màu chủ đạo của Video:",
+    "Chọn Tone màu & Thể loại câu chuyện:",
     [
+        "Học đường / Webtoon Manhwa (Handsome Boy / School POV)",
         "Đời sống thường nhật & Bụi bặm (Street Life / Realistic)",
         "Tâm lý / Góc khuất & U tối (Dark Moody POV)",
-        "Nghề nghiệp / Tươi sáng & Động lực (Bright Career)",
         "Tài chính / Khởi nghiệp & Kịch tính (Corporate / Hustle)"
     ]
 )
 
 groq_key = st.text_input("Groq API Key (Bắt buộc)", type="password", placeholder="gsk_...")
-pexels_key = st.text_input("Pexels API Key (Để lấy video B-roll HD)", type="password", placeholder="Key Pexels...")
-audio_file = st.file_uploader("Tải lên file Voice âm thanh", type=["mp3", "wav", "m4a", "ogg"])
+pexels_key = st.text_input("Pexels API Key (Tùy chọn cho chế độ Stock footage)", type="password", placeholder="Key Pexels...")
+audio_file = st.file_uploader("Tải lên file Voice âm thanh (Hỗ trợ MP3, WAV, M4A, OGG)", type=["mp3", "wav", "m4a", "ogg"])
 
 def apply_genre_color_grading(img: Image.Image, genre: str) -> Image.Image:
-    if "Street Life" in genre or "Đời sống" in genre:
+    if "Webtoon" in genre or "Học đường" in genre:
         enhancer = ImageEnhance.Color(img)
-        graded = enhancer.enhance(1.05)
+        graded = enhancer.enhance(1.10)
         enhancer = ImageEnhance.Contrast(graded)
-        return enhancer.enhance(1.08)
+        return enhancer.enhance(1.05)
     elif "Dark Moody" in genre:
         enhancer = ImageEnhance.Contrast(img)
         graded = enhancer.enhance(1.20)
         enhancer = ImageEnhance.Brightness(graded)
         return enhancer.enhance(0.90)
-    elif "Bright Career" in genre:
-        enhancer = ImageEnhance.Brightness(img)
-        img = enhancer.enhance(1.05)
+    elif "Street Life" in genre or "Đời sống" in genre:
         enhancer = ImageEnhance.Color(img)
-        return enhancer.enhance(1.15)
+        graded = enhancer.enhance(1.05)
+        enhancer = ImageEnhance.Contrast(graded)
+        return enhancer.enhance(1.08)
     else:
         enhancer = ImageEnhance.Contrast(img)
         graded = enhancer.enhance(1.15)
@@ -64,12 +72,58 @@ def apply_genre_color_grading(img: Image.Image, genre: str) -> Image.Image:
         b = b.point(lambda i: min(255, int(i * 1.05)))
         return Image.merge("RGB", (r, g, b))
 
+def generate_manhwa_image(query_en: str, idx: int, workdir: str, char_seed: int, genre: str) -> str:
+    """Tạo ảnh Webtoon/Manhwa trực tiếp qua Pollinations Flux API, giữ nhất quán nhân vật"""
+    dest = os.path.join(workdir, f"bg_{idx:03d}.jpg")
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+
+    char_dna = "korean manhwa webtoon style, 2D anime illustration, handsome 16-year-old high school boy, messy soft black hair, sharp handsome jawline, white school uniform shirt navy collar, clean detailed lines, cinematic lighting, 4k"
+    full_prompt = f"{char_dna}, {query_en}, anime background, aesthetic digital art"
+    encoded = urllib.parse.quote(full_prompt)
+
+    gen_url = f"https://image.pollinations.ai/prompt/{encoded}?width={W}&height={H}&model=flux&seed={char_seed}&nologo=true"
+
+    downloaded = False
+    for _ in range(2):
+        try:
+            resp = requests.get(gen_url, headers=headers, timeout=20)
+            if resp.status_code == 200 and len(resp.content) > 30000:
+                with open(dest, "wb") as f:
+                    f.write(resp.content)
+                downloaded = True
+                break
+        except Exception:
+            time.sleep(1)
+
+    if not downloaded:
+        random_seed = random.randint(1000, 99999)
+        direct_url = f"https://loremflickr.com/1280/720/anime,school?lock={random_seed}"
+        try:
+            resp = requests.get(direct_url, timeout=7)
+            if resp.status_code == 200 and len(resp.content) > 20000:
+                with open(dest, "wb") as f:
+                    f.write(resp.content)
+                downloaded = True
+        except Exception:
+            pass
+
+    try:
+        with Image.open(dest) as raw_img:
+            fitted = ImageOps.fit(raw_img.convert("RGB"), (W, H), Image.LANCZOS)
+            graded = apply_genre_color_grading(fitted, genre)
+            graded.save(dest, "JPEG", quality=92)
+    except Exception:
+        safe_fallback = Image.new("RGB", (W, H), (25, 30, 45))
+        safe_fallback.save(dest, "JPEG", quality=90)
+
+    return dest
+
 def fetch_matching_image(query_vn: str, query_en: str, idx: int, workdir: str, used_urls: set, p_key: str, genre: str, is_english: bool) -> str:
+    """Cào ảnh thực tế từ Pexels, Wikimedia, DuckDuckGo"""
     dest = os.path.join(workdir, f"bg_{idx:03d}.jpg")
     downloaded = False
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-
-    search_en = query_en.strip() if query_en else "everyday life street"
+    search_en = query_en.strip() if query_en else "daily life scene"
 
     # Tầng 1: Pexels API
     if p_key and p_key.strip():
@@ -146,10 +200,10 @@ def fetch_matching_image(query_vn: str, query_en: str, idx: int, workdir: str, u
             except Exception:
                 continue
 
-    # Tầng 4: CDN Công cộng linh hoạt theo chủ đề thực tế (không ép văn phòng)
+    # Tầng 4: Fallback linh hoạt
     if not downloaded:
         random_seed = random.randint(1000, 99999)
-        topic = "street,people,city" if ("Street" in genre or "Đời sống" in genre) else "cinematic,lifestyle"
+        topic = "street,people,city" if ("Street" in genre or "Đời sống" in genre) else "lifestyle,human"
         direct_url = f"https://loremflickr.com/1280/720/{topic}?lock={random_seed}"
         try:
             resp = requests.get(direct_url, timeout=7)
@@ -160,7 +214,6 @@ def fetch_matching_image(query_vn: str, query_en: str, idx: int, workdir: str, u
         except Exception:
             pass
 
-    # Xử lý kích thước & kiểm tra toàn vẹn
     try:
         with Image.open(dest) as raw_img:
             fitted = ImageOps.fit(raw_img.convert("RGB"), (W, H), Image.LANCZOS)
@@ -282,16 +335,18 @@ def create_kenburns_clip(img_path: str, target_frames: int, out_clip: str, mode:
 # ==============================================================================
 # PIPELINE SẢN XUẤT CHÍNH
 # ==============================================================================
-if st.button("⚡ Bắt Đầu Dựng Video Thành Phẩm Hoàn Chỉnh", use_container_width=True, type="primary"):
+if st.button("⚡ Bắt Đầu Dựng Video Thành Phẩm", use_container_width=True, type="primary"):
     if not groq_key or not groq_key.strip():
         st.error("Vui lòng nhập Groq API Key!")
     elif not audio_file:
         st.error("Vui lòng tải file Voice âm thanh lên trước!")
     else:
-        status = st.status("Đang chuẩn bị dây chuyền sản xuất video...", expanded=True)
+        is_webtoon_mode = "AI Gen" in render_engine
+        status = st.status("Đang khởi động xưởng sản xuất video...", expanded=True)
         workdir = tempfile.mkdtemp(prefix="master_prod_")
         used_urls = set()
         used_vid_ids = set()
+        char_seed = random.randint(10000, 999999)
 
         try:
             audio_path = os.path.join(workdir, audio_file.name)
@@ -304,8 +359,8 @@ if st.button("⚡ Bắt Đầu Dựng Video Thành Phẩm Hoàn Chỉnh", use_co
 
             client = Groq(api_key=groq_key.strip())
 
-            # 1. Bóc tách âm thanh
-            status.update(label="🎙️ 1/4: Whisper phân tích mốc thời gian & nhận diện ngôn ngữ...")
+            # 1. Whisper bóc tách mốc thời gian
+            status.update(label="🎙️ 1/4: Whisper phân tích timestamp & bóc tách lời thoại...")
             compressed_audio = os.path.join(workdir, "whisper_input.mp3")
             compress_cmd = [
                 "ffmpeg", "-y", "-i", audio_path,
@@ -358,8 +413,8 @@ if st.button("⚡ Bắt Đầu Dựng Video Thành Phẩm Hoàn Chỉnh", use_co
                     remaining = total_required_frames - accumulated_frames
                     segments[i]["target_frames"] = max(25, remaining)
 
-            # 2. AI Đạo diễn bóc tách từ khóa LINH HOẠT THEO TỪNG CÂU NÓI (KHÔNG ÉP KHUÔN)
-            status.update(label=f"🧠 2/4: AI trích xuất hành động chuẩn xác theo nội dung voice...")
+            # 2. AI Đạo diễn bóc tách từ khóa hành động chi tiết
+            status.update(label=f"🧠 2/4: AI Đạo diễn trích xuất hành động bám sát từng câu thoại...")
             by_idx = {}
             batch_size = 12
 
@@ -367,40 +422,34 @@ if st.button("⚡ Bắt Đầu Dựng Video Thành Phẩm Hoàn Chỉnh", use_co
                 sub_segs = segments[b_start:b_start + batch_size]
                 transcript_text = "\n".join([f"[{i + b_start}] {s['text'][:90]}" for i, s in enumerate(sub_segs)])
 
-                if is_english:
-                    prompt = f"""You are an elite visual scene director for a video with tone: "{genre_mode}".
-YOUR MISSION: EXTRACT THE EXACT VISUAL ACTION AND SUBJECT FROM EACH LINE OF THE SCRIPT.
-
-CORE RULES:
-1. Listen carefully to what is being described. If it talks about delivery, motorcycle, rain, food package, phone app -> extract delivery, motorcycle, rain, street visuals. If it talks about office -> extract office visuals.
-2. NEVER force any unrelated theme. Follow the script 100%.
-3. DO NOT search for text signs, quote banners, or literal abstract words. Capture physical actions and real-world scenes.
-
-Script:
-{transcript_text}
-
-Return ONLY valid JSON:
-{{"scenes": [
-  {{"index": {b_start}, "query_vn": "", "query_en": "delivery driver on motorcycle in rain"}}
-]}}"""
-                else:
-                    prompt = f"""Bạn là đạo diễn hình ảnh điện ảnh cho video với phong cách: "{genre_mode}".
-NHIỆM VỤ TỐI THƯỢNG: TRÍCH XUẤT ĐÚNG HÀNH ĐỘNG VÀ VẬT THỂ THỰC TẾ TRONG TỪNG CÂU NÓI CỦA BÀI.
+                if is_webtoon_mode:
+                    prompt = f"""Bạn là đạo diễn kịch bản hình ảnh cho truyện tranh Webtoon/Manhwa Hàn Quốc: "{genre_mode}".
+Nhiệm vụ: Trích xuất hành động, góc máy và biểu cảm của nhân vật nam sinh chính theo từng câu thoại.
 
 QUY TẮC BẮT BUỘC:
-1. NÓI VỀ CÁI GÌ THÌ TÌM CÁI ĐÓ:
-   - Nói về chạy xe máy, shipper, né ổ gà, né công an, đội mũ bảo hiểm -> Tìm: 'shipper lái xe máy', 'con đường đất ổ gà', 'mũ bảo hiểm xe máy'.
-   - Nói về giao đồ ăn, khách bom hàng, đứng chờ dưới mưa -> Tìm: 'hộp đồ ăn giao hàng', 'người đứng chờ dưới mưa', 'màn hình điện thoại đơn hàng'.
-   - TUYỆT ĐỐI KHÔNG tự động nhồi nhét văn phòng, tòa nhà chọc trời, kiểm toán nếu trong câu thoại không nhắc đến.
-2. CẢNH ĐẦU TIÊN [0]: Bám sát nội dung câu mở đầu thực tế của đoạn thoại.
-3. CẤM tìm kiếm biển quảng cáo, chữ viết, tài liệu chữ vô nghĩa.
+1. Mô tả cụ thể hành động và góc máy: (ví dụ: 'đẩy cửa bước vào lớp học đông người', 'ngồi cạnh cửa sổ nhìn ra ngoài', 'bạn nữ lén nhìn đỏ mặt', 'chạy bộ mệt mỏi ở sân thể dục', 'ngăn bàn đầy thư tỏ tình và socola').
+2. Bám sát 100% từng câu thoại, không vẽ cảnh chung chung.
+3. Không tạo chữ, bảng hiệu, text bong bóng thoại.
 
 Đoạn thoại:
 {transcript_text}
 
-Trả về DUY NHẤT JSON:
+Trả về DUY NHẤT định dạng JSON:
 {{"scenes": [
-  {{"index": {b_start}, "query_vn": "tài xế giao hàng lái xe máy ngoài đường", "query_en": "delivery driver on motorcycle street"}}
+  {{"index": {b_start}, "query_vn": "nam sinh mở cửa bước vào lớp học", "query_en": "handsome boy pushing classroom door entering, students staring"}}
+]}}"""
+                else:
+                    prompt = f"""Bạn là đạo diễn hình ảnh điện ảnh: "{genre_mode}".
+Nhiệm vụ: Trích xuất hành động và vật thể đời thực bám sát từng câu thoại.
+1. Nói về cái gì thì tìm đúng cái đó (xe máy, shipper, mưa ngập, hộp đồ ăn, chung cư, điện thoại...).
+2. Bám sát câu thoại 100%, không áp đặt bối cảnh xa lạ nếu voice không nhắc đến.
+
+Đoạn thoại:
+{transcript_text}
+
+Trả về DUY NHẤT định dạng JSON:
+{{"scenes": [
+  {{"index": {b_start}, "query_vn": "hành động câu thoại", "query_en": "action visual description"}}
 ]}}"""
 
                 try:
@@ -418,30 +467,35 @@ Trả về DUY NHẤT JSON:
                 except Exception:
                     pass
 
-            # 3. Dựng cảnh 40% Video B-roll + 60% Ảnh tĩnh
-            status.update(label="🎬 3/4: Đang render từng clip, bám sát từng cảnh thoại...")
+            # 3. Dựng cảnh linh hoạt theo chế độ đã chọn
+            status.update(label="🎬 3/4: Đang dựng hình ảnh theo frame chính xác...")
             clips_txt = os.path.join(workdir, "clips.txt")
             with open(clips_txt, "w", encoding="utf-8") as f_clips:
                 for idx, sc in enumerate(segments):
                     sc_data = by_idx.get(idx, {})
-                    query_vn = sc_data.get("query_vn") or "cuộc sống thường nhật"
-                    query_en = sc_data.get("query_en") or "daily life street reality"
+                    query_vn = sc_data.get("query_vn") or "hành động cuộc sống"
+                    query_en = sc_data.get("query_en") or "cinematic daily life scene"
                     t_frames = sc["target_frames"]
 
                     clip_path = None
-                    is_video_slot = (idx % 5 in [1, 3]) and (idx != len(segments) - 1)
-                    if is_video_slot and pexels_key:
-                        clip_path = fetch_broll_clip(query_en, idx, t_frames, pexels_key, workdir, used_vid_ids)
-
-                    if not clip_path:
-                        img_path = fetch_matching_image(query_vn, query_en, idx, workdir, used_urls, pexels_key, genre_mode, is_english)
+                    if is_webtoon_mode:
+                        img_path = generate_manhwa_image(query_en, idx, workdir, char_seed, genre_mode)
                         clip_path = os.path.join(workdir, f"clip_{idx:03d}.mp4")
                         create_kenburns_clip(img_path, t_frames, clip_path, mode=idx)
+                    else:
+                        is_video_slot = (idx % 5 in [1, 3]) and (idx != len(segments) - 1)
+                        if is_video_slot and pexels_key:
+                            clip_path = fetch_broll_clip(query_en, idx, t_frames, pexels_key, workdir, used_vid_ids)
+
+                        if not clip_path:
+                            img_path = fetch_matching_image(query_vn, query_en, idx, workdir, used_urls, pexels_key, genre_mode, is_english)
+                            clip_path = os.path.join(workdir, f"clip_{idx:03d}.mp4")
+                            create_kenburns_clip(img_path, t_frames, clip_path, mode=idx)
 
                     f_clips.write(f"file '{os.path.abspath(clip_path)}'\n")
 
-            # 4. Xuất video hoàn thiện
-            status.update(label="⚡ 4/4: Ghép video và xuất Master...", state="running")
+            # 4. Xuất video Master
+            status.update(label="⚡ 4/4: Ghép video và nén xuất Master...", state="running")
             out_path = os.path.join(workdir, "output.mp4")
 
             cmd = [
@@ -457,7 +511,7 @@ Trả về DUY NHẤT JSON:
             ]
             subprocess.run(cmd, check=True)
 
-            status.update(label="✅ Video hoàn thành hoàn hảo, khớp chuẩn 100% voice!", state="complete")
+            status.update(label="✅ Video hoàn thành hoàn hảo!", state="complete")
 
             with open(out_path, "rb") as vid_file:
                 video_bytes = vid_file.read()
