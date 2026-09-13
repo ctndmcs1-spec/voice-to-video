@@ -1,4 +1,3 @@
-
 import os
 import re
 import io
@@ -15,6 +14,8 @@ import requests
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
 from groq import Groq
+import cv2
+import numpy as np
 
 APP_TITLE = "Whiteboard AI Studio"
 BATCH_SECONDS = 5 * 60
@@ -28,7 +29,7 @@ HEIGHT = 720
 st.set_page_config(page_title=APP_TITLE, page_icon="✏️", layout="wide")
 
 st.title("✏️ Whiteboard AI Studio")
-st.caption("Voice → Groq → scenes 15–30s → 1 infographic/scene → hand-draw animation → FFmpeg → MP4")
+st.caption("Voice → Groq → scenes 15–30s → 1 infographic/scene → Progressive Hand Draw → FFmpeg → MP4")
 
 with st.sidebar:
     st.header("🔑 API")
@@ -41,7 +42,7 @@ with st.sidebar:
         "Pollinations API Key",
         value=st.secrets.get("POLLINATIONS_API_KEY", os.getenv("POLLINATIONS_API_KEY", "")),
         type="password",
-        help="Needed for AI image generation. Groq itself does not provide text-to-image.",
+        help="Cần thiết để tạo ảnh. Groq không hỗ trợ text-to-image.",
     )
 
     st.header("🧠 Groq models")
@@ -114,12 +115,10 @@ def extract_json(text):
     text = text.strip()
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
     text = re.sub(r"\s*```$", "", text)
-    # First try the whole response
     try:
         return json.loads(text)
     except Exception:
         pass
-    # Then find the largest JSON object
     starts = [m.start() for m in re.finditer(r"\{", text)]
     ends = [m.end() for m in re.finditer(r"\}", text)]
     for s in starts:
@@ -148,7 +147,6 @@ def transcribe_file(client, path, model):
     return result
 
 def chunk_audio(src, out_dir):
-    # Always process in 5-minute batches to reduce memory pressure.
     pattern = str(Path(out_dir) / "batch_%03d.m4a")
     run_cmd([
         "ffmpeg", "-y", "-i", str(src),
@@ -217,17 +215,21 @@ Batch duration: {batch_duration:.2f}s.
 TRANSCRIPT:
 {transcript_text}
 """
-    r = client.chat.completions.create(
-        model=model,
-        temperature=0.2,
-        max_tokens=12000,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-    )
-    obj = extract_json(r.choices[0].message.content)
-    scenes = obj.get("scenes", [])
+    try:
+        r = client.chat.completions.create(
+            model=model,
+            temperature=0.2,
+            max_tokens=12000,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+        )
+        obj = extract_json(r.choices[0].message.content)
+        scenes = obj.get("scenes", [])
+    except Exception:
+        scenes = []
+
     clean = []
     for s in scenes[:max_scenes]:
         try:
@@ -244,9 +246,17 @@ TRANSCRIPT:
             })
         except Exception:
             continue
+
+    # Tự động tạo 1 scene bao phủ nếu AI không phân cảnh được (tránh crash khi gặp batch quá ngắn)
     if not clean:
-        raise ValueError("No valid scenes returned by planner")
-    # Ensure coverage from 0 to batch end. Small gaps are assigned to the previous scene.
+        clean = [{
+            "start": 0.0,
+            "end": batch_duration,
+            "title": "Tổng kết",
+            "summary": (transcript_text[:120] if transcript_text else "Kết thúc nội dung"),
+            "visual_prompt": "A simple minimal whiteboard educational illustration, summarizing the main conclusion with clear arrows, minimal characters and icons, clean white background",
+        }]
+
     clean[0]["start"] = 0.0
     clean[-1]["end"] = batch_duration
     return clean
@@ -261,7 +271,6 @@ def normalize_pollinations_key(api_key):
             "Key hợp lệ thường bắt đầu bằng sk_ hoặc pk_."
         )
     return key
-
 
 def pollinations_request(prompt, api_key, model, timeout, width=WIDTH, height=HEIGHT):
     key = normalize_pollinations_key(api_key)
@@ -302,26 +311,19 @@ no photorealism, no 3D render, no gradients, no clutter.
             if r.status_code == 401:
                 raise RuntimeError(
                     "Pollinations trả 401 Unauthorized: API key không hợp lệ, "
-                    "hết hạn hoặc chưa được cấp quyền. Hãy tạo/copy lại key tại enter.pollinations.ai."
+                    "hết hạn hoặc chưa được cấp quyền."
                 )
             if r.status_code == 403:
-                raise RuntimeError(
-                    "Pollinations trả 403 Forbidden: key không có quyền dùng model/tài nguyên này."
-                )
+                raise RuntimeError("Pollinations trả 403 Forbidden.")
             if r.status_code == 429:
-                raise RuntimeError(
-                    "Pollinations đang rate-limit (429). Hệ thống sẽ thử lại."
-                )
+                raise RuntimeError("Pollinations rate-limit (429). Đang thử lại...")
             if r.status_code >= 400:
                 detail = r.text[:700].replace("\n", " ")
                 raise RuntimeError(f"Pollinations HTTP {r.status_code}: {detail}")
 
             content_type = r.headers.get("content-type", "").lower()
             if "image" not in content_type:
-                raise RuntimeError(
-                    f"Pollinations không trả ảnh (content-type={content_type}). "
-                    f"Response: {r.text[:500]}"
-                )
+                raise RuntimeError(f"Pollinations không trả ảnh: {r.text[:500]}")
             if not r.content:
                 raise RuntimeError("Pollinations trả về dữ liệu ảnh rỗng.")
             return r.content
@@ -331,7 +333,6 @@ no photorealism, no 3D render, no gradients, no clutter.
                 time.sleep(2 * attempt)
             else:
                 raise last_error
-
 
 def pollinations_image(prompt, api_key, model, output_path, timeout):
     data = pollinations_request(prompt, api_key, model, timeout)
@@ -345,9 +346,7 @@ def pollinations_image(prompt, api_key, model, output_path, timeout):
         Path(output_path).unlink(missing_ok=True)
         raise RuntimeError(f"File ảnh Pollinations không hợp lệ: {e}")
 
-
 def test_pollinations_api(api_key, model, timeout):
-    # Tiny live test: proves auth + selected image model work before a long run.
     data = pollinations_request(
         "A very simple black ink whiteboard drawing of a light bulb and a pencil, "
         "minimal composition, white background",
@@ -357,8 +356,7 @@ def test_pollinations_api(api_key, model, timeout):
         width=512,
         height=288,
     )
-    img = Image.open(io.BytesIO(data)).convert("RGB")
-    return img
+    return Image.open(io.BytesIO(data)).convert("RGB")
 
 def font_for(size):
     candidates = [
@@ -373,11 +371,9 @@ def font_for(size):
 def add_title(image_path, title, output_path):
     img = Image.open(image_path).convert("RGB").resize((WIDTH, HEIGHT))
     draw = ImageDraw.Draw(img)
-    # White title band; keeps generated image text-free and title accurate.
     band_h = 105
     draw.rectangle([0, 0, WIDTH, band_h], fill="white")
     f = font_for(44)
-    # Fit title to width
     while True:
         box = draw.textbbox((0, 0), title, font=f)
         if box[2] - box[0] <= WIDTH - 80 or getattr(f, "size", 44) <= 24:
@@ -387,65 +383,216 @@ def add_title(image_path, title, output_path):
     draw.text(((WIDTH - tw) / 2, 25), title, fill="black", font=f)
     img.save(output_path, quality=95)
 
-def make_hand_png(path):
-    # Simple clean hand + pencil illustration. It is deliberately stylized
-    # so the animation is lightweight and works without a separate asset.
-    S = 260
-    im = Image.new("RGBA", (S, S), (255, 255, 255, 0))
+# -----------------------------
+# Progressive Hand Draw Engine
+# -----------------------------
+def generate_fallback_hand():
+    S = 320
+    im = Image.new("RGBA", (S, S), (0, 0, 0, 0))
     d = ImageDraw.Draw(im)
-    # palm/fingers
-    d.ellipse((65, 55, 210, 220), fill=(242, 220, 190, 255), outline=(20,20,20,255), width=5)
-    d.rounded_rectangle((92, 20, 145, 125), 20, fill=(242,220,190,255), outline=(20,20,20,255), width=5)
-    d.rounded_rectangle((135, 35, 185, 135), 20, fill=(242,220,190,255), outline=(20,20,20,255), width=5)
-    d.rounded_rectangle((48, 72, 105, 145), 22, fill=(242,220,190,255), outline=(20,20,20,255), width=5)
-    # pencil
-    d.polygon([(145, 185), (232, 98), (245, 111), (158, 198)], fill=(210,40,40,255), outline=(20,20,20,255))
-    d.polygon([(232,98),(251,89),(245,111)], fill=(230,210,170,255), outline=(20,20,20,255))
-    d.line((154, 195, 165, 207), fill=(20,20,20,255), width=5)
-    im.save(path)
+    d.line([(40, 40), (140, 140)], fill=(30, 30, 30, 255), width=10)
+    d.polygon([(30, 30), (50, 40), (40, 50)], fill=(220, 50, 50, 255))
+    d.ellipse((110, 110, 260, 260), fill=(235, 205, 175, 255), outline=(30, 30, 30, 255), width=4)
+    d.rounded_rectangle((100, 130, 180, 220), 20, fill=(235, 205, 175, 255), outline=(30, 30, 30, 255), width=4)
+    return im
+
+def load_hand_asset(hand_path, target_width=320):
+    p = None
+    for candidate in [hand_path, Path("hand.png"), Path("assets/hand.png")]:
+        if candidate and Path(candidate).exists():
+            p = Path(candidate)
+            break
+    if p:
+        try:
+            pil_hand = Image.open(p).convert("RGBA")
+        except Exception:
+            pil_hand = generate_fallback_hand()
+    else:
+        pil_hand = generate_fallback_hand()
+
+    w, h = pil_hand.size
+    new_h = int(h * (target_width / w))
+    pil_hand = pil_hand.resize((target_width, new_h), Image.Resampling.LANCZOS)
+    hand_np = np.array(pil_hand)
+
+    bgr = cv2.cvtColor(hand_np[:, :, :3], cv2.COLOR_RGB2BGR)
+    alpha = hand_np[:, :, 3]
+
+    ys, xs = np.where(alpha > 120)
+    if len(xs) > 0:
+        score = xs + ys * 1.15
+        tip_idx = np.argmin(score)
+        tip_x = int(xs[tip_idx])
+        tip_y = int(ys[tip_idx])
+    else:
+        tip_x, tip_y = 0, 0
+    return bgr, alpha, tip_x, tip_y
+
+def extract_drawing_path(image_path):
+    img = cv2.imread(str(image_path))
+    if img is None:
+        return [(WIDTH // 2, HEIGHT // 2)]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    _, binary = cv2.threshold(gray, 225, 255, cv2.THRESH_BINARY_INV)
+
+    title_mask = np.zeros_like(binary)
+    title_mask[:105, :] = binary[:105, :]
+
+    body_mask = np.zeros_like(binary)
+    body_mask[105:, :] = binary[105:, :]
+
+    title_contours, _ = cv2.findContours(title_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    body_contours, _ = cv2.findContours(body_mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+
+    title_sorted = sorted(title_contours, key=lambda c: cv2.boundingRect(c)[0])
+
+    def c_center(c):
+        M = cv2.moments(c)
+        if M["m00"] > 0:
+            return (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
+        x, y, w, h = cv2.boundingRect(c)
+        return (x + w // 2, y + h // 2)
+
+    valid_body = [c for c in body_contours if cv2.arcLength(c, False) > 12]
+    body_sorted = []
+    if valid_body:
+        curr = (100, 150)
+        rem = valid_body[:]
+        while rem:
+            best_idx = 0
+            best_dist = float("inf")
+            for idx, c in enumerate(rem):
+                pt = c_center(c)
+                d = (pt[0] - curr[0]) ** 2 + (pt[1] - curr[1]) ** 2
+                if d < best_dist:
+                    best_dist = d
+                    best_idx = idx
+            chosen = rem.pop(best_idx)
+            body_sorted.append(chosen)
+            curr = c_center(chosen)
+
+    all_contours = title_sorted + body_sorted
+    trajectory = []
+    for c in all_contours:
+        pts = c.reshape(-1, 2)
+        sampled = pts[::3]
+        for p in sampled:
+            trajectory.append((int(p[0]), int(p[1])))
+
+    if len(trajectory) < 40:
+        trajectory = []
+        for y in range(120, 680, 45):
+            xs = range(80, 1200, 25) if (y // 45) % 2 == 0 else range(1200, 80, -25)
+            for x in xs:
+                trajectory.append((x, y))
+    return trajectory
+
+def paste_hand(frame_bgr, hand_bgr, hand_alpha, x, y):
+    fh, fw = frame_bgr.shape[:2]
+    hh, hw = hand_bgr.shape[:2]
+    x1, y1 = max(0, x), max(0, y)
+    x2, y2 = min(fw, x + hw), min(fh, y + hh)
+    if x1 >= x2 or y1 >= y2:
+        return
+    hx1, hy1 = x1 - x, y1 - y
+    hx2, hy2 = hx1 + (x2 - x1), hy1 + (y2 - y1)
+
+    sub_hand = hand_bgr[hy1:hy2, hx1:hx2]
+    sub_alpha = (hand_alpha[hy1:hy2, hx1:hx2].astype(np.float32) / 255.0)[:, :, None]
+    roi = frame_bgr[y1:y2, x1:x2]
+    frame_bgr[y1:y2, x1:x2] = (sub_hand * sub_alpha + roi * (1.0 - sub_alpha)).astype(np.uint8)
 
 def render_scene(image_path, duration, output_path, hand_path, style):
-    # Lightweight "draw-on" feeling:
-    # - image fades in from white
-    # - hand/pencil travels over the board
-    # - slow camera zoom adds life
-    # This is intentionally FFmpeg-only after the image is created.
-    if style == "Whiteboard + moving hand + zoom":
-        zoom = "zoompan=z='min(zoom+0.0007,1.10)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:fps=30:s=1280x720"
-    elif style == "Clean infographic motion":
-        zoom = "zoompan=z='min(zoom+0.00035,1.05)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:fps=30:s=1280x720"
-    else:
-        zoom = "zoompan=z='min(zoom+0.00045,1.07)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:fps=30:s=1280x720"
+    total_frames = max(1, int(duration * FPS))
+    draw_duration = max(2.0, min(duration - 1.2, duration * 0.72))
+    draw_frames = int(draw_duration * FPS)
+    retract_frames = int(0.5 * FPS)
 
-    # Hand is an overlay; it moves across the image while the scene plays.
-    # The underlying image is whiteboard-style, so the combined result resembles
-    # a hand-drawn explainer rather than a normal slideshow.
-    hand_enable = style != "Clean infographic motion"
+    original_bgr = cv2.imread(str(image_path))
+    if original_bgr is None:
+        raise RuntimeError(f"Không thể đọc ảnh: {image_path}")
+    original_bgr = cv2.resize(original_bgr, (WIDTH, HEIGHT))
+    white_canvas = np.full_like(original_bgr, 255)
+    reveal_mask = np.zeros((HEIGHT, WIDTH), dtype=np.uint8)
+
+    trajectory = extract_drawing_path(image_path)
+    hand_bgr, hand_alpha, tip_x, tip_y = load_hand_asset(hand_path, target_width=330)
+
     cmd = [
         "ffmpeg", "-y",
-        "-loop", "1", "-i", str(image_path),
-        "-loop", "1", "-i", str(hand_path),
-        "-t", f"{duration:.3f}",
-        "-filter_complex",
-        (
-            f"[0:v]scale=1280:720:force_original_aspect_ratio=decrease,"
-            f"pad=1280:720:(ow-iw)/2:(oh-ih)/2:white,"
-            f"{zoom},fade=t=in:st=0:d=0.8[v];"
-            f"[1:v]scale=170:-1[hand];"
-            f"[v][hand]overlay="
-            f"x='if(lt(t,{duration/2:.3f}), 80+(1180-80)*t/{duration/2:.3f}, "
-            f"1180-(1180-80)*(t-{duration/2:.3f})/{duration/2:.3f})':"
-            f"y='if(lt(t,{duration/2:.3f}), 500-(500-120)*t/{duration/2:.3f}, "
-            f"120+(500-120)*(t-{duration/2:.3f})/{duration/2:.3f})':"
-            f"enable='{str(hand_enable).lower()}'[outv]"
-        ),
-        "-map", "[outv]",
+        "-f", "rawvideo",
+        "-vcodec", "rawvideo",
+        "-s", f"{WIDTH}x{HEIGHT}",
+        "-pix_fmt", "bgr24",
+        "-r", str(FPS),
+        "-i", "-",
         "-an", "-c:v", "libx264", "-preset", "veryfast",
-        "-pix_fmt", "yuv420p", "-r", str(FPS),
+        "-pix_fmt", "yuv420p",
         str(output_path),
     ]
-    run_cmd(cmd, timeout=max(180, int(duration * 8)))
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
+    last_tip = trajectory[-1] if trajectory else (WIDTH // 2, HEIGHT // 2)
+
+    for f_idx in range(total_frames):
+        hand_visible = False
+        hand_pos_x, hand_pos_y = 0, 0
+
+        if f_idx < draw_frames:
+            curr_idx = int((f_idx + 1) / draw_frames * len(trajectory))
+            prev_idx = int(f_idx / draw_frames * len(trajectory))
+            step_pts = trajectory[prev_idx:curr_idx]
+
+            for pt in step_pts:
+                cv2.circle(reveal_mask, pt, 22, 255, -1)
+
+            if step_pts:
+                target_pt = step_pts[-1]
+            else:
+                target_pt = trajectory[min(curr_idx, len(trajectory) - 1)]
+
+            jitter_x = int(1.2 * math.sin(f_idx * 1.8))
+            jitter_y = int(1.2 * math.cos(f_idx * 1.8))
+            hand_pos_x = target_pt[0] + jitter_x
+            hand_pos_y = target_pt[1] + jitter_y
+            last_tip = (hand_pos_x, hand_pos_y)
+            hand_visible = True
+        elif f_idx < draw_frames + retract_frames:
+            reveal_mask[:, :] = 255
+            prog = (f_idx - draw_frames) / max(1, retract_frames)
+            hand_pos_x = int(last_tip[0] + (WIDTH + 180 - last_tip[0]) * prog)
+            hand_pos_y = int(last_tip[1] + (HEIGHT + 180 - last_tip[1]) * prog)
+            hand_visible = True
+        else:
+            reveal_mask[:, :] = 255
+            hand_visible = False
+
+        blur = cv2.GaussianBlur(reveal_mask, (13, 13), 0)
+        alpha = (blur.astype(np.float32) / 255.0)[:, :, None]
+        frame = (original_bgr * alpha + white_canvas * (1.0 - alpha)).astype(np.uint8)
+
+        if hand_visible and style != "Clean infographic motion":
+            paste_hand(frame, hand_bgr, hand_alpha, hand_pos_x - tip_x, hand_pos_y - tip_y)
+
+        if style == "Whiteboard + moving hand + zoom":
+            scale = 1.0 + 0.05 * (f_idx / total_frames)
+            cw, ch = int(WIDTH / scale), int(HEIGHT / scale)
+            x1 = (WIDTH - cw) // 2
+            y1 = (HEIGHT - ch) // 2
+            crop = frame[y1:y1 + ch, x1:x1 + cw]
+            frame = cv2.resize(crop, (WIDTH, HEIGHT), interpolation=cv2.INTER_LINEAR)
+
+        proc.stdin.write(frame.tobytes())
+
+    proc.stdin.close()
+    proc.wait()
+    if proc.returncode != 0:
+        err = proc.stderr.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"FFmpeg thất bại: {err[-2000:]}")
+
+# -----------------------------
+# Batch and Render Pipelines
+# -----------------------------
 def render_batch(batch_audio, scenes, batch_dir, hand_path, style, progress_callback=None):
     scene_videos = []
     total = len(scenes)
@@ -461,6 +608,7 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style, progress_call
         scene_videos.append(vid)
         if progress_callback:
             progress_callback(i / total)
+
     concat_file = batch_dir / "concat.txt"
     concat_file.write_text("\n".join(f"file '{p.resolve()}'" for p in scene_videos), encoding="utf-8")
     batch_video = batch_dir / "batch_video.mp4"
@@ -470,7 +618,7 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style, progress_call
         "-c", "copy", "-movflags", "+faststart",
         str(batch_video)
     ], timeout=900)
-    # Match batch audio exactly.
+
     final_batch = batch_dir / "batch_final.mp4"
     run_cmd([
         "ffmpeg", "-y",
@@ -494,7 +642,7 @@ def concat_batches(batch_videos, output_path):
     ], timeout=1800)
 
 # -----------------------------
-# Main
+# Main Application
 # -----------------------------
 st.sidebar.divider()
 if st.sidebar.button("🔎 TEST POLLINATIONS API", use_container_width=True):
@@ -540,18 +688,24 @@ if audio:
             batch_dir.mkdir()
             chunks = chunk_audio(source, batch_dir)
 
-            hand_path = root / "hand.png"
-            make_hand_png(hand_path)
+            hand_path = Path("hand.png")
 
             batch_videos = []
             all_scene_count = 0
             progress = st.progress(0)
             status = st.empty()
 
+            valid_chunks = []
             for bi, chunk in enumerate(chunks):
+                cdur = ffprobe_duration(chunk)
+                # Bỏ qua mẩu audio vụn bị dôi ra ở cuối (< 5 giây) nếu đã có batch trước đó
+                if cdur < 5.0 and bi > 0:
+                    continue
+                valid_chunks.append((bi, chunk, cdur))
+
+            for idx, (bi, chunk, bdur) in enumerate(valid_chunks):
                 bstart = bi * BATCH_SECONDS
-                bdur = ffprobe_duration(chunk)
-                status.write(f"🧠 Batch {bi+1}/{len(chunks)} — transcribing...")
+                status.write(f"🧠 Batch {idx+1}/{len(valid_chunks)} — transcribing...")
                 tr = transcribe_file(client, chunk, stt_model)
                 segs = normalize_segments(tr, bstart)
                 batch_text = "\n".join(
@@ -559,7 +713,7 @@ if audio:
                     for x in segs
                 )
 
-                status.write(f"✂️ Batch {bi+1}/{len(chunks)} — planning scenes...")
+                status.write(f"✂️ Batch {idx+1}/{len(valid_chunks)} — planning scenes...")
                 scenes = make_scene_plan(
                     client,
                     batch_text,
@@ -571,32 +725,28 @@ if audio:
                     max_scenes_per_batch,
                 )
 
-                st.write(f"**Batch {bi+1}: {bdur:.1f}s → {len(scenes)} scenes**")
+                st.write(f"**Batch {idx+1}: {bdur:.1f}s → {len(scenes)} scenes**")
                 for si, s in enumerate(scenes, 1):
                     st.caption(
                         f"{si:02d}. {s['start']:.1f}s–{s['end']:.1f}s — {s['title']}"
                     )
 
-                batch_work = root / f"work_{bi+1:03d}"
+                batch_work = root / f"work_{idx+1:03d}"
                 batch_work.mkdir()
 
-                status.write(f"🎨 Batch {bi+1}/{len(chunks)} — generating images + animation...")
-                def cb(frac, bi=bi):
-                    progress.progress(min(1.0, (bi + frac) / len(chunks)))
+                status.write(f"🎨 Batch {idx+1}/{len(valid_chunks)} — progressive drawing scenes...")
+                def cb(frac, idx=idx):
+                    progress.progress(min(1.0, (idx + frac) / len(valid_chunks)))
 
                 bv = render_batch(
                     chunk, scenes, batch_work, hand_path, draw_style, cb
                 )
 
-                # Move the finished batch outside the temporary work directory
-                # before cleanup. Otherwise the old V1 deleted the very MP4 that
-                # was needed later for final concatenation.
-                saved_batch = root / f"batch_final_{bi+1:03d}.mp4"
+                saved_batch = root / f"batch_final_{idx+1:03d}.mp4"
                 shutil.copy2(bv, saved_batch)
                 batch_videos.append(saved_batch)
                 all_scene_count += len(scenes)
 
-                # Free scene images/videos between 5-minute batches.
                 shutil.rmtree(batch_work, ignore_errors=True)
 
             progress.progress(1.0)
@@ -606,7 +756,7 @@ if audio:
             concat_batches(batch_videos, final)
 
             st.success(
-                f"Done! {all_scene_count} scenes, processed in {len(chunks)} batch(es) of ≤5 minutes."
+                f"Hoàn thành! Đã tạo {all_scene_count} scene chuẩn hiệu ứng nét vẽ tay."
             )
             st.video(str(final))
             st.download_button(
@@ -619,11 +769,6 @@ if audio:
 
         except Exception as e:
             st.exception(e)
-            st.warning(
-                "Nếu lỗi xảy ra ở một scene, hãy xem traceback. V1 ưu tiên dễ test và ổn định; "
-                "sau khi test thành công có thể thêm resume từng scene, retry ảnh và subtitle."
-            )
+            st.warning("Nếu lỗi xảy ra ở một scene, hãy kiểm tra traceback log.")
         finally:
-            # Keep final file alive while Streamlit renders the download/video.
-            # Temporary cleanup is intentionally delayed by OS/runtime.
             pass
