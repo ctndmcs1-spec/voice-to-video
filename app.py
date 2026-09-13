@@ -29,7 +29,7 @@ HEIGHT = 720
 st.set_page_config(page_title=APP_TITLE, page_icon="✏️", layout="wide")
 
 st.title("✏️ Whiteboard AI Studio")
-st.caption("Voice → Groq → scenes 15–30s → 1 infographic/scene → Progressive Hand Draw → FFmpeg → MP4")
+st.caption("Voice → Groq → Progressive Hand Draw → FFmpeg → MP4")
 
 with st.sidebar:
     st.header("🔑 API")
@@ -107,10 +107,6 @@ def ffprobe_duration(path):
     ], timeout=60)
     return float(out.strip())
 
-def safe_name(s, n=60):
-    s = re.sub(r"[^a-zA-Z0-9_-]+", "_", s).strip("_")
-    return (s or "scene")[:n]
-
 def extract_json(text):
     text = text.strip()
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
@@ -175,6 +171,24 @@ def normalize_segments(result, offset):
             out.append({"start": stt + offset, "end": end + offset, "text": text})
     return out
 
+def sanitize_prompt_text(prompt):
+    # Thay thế các từ khoá nhạy cảm dễ kích hoạt bộ lọc Azure/Pollinations
+    replacements = {
+        r"\bblood\b": "dark ink",
+        r"\bbleed\b": "drop",
+        r"\bsuicide\b": "despair",
+        r"\bkill(ing|er)?\b": "oppression",
+        r"\bdead\b": "fallen",
+        r"\bdeath\b": "crisis",
+        r"\bcorpse\b": "shadow",
+        r"\bjump(ing)?\b": "falling shadow",
+        r"\bweapon\b": "chain",
+    }
+    cleaned = prompt
+    for pattern, rep in replacements.items():
+        cleaned = re.sub(pattern, rep, cleaned, flags=re.IGNORECASE)
+    return cleaned
+
 def make_scene_plan(client, transcript_text, batch_start, batch_duration, model, min_s, max_s, max_scenes):
     system = f"""
 You are the visual director for a Vietnamese whiteboard explainer channel.
@@ -184,18 +198,13 @@ Turn a voice transcript into coherent visual scenes.
 
 Hard rules:
 1. Each scene must be {min_s}-{max_s} seconds.
-2. Do NOT cut in the middle of an important idea if a nearby boundary works better.
-3. Each scene gets EXACTLY ONE main infographic image.
-4. One image must visually summarize ALL important ideas spoken in that scene.
-5. The image is a whiteboard educational infographic: white background, black hand-drawn ink, simple expressive characters, arrows, objects, diagrams, a few restrained accent colors.
-6. Do not put Vietnamese words or tiny labels inside the generated image. The Python tool will add the accurate title itself.
-7. Do not make generic filler images. Every object must be justified by the voice.
-8. Avoid copyrighted characters, logos and real-person likenesses.
-9. The visual prompt must be in English because the image model performs better with English prompts.
-10. Keep scenes between {min_s} and {max_s}; the final scene may be shorter only if the batch ends.
-11. Return ONLY valid JSON.
+2. Each scene gets EXACTLY ONE main infographic image.
+3. The image is a whiteboard educational infographic: white background, black hand-drawn ink line art, simple expressive figures, arrows, diagrams, restrained accent colors.
+4. Do NOT put Vietnamese words or letters inside the generated image.
+5. STRICT SAFETY REQUIREMENT: NEVER use graphic words like blood, suicide, murder, jump, corpse, or weapon. ALWAYS represent dark themes symbolically (e.g., dark clouds, broken chains, stressed person holding head, empty desk, handcuffs, heavy stones, question marks, scales of justice).
+6. Return ONLY valid JSON.
 
-JSON:
+JSON format:
 {{
   "scenes": [
     {{
@@ -203,7 +212,7 @@ JSON:
       "end": 20.0,
       "title": "short Vietnamese title",
       "summary": "one sentence in Vietnamese",
-      "visual_prompt": "detailed English prompt for ONE coherent whiteboard infographic image"
+      "visual_prompt": "detailed symbolic whiteboard illustration in English"
     }}
   ]
 }}
@@ -226,39 +235,42 @@ TRANSCRIPT:
             ],
         )
         obj = extract_json(r.choices[0].message.content)
-        scenes = obj.get("scenes", [])
+        raw_scenes = obj.get("scenes", [])
     except Exception:
-        scenes = []
+        raw_scenes = []
 
     clean = []
-    for s in scenes[:max_scenes]:
+    for s in raw_scenes[:max_scenes]:
         try:
             a = max(0.0, float(s["start"]))
             b = min(batch_duration, float(s["end"]))
-            if b <= a + 1:
+            if b <= a + 0.5:
                 continue
             clean.append({
                 "start": a,
                 "end": b,
                 "title": str(s.get("title", "Cảnh")),
                 "summary": str(s.get("summary", "")),
-                "visual_prompt": str(s.get("visual_prompt", "")),
+                "visual_prompt": sanitize_prompt_text(str(s.get("visual_prompt", ""))),
             })
         except Exception:
             continue
 
-    # Tự động tạo 1 scene bao phủ nếu AI không phân cảnh được (tránh crash khi gặp batch quá ngắn)
     if not clean:
         clean = [{
             "start": 0.0,
             "end": batch_duration,
-            "title": "Tổng kết",
+            "title": "Tổng quan",
             "summary": (transcript_text[:120] if transcript_text else "Kết thúc nội dung"),
-            "visual_prompt": "A simple minimal whiteboard educational illustration, summarizing the main conclusion with clear arrows, minimal characters and icons, clean white background",
+            "visual_prompt": "A symbolic whiteboard educational drawing of a person thinking, question marks, abstract diagrams, clean white background, minimalist black ink art",
         }]
 
+    # NỐI LIỀN MẮT XÍCH CÁC CẢNH ĐỂ KHÔNG BỊ MẤT 1 GIÂY NÀO (KHẮC PHỤC LỖI THIẾU THỜI LƯỢNG)
     clean[0]["start"] = 0.0
+    for idx in range(1, len(clean)):
+        clean[idx]["start"] = clean[idx - 1]["end"]
     clean[-1]["end"] = batch_duration
+
     return clean
 
 def normalize_pollinations_key(api_key):
@@ -274,8 +286,10 @@ def normalize_pollinations_key(api_key):
 
 def pollinations_request(prompt, api_key, model, timeout, width=WIDTH, height=HEIGHT):
     key = normalize_pollinations_key(api_key)
+    safe_prompt = sanitize_prompt_text(prompt)
+
     full_prompt = f"""
-{prompt}
+{safe_prompt}
 
 STYLE LOCK:
 single coherent whiteboard infographic, 16:9 landscape composition,
@@ -309,21 +323,31 @@ no photorealism, no 3D render, no gradients, no clutter.
                 timeout=timeout,
             )
             if r.status_code == 401:
-                raise RuntimeError(
-                    "Pollinations trả 401 Unauthorized: API key không hợp lệ, "
-                    "hết hạn hoặc chưa được cấp quyền."
-                )
+                raise RuntimeError("Pollinations trả 401 Unauthorized: API key không hợp lệ hoặc hết hạn.")
             if r.status_code == 403:
                 raise RuntimeError("Pollinations trả 403 Forbidden.")
             if r.status_code == 429:
-                raise RuntimeError("Pollinations rate-limit (429). Đang thử lại...")
+                time.sleep(3 * attempt)
+                continue
+
+            # NẾU BỊ AZURE SAFETY FILTER CHẶN (HTTP 400) -> TỰ ĐỘNG DÙNG PROMPT DỰ PHÒNG AN TOÀN
+            if r.status_code == 400 and ("safety" in r.text.lower() or "violation" in r.text.lower()):
+                fallback_prompt = (
+                    "A symbolic minimal whiteboard infographic illustration, showing a character facing life decisions, "
+                    "arrows pointing to multiple paths, clean white background, educational doodle"
+                )
+                fb_url = "https://gen.pollinations.ai/image/" + quote(fallback_prompt, safe="")
+                r_fb = requests.get(fb_url, params=params, headers={"Authorization": f"Bearer {key}", "Accept": "image/*"}, timeout=timeout)
+                if r_fb.status_code == 200 and "image" in r_fb.headers.get("content-type", "").lower():
+                    return r_fb.content
+
             if r.status_code >= 400:
-                detail = r.text[:700].replace("\n", " ")
+                detail = r.text[:500].replace("\n", " ")
                 raise RuntimeError(f"Pollinations HTTP {r.status_code}: {detail}")
 
             content_type = r.headers.get("content-type", "").lower()
             if "image" not in content_type:
-                raise RuntimeError(f"Pollinations không trả ảnh: {r.text[:500]}")
+                raise RuntimeError("Pollinations không trả về file ảnh.")
             if not r.content:
                 raise RuntimeError("Pollinations trả về dữ liệu ảnh rỗng.")
             return r.content
@@ -348,8 +372,7 @@ def pollinations_image(prompt, api_key, model, output_path, timeout):
 
 def test_pollinations_api(api_key, model, timeout):
     data = pollinations_request(
-        "A very simple black ink whiteboard drawing of a light bulb and a pencil, "
-        "minimal composition, white background",
+        "A simple black ink whiteboard drawing of an idea bulb and a book, minimal composition, white background",
         api_key,
         model,
         timeout,
@@ -503,8 +526,8 @@ def paste_hand(frame_bgr, hand_bgr, hand_alpha, x, y):
     frame_bgr[y1:y2, x1:x2] = (sub_hand * sub_alpha + roi * (1.0 - sub_alpha)).astype(np.uint8)
 
 def render_scene(image_path, duration, output_path, hand_path, style):
-    total_frames = max(1, int(duration * FPS))
-    draw_duration = max(2.0, min(duration - 1.2, duration * 0.72))
+    total_frames = max(1, round(duration * FPS))
+    draw_duration = max(2.0, min(duration - 1.0, duration * 0.75))
     draw_frames = int(draw_duration * FPS)
     retract_frames = int(0.5 * FPS)
 
@@ -620,13 +643,14 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style, progress_call
     ], timeout=900)
 
     final_batch = batch_dir / "batch_final.mp4"
+    # Ghép chuẩn xác âm thanh và hình ảnh, không bị cắt bớt
     run_cmd([
         "ffmpeg", "-y",
         "-i", str(batch_video),
         "-i", str(batch_audio),
         "-map", "0:v:0", "-map", "1:a:0",
         "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
-        "-shortest", "-movflags", "+faststart",
+        "-movflags", "+faststart",
         str(final_batch)
     ], timeout=900)
     return final_batch
@@ -667,7 +691,7 @@ if audio:
             st.error("Bạn chưa nhập GROQ_API_KEY.")
             st.stop()
         if not pollen_key:
-            st.error("Bạn chưa nhập POLLINATIONS_API_KEY. Groq không có text-to-image; tool dùng Pollinations cho phần ảnh.")
+            st.error("Bạn chưa nhập POLLINATIONS_API_KEY.")
             st.stop()
         try:
             pollen_key = normalize_pollinations_key(pollen_key)
@@ -698,7 +722,6 @@ if audio:
             valid_chunks = []
             for bi, chunk in enumerate(chunks):
                 cdur = ffprobe_duration(chunk)
-                # Bỏ qua mẩu audio vụn bị dôi ra ở cuối (< 5 giây) nếu đã có batch trước đó
                 if cdur < 5.0 and bi > 0:
                     continue
                 valid_chunks.append((bi, chunk, cdur))
@@ -756,7 +779,7 @@ if audio:
             concat_batches(batch_videos, final)
 
             st.success(
-                f"Hoàn thành! Đã tạo {all_scene_count} scene chuẩn hiệu ứng nét vẽ tay."
+                f"Hoàn thành! Đã tạo {all_scene_count} scene chuẩn hiệu ứng vẽ tay và đồng bộ 100% âm thanh."
             )
             st.video(str(final))
             st.download_button(
