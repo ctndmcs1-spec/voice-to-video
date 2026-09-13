@@ -22,7 +22,7 @@ BATCH_SECONDS = 5 * 60  # 5 phút chuẩn
 FPS = 30
 WIDTH = 1280
 HEIGHT = 720
-HF_FLUX_MODEL = "black-forest-labs/FLUX.1-schnell"
+HF_MODEL = "stabilityai/sdxl-turbo"
 
 # -----------------------------
 # Giao diện / Cấu hình
@@ -30,7 +30,7 @@ HF_FLUX_MODEL = "black-forest-labs/FLUX.1-schnell"
 st.set_page_config(page_title=APP_TITLE, page_icon="✏️", layout="wide")
 
 st.title("✏️ Xưởng Tạo Video Vẽ Bảng Trắng AI")
-st.caption("Giọng nói → Phân cảnh Groq → Vẽ tranh FLUX (Hugging Face) → Nét bút vẽ tay OpenCV → MP4")
+st.caption("Giọng nói → Phân cảnh Groq → Vẽ nét mực đen SDXL-Turbo → Nét bút vẽ tay OpenCV → MP4")
 
 with st.sidebar:
     st.header("🔑 Cấu hình API")
@@ -44,7 +44,7 @@ with st.sidebar:
         "Khóa Hugging Face Token",
         value=st.secrets.get("HF_TOKEN", os.getenv("HF_TOKEN", "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")),
         type="password",
-        help="Dùng để tạo tranh FLUX.1-schnell miễn phí.",
+        help="Dùng để tạo tranh nét vẽ bảng trắng miễn phí không watermark.",
     )
 
     st.header("🧠 Mô hình Groq")
@@ -264,38 +264,46 @@ TRANSCRIPT:
             "visual_prompt": "A symbolic whiteboard educational drawing of a person thinking, question marks, abstract diagrams, clean white background, minimalist black ink art",
         }]
 
+    # 1. Bắt đầu từ giây 0.0
     clean[0]["start"] = 0.0
 
-    # Lấp khoảng trống giữa các cảnh
+    # 2. Giữ nguyên toàn bộ 13-14 cảnh của AI: Kéo dài ảnh cảnh trước ra phủ kín khoảng lặng tới cảnh sau
     for i in range(len(clean) - 1):
         clean[i]["end"] = clean[i + 1]["start"]
 
+    # 3. Kéo cảnh cuối phủ kín đến hết batch_duration (khắc phục hụt 15s)
     clean[-1]["end"] = batch_duration
+
     return clean
 
 # -----------------------------
-# Hugging Face FLUX.1 Engine
+# Hugging Face SDXL-Turbo Engine (Nét mực đen bảng trắng)
 # -----------------------------
-def hf_flux_request(prompt, token, timeout=90):
+def hf_image_request(prompt, token, timeout=75):
     token = (token or "").strip()
+    if not token:
+        raise RuntimeError("Vui lòng điền Khóa Hugging Face Token.")
+
     safe_prompt = sanitize_prompt_text(prompt)
     full_prompt = (
-        f"{safe_prompt}, single coherent whiteboard infographic, 16:9 landscape composition, "
-        "pure white paper background, hand-drawn black ink line art, simple expressive educational illustration, "
-        "clean composition, subtle red and blue accent strokes only, clear visual hierarchy, arrows, "
-        "empty band near top for title, NO words, NO letters, NO text, NO watermark, 2D vector style"
+        f"Black and white line art whiteboard drawing of {safe_prompt}, "
+        "minimalist black ink sketch on pure white paper background, clean vector lines, "
+        "coloring page lineart style, simple expressive educational doodle, "
+        "arrows and diagrams, no shading, no 3D render, no colors, no text, no watermark, 16:9 composition"
     )
 
-    # 1. Gọi trực tiếp qua Router mới của Hugging Face
     endpoints = [
-        f"https://router.huggingface.co/hf-inference/models/{HF_FLUX_MODEL}",
-        f"https://router.huggingface.co/models/{HF_FLUX_MODEL}",
+        f"https://router.huggingface.co/hf-inference/models/{HF_MODEL}",
+        f"https://router.huggingface.co/models/{HF_MODEL}",
     ]
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "image/jpeg",
     }
-    payload = {"inputs": full_prompt}
+    payload = {
+        "inputs": full_prompt,
+        "parameters": {"num_inference_steps": 2}
+    }
 
     last_err = None
     for api_url in endpoints:
@@ -305,29 +313,20 @@ def hf_flux_request(prompt, token, timeout=90):
                 if r.status_code == 200 and len(r.content) > 1000:
                     return r.content
                 if r.status_code == 503:
-                    time.sleep(8 * attempt)
+                    time.sleep(5 * attempt)
                     continue
                 if r.status_code == 401:
-                    raise RuntimeError("Hugging Face lỗi 401: Token không đúng hoặc chưa có quyền Read.")
+                    raise RuntimeError("Hugging Face lỗi 401: Token không chính xác hoặc không có quyền Read.")
                 if r.status_code >= 400:
                     last_err = f"HTTP {r.status_code}: {r.text[:200]}"
             except Exception as e:
                 last_err = str(e)
                 time.sleep(2 * attempt)
 
-    # 2. Cơ chế tự cứu thông minh (Fallback): Tự chuyển sang FLUX trực tiếp nếu HF bị lỗi mạng/DNS
-    try:
-        fb_url = f"https://image.pollinations.ai/prompt/{quote(full_prompt, safe='')}"
-        r_fb = requests.get(fb_url, params={"model": "flux", "width": WIDTH, "height": HEIGHT, "nologo": "true"}, timeout=60)
-        if r_fb.status_code == 200 and len(r_fb.content) > 1000:
-            return r_fb.content
-    except Exception:
-        pass
-
-    raise RuntimeError(f"Không thể kết nối máy chủ tạo ảnh: {last_err}")
+    raise RuntimeError(f"Không thể tạo ảnh từ Hugging Face: {last_err}")
 
 def generate_image(prompt, token, output_path, timeout):
-    data = hf_flux_request(prompt, token, timeout)
+    data = hf_image_request(prompt, token, timeout)
     Path(output_path).write_bytes(data)
     try:
         with Image.open(output_path) as im:
@@ -339,7 +338,7 @@ def generate_image(prompt, token, output_path, timeout):
         raise RuntimeError(f"File ảnh tạo ra không hợp lệ: {e}")
 
 def test_hf_api(token, timeout):
-    data = hf_flux_request(
+    data = hf_image_request(
         "A simple black ink whiteboard drawing of an idea light bulb and an open book, minimal composition, white background",
         token,
         timeout,
@@ -635,10 +634,10 @@ def concat_batches(batch_videos, output_path):
 st.sidebar.divider()
 if st.sidebar.button("🔎 KIỂM TRA TẠO ẢNH HUGGING FACE", use_container_width=True):
     try:
-        with st.spinner("Đang kết nối tới mô hình FLUX.1-schnell..."):
+        with st.spinner("Đang kết nối tới mô hình SDXL-Turbo..."):
             test_img = test_hf_api(hf_token, 60)
-        st.success("Hugging Face FLUX kết nối rất tốt — Sẵn sàng tạo ảnh!")
-        st.image(test_img, caption="Ảnh minh họa thử nghiệm từ FLUX.1-schnell", use_container_width=True)
+        st.success("Hugging Face kết nối rất tốt — Tranh nét vẽ bảng trắng chuẩn xác!")
+        st.image(test_img, caption="Ảnh minh họa thử nghiệm từ SDXL-Turbo", use_container_width=True)
     except Exception as e:
         st.error(f"Lỗi kiểm tra: {e}")
 
@@ -717,7 +716,7 @@ if audio:
                 batch_work = root / f"work_{idx+1:03d}"
                 batch_work.mkdir()
 
-                status.write(f"🎨 Đợt {idx+1}/{len(valid_chunks)} — Đang tạo tranh FLUX và render hiệu ứng nét vẽ...")
+                status.write(f"🎨 Đợt {idx+1}/{len(valid_chunks)} — Đang tạo tranh nét mực và render chuyển động bút...")
                 def cb(frac, idx=idx):
                     progress.progress(min(1.0, (idx + frac) / len(valid_chunks)))
 
