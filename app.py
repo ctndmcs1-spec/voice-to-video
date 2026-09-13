@@ -17,8 +17,8 @@ from groq import Groq
 import cv2
 import numpy as np
 
-APP_TITLE = "Xưởng Video Vẽ Bảng Trắng AI"
-BATCH_SECONDS = 5 * 60  # Chuẩn 5 phút mỗi đợt
+APP_TITLE = "Xưởng Video Diễn Hoạt Độc Bản AI"
+BATCH_SECONDS = 5 * 60  # 5 phút chuẩn
 FPS = 30
 WIDTH = 1280
 HEIGHT = 720
@@ -29,13 +29,13 @@ CLOUDFLARE_AI_URL = "https://api.cloudflare.com/client/v4/accounts/"
 # -----------------------------
 st.set_page_config(page_title=APP_TITLE, page_icon="✏️", layout="wide")
 
-st.title("✏️ Xưởng Tạo Video Vẽ Bảng Trắng AI")
-st.caption("Giọng nói → Groq Whisper → Phân cảnh Groq → Tranh FLUX Comic Doodle (Cloudflare AI) → Bút vẽ tay OpenCV → MP4")
+st.title("✏️ Xưởng Tạo Video Diễn Hoạt Độc Bản AI")
+st.caption("Bàn tay vẽ nét thực tế + Camera Steadicam lướt bám theo ngòi bút + Zoom out toàn cảnh")
 
 with st.sidebar:
     st.header("🔑 Cấu hình API")
     groq_key = st.text_input(
-        "Khóa Groq API (Groq API Key)",
+        "Khóa Groq API",
         value=st.secrets.get("GROQ_API_KEY", os.getenv("GROQ_API_KEY", "")),
         type="password",
         help="Dùng để nhận diện giọng nói và lên kịch bản phân cảnh.",
@@ -44,50 +44,49 @@ with st.sidebar:
         "Cloudflare Account ID",
         value=st.secrets.get("CLOUDFLARE_ACCOUNT_ID", os.getenv("CLOUDFLARE_ACCOUNT_ID", "")),
         type="password",
-        help="Account ID trong trang quản trị Cloudflare Dashboard.",
     )
     cloudflare_token = st.text_input(
         "Cloudflare Workers AI API Token",
         value=st.secrets.get("CLOUDFLARE_API_TOKEN", os.getenv("CLOUDFLARE_API_TOKEN", "")),
         type="password",
-        help="API Token có quyền Workers AI Read/Run.",
     )
 
     st.header("🧠 Mô hình Groq")
     stt_model = st.selectbox(
-        "Mô hình nghe giọng nói (Voice → Text)",
+        "Mô hình nghe giọng nói",
         ["whisper-large-v3", "whisper-large-v3-turbo"],
         index=0,
     )
     planner_model = st.selectbox(
-        "Mô hình biên kịch kịch bản",
-        ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "qwen/qwen3.6-27b", "openai/gpt-oss-20b", "groq/compound-mini"],
+        "Mô hình biên kịch",
+        ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "openai/gpt-oss-20b"],
         index=0,
     )
 
     st.header("🎨 Cloudflare AI")
     image_model = st.selectbox(
-        "Mô hình tạo ảnh Whiteboard",
+        "Mô hình tạo ảnh",
         ["@cf/black-forest-labs/flux-1-schnell"],
         index=0,
     )
 
-    st.header("🎬 Cài đặt hiệu ứng")
+    st.header("🎬 Hiệu ứng diễn hoạt (Signature Style)")
+    draw_style = st.selectbox(
+        "Phong cách dựng phim",
+        [
+            "Độc bản: Bàn tay vẽ + Camera lướt theo bút + Zoom out",
+            "Kiến Thức Thú Vị (Chỉ lia máy + Zoom động, ẩn tay)",
+            "Bảng trắng cổ điển (Góc máy tĩnh không lia)",
+        ],
+        index=0,
+    )
+
     scene_min = st.slider("Thời lượng cảnh tối thiểu (giây)", 15, 25, 15)
     scene_max = st.slider("Thời lượng cảnh tối đa (giây)", 20, 30, 30)
     if scene_max < scene_min:
         scene_max = scene_min
 
-    draw_style = st.selectbox(
-        "Phong cách vẽ hoạt họa",
-        [
-            "Bảng trắng + Bàn tay đưa nét vẽ",
-            "Bảng trắng + Bàn tay vẽ + Phóng to nhẹ",
-            "Chuyển động đồ họa sạch (Không hiện tay)",
-        ],
-    )
-
-    st.header("⚙️ Giới hạn an toàn")
+    st.header("⚙️ Cài đặt khác")
     max_scenes_per_batch = st.slider("Số cảnh tối đa mỗi đợt 5 phút", 5, 25, 20)
     image_timeout = st.slider("Thời gian chờ tạo ảnh (giây)", 30, 180, 120)
 
@@ -95,13 +94,7 @@ with st.sidebar:
 # Tiện ích hệ thống
 # -----------------------------
 def run_cmd(cmd, timeout=600):
-    p = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=timeout,
-    )
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
     if p.returncode != 0:
         raise RuntimeError(p.stderr[-5000:] or "Lệnh hệ thống thất bại")
     return p.stdout
@@ -133,7 +126,7 @@ def extract_json(text):
                 return json.loads(text[s:e])
             except Exception:
                 continue
-    raise ValueError("AI không trả về cấu trúc JSON hợp lệ")
+    raise ValueError("AI không phản hồi cấu trúc JSON hợp lệ")
 
 def groq_client(key):
     return Groq(api_key=key)
@@ -196,28 +189,27 @@ def sanitize_prompt_text(prompt):
         cleaned = re.sub(pattern, rep, cleaned, flags=re.IGNORECASE)
     return cleaned
 
+# -----------------------------
+# Lập kịch bản phân cảnh (Khôi phục logic bù khoảng lặng + Khóa chặn >35s)
+# -----------------------------
 def make_scene_plan(client, transcript_text, batch_start, batch_duration, model, min_s, max_s, max_scenes):
     system = f"""
-You are the visual director for a high-end educational whiteboard explainer channel.
+You are the visual director for a signature animated whiteboard channel.
 
 Task:
-Turn a voice transcript into rich, comic-style visual scenes.
+Turn the voice transcript into a rich, 3-part storyboard scene.
 
 HARD RULES:
-1. Each scene must be {min_s}-{max_s} seconds.
-2. Character Style: Professional 2D comic doodle art (chibi-proportions, clear expressive facial emotions like sweating, anxiety, shrugging, sadness, thick clean ink outlines). NO STICK FIGURES.
-3. Canvas Composition: Rich and well-filled 16:9 layout. Central expressive character surrounded by 2-3 visual situation branches, metaphor props, and connecting arrows.
-4. Accent Colors: Mention restrained bold red accent highlights on key symbols (like red warning marks, red gauges, red arrows).
-5. STRICTLY NO TEXT OR WORDS IN THE IMAGE:
-   - Do NOT use speech bubbles with words like "Sure", "Okay", "Sorry", "Please".
-   - Do NOT use signs or labels with English words like "Cheap", "Self-Worth", "Fear", "Liar".
-   - ALWAYS represent concepts through VISUAL METAPHORS and UNIVERSAL SYMBOLS:
-     * Instead of "Cheap": a tag with a downward red trend arrow.
-     * Instead of "Self-worth": a low battery icon or broken diamond.
-     * Instead of "Fear": a shadowy monster or dark storm cloud looming above.
-     * Instead of speech words: use '?', '!', '💔', '⚠️' inside bubbles.
-6. Safety: NEVER use words like blood, kill, suicide, weapon. Represent dark themes symbolically.
-7. Return ONLY valid JSON.
+1. Each scene must be {min_s}-{max_s} seconds (aim for around 18-24s).
+2. COMPREHENSIVE 3-PART STORYBOARD: Divide canvas into 3 connected zones on a 16:9 layout:
+   - LEFT: Trigger / context / origin of problem.
+   - CENTER: Main character (STRICTLY WAIST-UP half body or sitting behind a desk with deep facial emotions. NO awkward floating legs).
+   - RIGHT: Outcome / consequence / metaphor icons.
+   - Curved doodle arrows connecting all zones.
+3. COLOR ACCENTS: Bold black outlines on pure white background, selective red and blue spot colors.
+4. STRICTLY ZERO TEXT: Absolutely NO words or letters. Use visual metaphor icons (?, !, ⚠️, ❌, ⬇️, 💔) instead of speech bubbles.
+5. Safety: NEVER use words like blood, kill, suicide, weapon.
+6. Return ONLY valid JSON.
 
 JSON FORMAT:
 {{
@@ -226,8 +218,8 @@ JSON FORMAT:
       "start": 0.0,
       "end": 20.0,
       "title": "tiêu đề tiếng Việt ngắn gọn",
-      "summary": "một câu tóm tắt tiếng Việt",
-      "visual_prompt": "detailed visual comic doodle scene description in English, purely symbolic with zero text"
+      "summary": "tóm tắt tiếng Việt",
+      "visual_prompt": "detailed 3-part scene description in English, waist-up character, rich metaphors, zero text"
     }}
   ]
 }}
@@ -277,20 +269,68 @@ TRANSCRIPT:
             "end": batch_duration,
             "title": "Tổng kết nội dung",
             "summary": (transcript_text[:120] if transcript_text else "Kết thúc nội dung"),
-            "visual_prompt": "A thoughtful 2D comic character sitting at a desk with question marks and light bulb symbols, bold ink lines, vibrant red accent highlights, pure white background",
+            "visual_prompt": "A comprehensive 3-part whiteboard infographic with a waist-up expressive character sitting at a desk in center, question marks on left, insight lightbulb on right, pure white background",
         }]
 
+    # 1. Cảnh đầu tiên luôn bắt đầu từ 0.0s
     clean[0]["start"] = 0.0
 
-    # Lấp kín khoảng trống giữa các cảnh
+    # 2. Lấp khoảng trống: Kéo dài ảnh cảnh trước để phủ kín khoảng lặng tới sát cảnh sau
     for i in range(len(clean) - 1):
-        clean[i]["end"] = clean[i + 1]["start"]
+        next_start = clean[i + 1]["start"]
+        if clean[i]["end"] < next_start:
+            clean[i]["end"] = next_start
+        elif clean[i + 1]["start"] < clean[i]["end"]:
+            clean[i + 1]["start"] = clean[i]["end"]
 
-    clean[-1]["end"] = batch_duration
-    return clean
+    # 3. Xử lý đoạn đuôi của Batch để không bị hụt dù chỉ 1 giây âm thanh
+    if clean[-1]["end"] < batch_duration:
+        rem = batch_duration - clean[-1]["end"]
+        if rem <= 30.0:
+            clean[-1]["end"] = batch_duration
+        else:
+            curr = clean[-1]["end"]
+            step_idx = 1
+            while batch_duration - curr > 0:
+                r_dur = batch_duration - curr
+                step = min(25.0, r_dur) if r_dur > 30.0 else r_dur
+                clean.append({
+                    "start": curr,
+                    "end": curr + step,
+                    "title": f"Cảnh báo & Lời kết {step_idx}",
+                    "summary": "Tổng kết nội dung bài học",
+                    "visual_prompt": "A comprehensive 3-part whiteboard infographic of a waist-up person making a wise choice, warning signpost, light ahead, clean white background",
+                })
+                curr += step
+                step_idx += 1
+
+    # 4. KHÓA CHẶN AN TOÀN: Tuyệt đối không để cảnh nào dài hơn 35s (tự động chẻ đôi cảnh)
+    final_scenes = []
+    for s in clean:
+        dur = s["end"] - s["start"]
+        if dur > 35.0:
+            mid = s["start"] + dur / 2.0
+            final_scenes.append({
+                "start": s["start"],
+                "end": mid,
+                "title": s["title"],
+                "summary": s["summary"],
+                "visual_prompt": s["visual_prompt"],
+            })
+            final_scenes.append({
+                "start": mid,
+                "end": s["end"],
+                "title": f"{s['title']} (tiếp)",
+                "summary": s["summary"],
+                "visual_prompt": s["visual_prompt"] + ", continuation part, waist-up, clean white background",
+            })
+        else:
+            final_scenes.append(s)
+
+    return final_scenes
 
 # -----------------------------
-# Cloudflare Workers AI Engine (Nâng cấp phong cách Comic Doodle)
+# Cloudflare Workers AI Engine
 # -----------------------------
 def cloudflare_image_request(prompt, account_id, api_token, model, timeout=120):
     account_id = (account_id or "").strip()
@@ -302,17 +342,15 @@ def cloudflare_image_request(prompt, account_id, api_token, model, timeout=120):
 
     url = f"{CLOUDFLARE_AI_URL}{account_id}/ai/run/{model}"
     safe_prompt = sanitize_prompt_text(prompt)
-    
-    # Ép chặt phong cách Comic Doodle dày dặn, có màu nhấn đỏ/xanh, cấm tuyệt đối mọi loại chữ
+
     full_prompt = f"""
-Professional whiteboard explainer comic illustration of {safe_prompt}.
-STYLE SPECIFICATIONS:
-- High quality 2D comic doodle art style, thick black marker contour outlines, expressive cartoon characters with vivid facial expressions, full bodies, no stick figures.
-- Rich mindmap composition filling the 16:9 canvas with situation branches, visual metaphors, and doodle arrows.
-- Pure bright white background.
-- Selective vibrant red and blue spot color accents on key metaphor items and arrows.
-- STRICTLY WORDLESS: Absolutely NO English text, NO Vietnamese text, NO letters, NO words, NO typography, NO captions. 
-- All ideas conveyed purely through body language, facial emotions, and universal symbol icons (?, !, ⚠️, ❌, ⬇️).
+Comprehensive 16:9 widescreen educational whiteboard comic infographic of {safe_prompt}.
+VISUAL RULES:
+- Full landscape mindmap layout divided into 3 connected zones (Left context, Center character, Right consequence).
+- Character must be WAIST-UP half-body or sitting behind a desk, highly expressive cartoon emotion, thick bold ink outlines. NO floating leg doodles.
+- Pure solid white paper background.
+- Selective bright red and blue spot color fills on key metaphor icons.
+- STRICTLY WORDLESS: Absolutely NO words, NO letters, NO text, NO typography, NO captions. Universal icons only (?, !, ⚠️, ❌).
 """
     payload = {
         "prompt": full_prompt,
@@ -328,15 +366,14 @@ STYLE SPECIFICATIONS:
         try:
             response = requests.post(url, headers=headers, json=payload, timeout=timeout)
             if response.status_code == 401:
-                raise RuntimeError("Cloudflare 401: API Token không hợp lệ hoặc không có quyền truy cập Workers AI.")
+                raise RuntimeError("Cloudflare 401: API Token không hợp lệ.")
             if response.status_code == 403:
-                raise RuntimeError("Cloudflare 403: Tài khoản hoặc Token không có quyền dùng model Workers AI này.")
+                raise RuntimeError("Cloudflare 403: Không có quyền gọi mô hình này.")
             if response.status_code == 429:
                 time.sleep(3 * attempt)
                 continue
             if response.status_code >= 400:
-                detail = response.text[:1000]
-                raise RuntimeError(f"Cloudflare HTTP {response.status_code}: {detail}")
+                raise RuntimeError(f"Cloudflare HTTP {response.status_code}: {response.text[:500]}")
 
             data = response.json()
             if not data.get("success", True):
@@ -348,8 +385,6 @@ STYLE SPECIFICATIONS:
                 raise RuntimeError("Cloudflare không trả về dữ liệu ảnh Base64.")
 
             image_bytes = base64.b64decode(image_b64)
-            if not image_bytes:
-                raise RuntimeError("Dữ liệu ảnh Cloudflare trả về bị rỗng.")
             return image_bytes
         except Exception as e:
             last_error = e
@@ -380,7 +415,7 @@ def cloudflare_image(prompt, account_id, api_token, model, output_path, timeout=
 
 def test_cloudflare_api(account_id, api_token, model, timeout=120):
     data = cloudflare_image_request(
-        prompt="A stressed comic character sitting with head in hands, surrounded by floating question mark icons, messy arrows, bold outlines, selective red accent highlights, pure white background, wordless",
+        prompt="A 3-part comprehensive mindmap: on the left a boss giving tasks, in the center a waist-up stressed character holding head at desk, on the right an empty battery icon, bold ink, red spot colors, wordless",
         account_id=account_id,
         api_token=api_token,
         model=model,
@@ -415,68 +450,26 @@ def add_title(image_path, title, output_path):
     img.save(output_path, quality=95)
 
 # -----------------------------
-# Bộ máy vẽ tay từng nét (OpenCV)
+# Bộ máy Bàn tay & Quỹ đạo nét vẽ (Khôi phục Nearest-Neighbor Sorting)
 # -----------------------------
-def generate_fallback_hand():
-    S = 320
-    im = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-    d = ImageDraw.Draw(im)
-    d.line([(40, 40), (140, 140)], fill=(30, 30, 30, 255), width=10)
-    d.polygon([(30, 30), (50, 40), (40, 50)], fill=(220, 50, 50, 255))
-    d.ellipse((110, 110, 260, 260), fill=(235, 205, 175, 255), outline=(30, 30, 30, 255), width=4)
-    d.rounded_rectangle((100, 130, 180, 220), 20, fill=(235, 205, 175, 255), outline=(30, 30, 30, 255), width=4)
-    return im
-
 def load_hand_asset(hand_path, target_width=320):
-    p = None
-    for candidate in [hand_path, Path("hand.png"), Path("assets/hand.png")]:
-        if candidate and Path(candidate).exists():
-            p = Path(candidate)
-            break
-    if p:
-        try:
-            pil_hand = Image.open(p).convert("RGBA")
-        except Exception:
-            pil_hand = generate_fallback_hand()
+    p = Path(hand_path) if hand_path and Path(hand_path).exists() else Path("hand.png")
+    if p.exists():
+        pil_hand = Image.open(p).convert("RGBA")
     else:
-        pil_hand = generate_fallback_hand()
-
+        pil_hand = Image.new("RGBA", (320, 320), (0, 0, 0, 0))
     w, h = pil_hand.size
     new_h = int(h * (target_width / w))
     pil_hand = pil_hand.resize((target_width, new_h), Image.Resampling.LANCZOS)
     hand_np = np.array(pil_hand)
-
     bgr = cv2.cvtColor(hand_np[:, :, :3], cv2.COLOR_RGB2BGR)
     alpha = hand_np[:, :, 3]
-
     ys, xs = np.where(alpha > 120)
-    if len(xs) > 0:
-        score = xs + ys * 1.15
-        tip_idx = np.argmin(score)
-        tip_x = int(xs[tip_idx])
-        tip_y = int(ys[tip_idx])
-    else:
-        tip_x, tip_y = 0, 0
+    tip_x, tip_y = (int(xs[np.argmin(xs + ys * 1.15)]), int(ys[np.argmin(xs + ys * 1.15)])) if len(xs) > 0 else (0, 0)
     return bgr, alpha, tip_x, tip_y
 
-def extract_drawing_path(image_path):
-    img = cv2.imread(str(image_path))
-    if img is None:
-        return [(WIDTH // 2, HEIGHT // 2)]
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    _, binary = cv2.threshold(gray, 225, 255, cv2.THRESH_BINARY_INV)
-
-    title_mask = np.zeros_like(binary)
-    title_mask[:105, :] = binary[:105, :]
-
-    body_mask = np.zeros_like(binary)
-    body_mask[105:, :] = binary[105:, :]
-
-    title_contours, _ = cv2.findContours(title_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    body_contours, _ = cv2.findContours(body_mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
-
-    title_sorted = sorted(title_contours, key=lambda c: cv2.boundingRect(c)[0])
-
+def sort_contours_nn(contours, start_pt=(100, 150)):
+    """Thuật toán tối ưu đường đi nét gần nhất để tay không bị nhảy cóc"""
     def c_center(c):
         M = cv2.moments(c)
         if M["m00"] > 0:
@@ -484,11 +477,11 @@ def extract_drawing_path(image_path):
         x, y, w, h = cv2.boundingRect(c)
         return (x + w // 2, y + h // 2)
 
-    valid_body = [c for c in body_contours if cv2.arcLength(c, False) > 12]
-    body_sorted = []
-    if valid_body:
-        curr = (100, 150)
-        rem = valid_body[:]
+    valid = [c for c in contours if cv2.arcLength(c, False) > 10]
+    sorted_res = []
+    if valid:
+        curr = start_pt
+        rem = valid[:]
         while rem:
             best_idx = 0
             best_dist = float("inf")
@@ -499,23 +492,53 @@ def extract_drawing_path(image_path):
                     best_dist = d
                     best_idx = idx
             chosen = rem.pop(best_idx)
-            body_sorted.append(chosen)
+            sorted_res.append(chosen)
             curr = c_center(chosen)
+    return sorted_res
 
-    all_contours = title_sorted + body_sorted
+def extract_drawing_path(image_path):
+    img = cv2.imread(str(image_path))
+    if img is None:
+        return [(WIDTH // 2, HEIGHT // 2)]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    _, binary = cv2.threshold(gray, 225, 255, cv2.THRESH_BINARY_INV)
+
+    # Chia 4 phân khu: Tiêu đề -> Trái -> Giữa -> Phải
+    title_mask = np.zeros_like(binary)
+    title_mask[:105, :] = binary[:105, :]
+
+    left_mask = np.zeros_like(binary)
+    left_mask[105:, :int(WIDTH * 0.38)] = binary[105:, :int(WIDTH * 0.38)]
+
+    center_mask = np.zeros_like(binary)
+    center_mask[105:, int(WIDTH * 0.38):int(WIDTH * 0.68)] = binary[105:, int(WIDTH * 0.38):int(WIDTH * 0.68)]
+
+    right_mask = np.zeros_like(binary)
+    right_mask[105:, int(WIDTH * 0.68):] = binary[105:, int(WIDTH * 0.68):]
+
+    t_cnts, _ = cv2.findContours(title_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    l_cnts, _ = cv2.findContours(left_mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+    c_cnts, _ = cv2.findContours(center_mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+    r_cnts, _ = cv2.findContours(right_mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+
+    # Sắp xếp tiêu đề từ trái qua phải
+    t_sorted = sorted(t_cnts, key=lambda c: cv2.boundingRect(c)[0])
+
+    # Áp dụng thuật toán tìm nét gần nhất cho từng phân khu
+    l_sorted = sort_contours_nn(l_cnts, start_pt=(150, 200))
+    c_sorted = sort_contours_nn(c_cnts, start_pt=(int(WIDTH * 0.5), 200))
+    r_sorted = sort_contours_nn(r_cnts, start_pt=(int(WIDTH * 0.8), 200))
+
+    all_contours = t_sorted + l_sorted + c_sorted + r_sorted
+
     trajectory = []
     for c in all_contours:
         pts = c.reshape(-1, 2)
-        sampled = pts[::3]
-        for p in sampled:
+        for p in pts[::3]:
             trajectory.append((int(p[0]), int(p[1])))
 
     if len(trajectory) < 40:
-        trajectory = []
-        for y in range(120, 680, 45):
-            xs = range(80, 1200, 25) if (y // 45) % 2 == 0 else range(1200, 80, -25)
-            for x in xs:
-                trajectory.append((x, y))
+        trajectory = [(x, y) for y in range(120, 680, 45) for x in range(80, 1200, 25)]
     return trajectory
 
 def paste_hand(frame_bgr, hand_bgr, hand_alpha, x, y):
@@ -533,9 +556,15 @@ def paste_hand(frame_bgr, hand_bgr, hand_alpha, x, y):
     roi = frame_bgr[y1:y2, x1:x2]
     frame_bgr[y1:y2, x1:x2] = (sub_hand * sub_alpha + roi * (1.0 - sub_alpha)).astype(np.uint8)
 
-def render_scene(image_path, duration, output_path, hand_path, style):
+def ease_in_out(t):
+    return 0.5 * (1.0 - math.cos(math.pi * t))
+
+# -----------------------------
+# Chế độ 1: Độc Bản (Tay vẽ + Camera lướt theo nét + Zoom out)
+# -----------------------------
+def render_scene_hybrid(image_path, duration, output_path, hand_path):
     total_frames = max(1, round(duration * FPS))
-    draw_duration = max(2.0, min(duration - 1.0, duration * 0.75))
+    draw_duration = max(2.0, min(duration - 1.5, duration * 0.72))
     draw_frames = int(draw_duration * FPS)
     retract_frames = int(0.5 * FPS)
 
@@ -547,7 +576,7 @@ def render_scene(image_path, duration, output_path, hand_path, style):
     reveal_mask = np.zeros((HEIGHT, WIDTH), dtype=np.uint8)
 
     trajectory = extract_drawing_path(image_path)
-    hand_bgr, hand_alpha, tip_x, tip_y = load_hand_asset(hand_path, target_width=330)
+    hand_bgr, hand_alpha, tip_x, tip_y = load_hand_asset(hand_path, target_width=320)
 
     cmd = [
         "ffmpeg", "-y",
@@ -563,25 +592,149 @@ def render_scene(image_path, duration, output_path, hand_path, style):
     ]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
-    last_tip = trajectory[-1] if trajectory else (WIDTH // 2, HEIGHT // 2)
+    last_tip = trajectory[0] if trajectory else (WIDTH // 2, HEIGHT // 2)
+    smooth_cx, smooth_cy = float(last_tip[0]), float(last_tip[1])
 
     for f_idx in range(total_frames):
         hand_visible = False
         hand_pos_x, hand_pos_y = 0, 0
 
+        # Cập nhật nét vẽ và vị trí tay (Khôi phục micro-jitter rung nhẹ tự nhiên)
         if f_idx < draw_frames:
             curr_idx = int((f_idx + 1) / draw_frames * len(trajectory))
             prev_idx = int(f_idx / draw_frames * len(trajectory))
             step_pts = trajectory[prev_idx:curr_idx]
 
             for pt in step_pts:
-                cv2.circle(reveal_mask, pt, 22, 255, -1)
+                cv2.circle(reveal_mask, pt, 24, 255, -1)
 
-            if step_pts:
-                target_pt = step_pts[-1]
-            else:
-                target_pt = trajectory[min(curr_idx, len(trajectory) - 1)]
+            target_pt = step_pts[-1] if step_pts else trajectory[min(curr_idx, len(trajectory) - 1)]
+            jitter_x = int(1.2 * math.sin(f_idx * 1.8))
+            jitter_y = int(1.2 * math.cos(f_idx * 1.8))
+            hand_pos_x = target_pt[0] + jitter_x
+            hand_pos_y = target_pt[1] + jitter_y
+            last_tip = (hand_pos_x, hand_pos_y)
+            hand_visible = True
+        elif f_idx < draw_frames + retract_frames:
+            reveal_mask[:, :] = 255
+            prog = (f_idx - draw_frames) / max(1, retract_frames)
+            hand_pos_x = int(last_tip[0] + (WIDTH + 180 - last_tip[0]) * prog)
+            hand_pos_y = int(last_tip[1] + (HEIGHT + 180 - last_tip[1]) * prog)
+            hand_visible = True
+        else:
+            reveal_mask[:, :] = 255
+            hand_visible = False
 
+        blur = cv2.GaussianBlur(reveal_mask, (13, 13), 0)
+        alpha = (blur.astype(np.float32) / 255.0)[:, :, None]
+        frame_world = (original_bgr * alpha + white_canvas * (1.0 - alpha)).astype(np.uint8)
+
+        if hand_visible:
+            paste_hand(frame_world, hand_bgr, hand_alpha, hand_pos_x - tip_x, hand_pos_y - tip_y)
+
+        # Tính toán camera lướt theo ngòi bút và zoom out kết màn
+        if f_idx < draw_frames:
+            scale = 1.25
+            smooth_cx = smooth_cx * 0.95 + hand_pos_x * 0.05
+            smooth_cy = smooth_cy * 0.95 + hand_pos_y * 0.05
+        else:
+            out_prog = ease_in_out((f_idx - draw_frames) / max(1, total_frames - draw_frames))
+            scale = 1.25 - 0.25 * out_prog
+            smooth_cx = smooth_cx * (1.0 - out_prog) + (WIDTH * 0.5) * out_prog
+            smooth_cy = smooth_cy * (1.0 - out_prog) + (HEIGHT * 0.5) * out_prog
+
+        crop_w = int(WIDTH / scale)
+        crop_h = int(HEIGHT / scale)
+        half_w, half_h = crop_w // 2, crop_h // 2
+        clamped_cx = max(half_w, min(WIDTH - half_w, int(smooth_cx)))
+        clamped_cy = max(half_h, min(HEIGHT - half_h, int(smooth_cy)))
+
+        crop = frame_world[clamped_cy - half_h:clamped_cy + half_h, clamped_cx - half_w:clamped_cx + half_w]
+        frame_out = cv2.resize(crop, (WIDTH, HEIGHT), interpolation=cv2.INTER_LINEAR)
+        proc.stdin.write(frame_out.tobytes())
+
+    proc.stdin.close()
+    proc.wait()
+    if proc.returncode != 0:
+        raise RuntimeError("FFmpeg thất bại trong chế độ Độc bản.")
+
+# -----------------------------
+# Chế độ 2: Kiến Thức Thú Vị (Chỉ lia máy + Zoom động, ẩn tay)
+# -----------------------------
+def render_scene_kttv(image_path, duration, output_path):
+    total_frames = max(1, round(duration * FPS))
+    original_bgr = cv2.resize(cv2.imread(str(image_path)), (WIDTH, HEIGHT))
+
+    cmd = [
+        "ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
+        "-s", f"{WIDTH}x{HEIGHT}", "-pix_fmt", "bgr24", "-r", str(FPS),
+        "-i", "-", "-an", "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", str(output_path)
+    ]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    pt_left = (WIDTH * 0.32, HEIGHT * 0.58)
+    pt_right = (WIDTH * 0.68, HEIGHT * 0.58)
+    pt_center = (WIDTH * 0.50, HEIGHT * 0.50)
+
+    for f_idx in range(total_frames):
+        p = f_idx / max(1, total_frames - 1)
+        if p < 0.35:
+            scale = 1.35 + 0.05 * (p / 0.35)
+            cx, cy = pt_left
+        elif p < 0.60:
+            sub_p = ease_in_out((p - 0.35) / 0.25)
+            scale = 1.40
+            cx = pt_left[0] + (pt_right[0] - pt_left[0]) * sub_p
+            cy = pt_left[1] + (pt_right[1] - pt_left[1]) * sub_p
+        elif p < 0.85:
+            sub_p = ease_in_out((p - 0.60) / 0.25)
+            scale = 1.40 - 0.40 * sub_p
+            cx = pt_right[0] + (pt_center[0] - pt_right[0]) * sub_p
+            cy = pt_right[1] + (pt_center[1] - pt_right[1]) * sub_p
+        else:
+            scale = 1.0
+            cx, cy = pt_center
+
+        crop_w, crop_h = int(WIDTH / scale), int(HEIGHT / scale)
+        x1 = max(0, min(WIDTH - crop_w, int(cx - crop_w / 2)))
+        y1 = max(0, min(HEIGHT - crop_h, int(cy - crop_h / 2)))
+        crop = original_bgr[y1:y1 + crop_h, x1:x1 + crop_w]
+        frame = cv2.resize(crop, (WIDTH, HEIGHT), interpolation=cv2.INTER_LINEAR)
+        proc.stdin.write(frame.tobytes())
+
+    proc.stdin.close()
+    proc.wait()
+
+# -----------------------------
+# Chế độ 3: Bảng trắng cổ điển (Góc máy tĩnh, tay vẽ)
+# -----------------------------
+def render_scene_classic_hand(image_path, duration, output_path, hand_path):
+    total_frames = max(1, round(duration * FPS))
+    draw_frames = int(max(2.0, min(duration - 1.0, duration * 0.75)) * FPS)
+    retract_frames = int(0.5 * FPS)
+    original_bgr = cv2.resize(cv2.imread(str(image_path)), (WIDTH, HEIGHT))
+    white_canvas = np.full_like(original_bgr, 255)
+    reveal_mask = np.zeros((HEIGHT, WIDTH), dtype=np.uint8)
+
+    trajectory = extract_drawing_path(image_path)
+    hand_bgr, hand_alpha, tip_x, tip_y = load_hand_asset(hand_path)
+
+    cmd = [
+        "ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
+        "-s", f"{WIDTH}x{HEIGHT}", "-pix_fmt", "bgr24", "-r", str(FPS),
+        "-i", "-", "-an", "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", str(output_path)
+    ]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    last_tip = trajectory[0] if trajectory else (WIDTH // 2, HEIGHT // 2)
+
+    for f_idx in range(total_frames):
+        hand_visible = False
+        if f_idx < draw_frames:
+            curr_idx = int((f_idx + 1) / draw_frames * len(trajectory))
+            prev_idx = int(f_idx / draw_frames * len(trajectory))
+            for pt in trajectory[prev_idx:curr_idx]:
+                cv2.circle(reveal_mask, pt, 24, 255, -1)
+            target_pt = trajectory[min(curr_idx, len(trajectory) - 1)] if trajectory else (WIDTH // 2, HEIGHT // 2)
             jitter_x = int(1.2 * math.sin(f_idx * 1.8))
             jitter_y = int(1.2 * math.cos(f_idx * 1.8))
             hand_pos_x = target_pt[0] + jitter_x
@@ -602,27 +755,16 @@ def render_scene(image_path, duration, output_path, hand_path, style):
         alpha = (blur.astype(np.float32) / 255.0)[:, :, None]
         frame = (original_bgr * alpha + white_canvas * (1.0 - alpha)).astype(np.uint8)
 
-        if hand_visible and ("Không hiện tay" not in style and "Clean" not in style):
+        if hand_visible:
             paste_hand(frame, hand_bgr, hand_alpha, hand_pos_x - tip_x, hand_pos_y - tip_y)
-
-        if "Phóng to" in style or "zoom" in style.lower():
-            scale = 1.0 + 0.05 * (f_idx / total_frames)
-            cw, ch = int(WIDTH / scale), int(HEIGHT / scale)
-            x1 = (WIDTH - cw) // 2
-            y1 = (HEIGHT - ch) // 2
-            crop = frame[y1:y1 + ch, x1:x1 + cw]
-            frame = cv2.resize(crop, (WIDTH, HEIGHT), interpolation=cv2.INTER_LINEAR)
 
         proc.stdin.write(frame.tobytes())
 
     proc.stdin.close()
     proc.wait()
-    if proc.returncode != 0:
-        err = proc.stderr.read().decode("utf-8", errors="ignore")
-        raise RuntimeError(f"FFmpeg thất bại: {err[-2000:]}")
 
 # -----------------------------
-# Quy trình render theo đợt (Batch)
+# Quy trình render theo đợt
 # -----------------------------
 def render_batch(batch_audio, scenes, batch_dir, hand_path, style, progress_callback=None):
     scene_videos = []
@@ -635,7 +777,15 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style, progress_call
             cloudflare_image(s["visual_prompt"], cloudflare_account_id, cloudflare_token, image_model, img_raw, image_timeout)
             add_title(img_raw, s["title"], img)
         duration = max(1.0, float(s["end"]) - float(s["start"]))
-        render_scene(img, duration, vid, hand_path, style)
+
+        # Phân luồng chính xác theo đúng lựa chọn trên Sidebar
+        if "Độc bản" in style:
+            render_scene_hybrid(img, duration, vid, hand_path)
+        elif "Kiến Thức Thú Vị" in style:
+            render_scene_kttv(img, duration, vid)
+        else:
+            render_scene_classic_hand(img, duration, vid, hand_path)
+
         scene_videos.append(vid)
         if progress_callback:
             progress_callback(i / total)
@@ -676,40 +826,29 @@ def concat_batches(batch_videos, output_path):
 # Luồng ứng dụng chính
 # -----------------------------
 st.sidebar.divider()
-if st.sidebar.button("🔎 KIỂM TRA CLOUDFLARE AI", use_container_width=True):
+if st.sidebar.button("🔎 KIỂM TRA ẢNH BỐ CỤC 3 PHẦN", use_container_width=True):
     try:
-        with st.spinner("Cloudflare đang tạo ảnh thử nghiệm phong cách Comic Doodle..."):
+        with st.spinner("Cloudflare đang vẽ tranh 3 phân khu..."):
             test_img = test_cloudflare_api(cloudflare_account_id, cloudflare_token, image_model, 120)
-        st.success("✅ Cloudflare Workers AI hoạt động cực tốt — Tranh đậm nét, có màu nhấn, không chữ!")
-        st.image(test_img, caption=f"Model: {image_model} (Chuẩn phong cách Comic Doodle)", use_container_width=True)
+        st.success("✅ Ảnh tạo thành công — Bố cục rộng, nhân vật bán thân, sạch chữ 100%!")
+        st.image(test_img, caption="Ảnh mẫu bố cục 3 vùng (Left - Center - Right)", use_container_width=True)
     except Exception as e:
-        st.error(f"❌ Cloudflare AI lỗi: {e}")
+        st.error(f"❌ Lỗi: {e}")
 
-audio = st.file_uploader(
-    "🎤 Tải lên tệp ghi âm giọng nói",
-    type=["mp3", "m4a", "wav", "ogg", "webm", "mp4", "mpeg", "mpga"],
-    help="Hỗ trợ các định dạng âm thanh phổ biến.",
-)
+audio = st.file_uploader("🎤 Tải lên tệp ghi âm giọng nói", type=["mp3", "m4a", "wav", "ogg", "webm", "mp4"])
 
 if audio:
     st.audio(audio)
 
     if st.button("🚀 BẮT ĐẦU TẠO VIDEO", type="primary", use_container_width=True):
-        if not groq_key:
-            st.error("Vui lòng nhập Khóa Groq API.")
-            st.stop()
-        if not cloudflare_account_id:
-            st.error("Vui lòng nhập Cloudflare Account ID.")
-            st.stop()
-        if not cloudflare_token:
-            st.error("Vui lòng nhập Cloudflare Workers AI API Token.")
+        if not groq_key or not cloudflare_account_id or not cloudflare_token:
+            st.error("Vui lòng nhập đầy đủ Groq API Key, Cloudflare Account ID và Token.")
             st.stop()
 
         root = Path(tempfile.mkdtemp(prefix="wb_ai_"))
         try:
             source = root / audio.name
             source.write_bytes(audio.getbuffer())
-
             duration = ffprobe_duration(source)
             st.info(f"Thời lượng âm thanh: {duration/60:.2f} phút. Hệ thống xử lý theo từng đợt 5 phút chuẩn.")
 
@@ -717,7 +856,6 @@ if audio:
             batch_dir = root / "batches"
             batch_dir.mkdir()
             chunks = chunk_audio(source, batch_dir)
-
             hand_path = Path("hand.png")
 
             batch_videos = []
@@ -725,79 +863,52 @@ if audio:
             progress = st.progress(0)
             status = st.empty()
 
-            valid_chunks = []
-            for bi, chunk in enumerate(chunks):
-                cdur = ffprobe_duration(chunk)
-                if cdur < 5.0 and bi > 0:
-                    continue
-                valid_chunks.append((bi, chunk, cdur))
+            valid_chunks = [(bi, ch, ffprobe_duration(ch)) for bi, ch in enumerate(chunks) if ffprobe_duration(ch) >= 5.0 or bi == 0]
 
             for idx, (bi, chunk, bdur) in enumerate(valid_chunks):
                 bstart = bi * BATCH_SECONDS
                 status.write(f"🧠 Đợt {idx+1}/{len(valid_chunks)} — Đang nhận diện giọng nói...")
                 tr = transcribe_file(client, chunk, stt_model)
                 segs = normalize_segments(tr, bstart)
-                batch_text = "\n".join(
-                    f"[{x['start']:.2f}-{x['end']:.2f}] {x['text']}"
-                    for x in segs
-                )
+                batch_text = "\n".join(f"[{x['start']:.2f}-{x['end']:.2f}] {x['text']}" for x in segs)
 
-                status.write(f"✂️ Đợt {idx+1}/{len(valid_chunks)} — Đang lập kịch bản phân cảnh Comic Doodle...")
-                scenes = make_scene_plan(
-                    client,
-                    batch_text,
-                    bstart,
-                    bdur,
-                    planner_model,
-                    scene_min,
-                    scene_max,
-                    max_scenes_per_batch,
-                )
+                status.write(f"✂️ Đợt {idx+1}/{len(valid_chunks)} — Lên kịch bản 3 phân khu bao quát...")
+                scenes = make_scene_plan(client, batch_text, bstart, bdur, planner_model, scene_min, scene_max, max_scenes_per_batch)
 
                 st.write(f"**Đợt {idx+1}: {bdur:.1f}s → {len(scenes)} cảnh**")
                 for si, s in enumerate(scenes, 1):
-                    st.caption(
-                        f"{si:02d}. {s['start']:.1f}s–{s['end']:.1f}s — {s['title']}"
-                    )
+                    st.caption(f"{si:02d}. {s['start']:.1f}s–{s['end']:.1f}s — {s['title']}")
 
                 batch_work = root / f"work_{idx+1:03d}"
                 batch_work.mkdir()
 
-                status.write(f"🎨 Đợt {idx+1}/{len(valid_chunks)} — Đang tạo tranh FLUX và render nét vẽ...")
+                status.write(f"🎨 Đợt {idx+1}/{len(valid_chunks)} — Đang vẽ tranh và render hiệu ứng...")
                 def cb(frac, idx=idx):
                     progress.progress(min(1.0, (idx + frac) / len(valid_chunks)))
 
-                bv = render_batch(
-                    chunk, scenes, batch_work, hand_path, draw_style, cb
-                )
-
+                bv = render_batch(chunk, scenes, batch_work, hand_path, draw_style, cb)
                 saved_batch = root / f"batch_final_{idx+1:03d}.mp4"
                 shutil.copy2(bv, saved_batch)
                 batch_videos.append(saved_batch)
                 all_scene_count += len(scenes)
-
                 shutil.rmtree(batch_work, ignore_errors=True)
 
             progress.progress(1.0)
             status.write("🎬 Đang kết hợp video hoàn chỉnh...")
-
-            final = root / "whiteboard_final.mp4"
+            final = root / "video_hoan_chinh.mp4"
             concat_batches(batch_videos, final)
 
-            st.success(
-                f"Đã tạo thành công {all_scene_count} cảnh chuẩn nét vẽ Comic Doodle, sạch chữ tiếng Anh và đồng bộ 100% âm thanh!"
-            )
+            st.success(f"Hoàn thành xuất sắc! Đã tạo {all_scene_count} cảnh chuẩn nét vẽ tay và đồng bộ 100% âm thanh.")
             st.video(str(final))
             st.download_button(
                 "⬇️ TẢI VIDEO MP4 VỀ MÁY",
                 data=final.read_bytes(),
-                file_name="video_ve_tay_hoan_chinh.mp4",
+                file_name="video_hoan_chinh.mp4",
                 mime="video/mp4",
                 use_container_width=True,
             )
 
         except Exception as e:
             st.exception(e)
-            st.warning("Nếu gặp lỗi, vui lòng kiểm tra thông báo trong mục Quản lý ứng dụng.")
         finally:
             pass
