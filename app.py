@@ -8,7 +8,6 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from urllib.parse import quote
 
 import requests
 import streamlit as st
@@ -18,10 +17,11 @@ import cv2
 import numpy as np
 
 APP_TITLE = "Xưởng Video Vẽ Tay AI"
-BATCH_SECONDS = 5 * 60  # Giữ nguyên 5 phút chuẩn
+BATCH_SECONDS = 5 * 60  # 5 phút chuẩn
 FPS = 30
 WIDTH = 1280
 HEIGHT = 720
+HF_FLUX_MODEL = "black-forest-labs/FLUX.1-schnell"
 
 # -----------------------------
 # Giao diện / Cấu hình
@@ -29,7 +29,7 @@ HEIGHT = 720
 st.set_page_config(page_title=APP_TITLE, page_icon="✏️", layout="wide")
 
 st.title("✏️ Xưởng Tạo Video Vẽ Bảng Trắng AI")
-st.caption("Giọng nói → Lên kịch bản cảnh → Tạo ảnh AI → Vẽ tay từng nét → FFmpeg → MP4")
+st.caption("Giọng nói → Phân cảnh Groq → Vẽ tranh FLUX (Hugging Face) → Nét bút vẽ tay OpenCV → MP4")
 
 with st.sidebar:
     st.header("🔑 Cấu hình API")
@@ -39,17 +39,17 @@ with st.sidebar:
         type="password",
         help="Dùng cho nhận diện giọng nói và lên kịch bản phân cảnh.",
     )
-    pollen_key = st.text_input(
-        "Khóa Pollinations API (Pollinations API Key)",
-        value=st.secrets.get("POLLINATIONS_API_KEY", os.getenv("POLLINATIONS_API_KEY", "")),
+    hf_token = st.text_input(
+        "Khóa Hugging Face Token",
+        value=st.secrets.get("HF_TOKEN", os.getenv("HF_TOKEN", "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")),
         type="password",
-        help="Dùng để sinh ảnh vẽ phong cách bảng trắng.",
+        help="Dùng để tạo tranh FLUX.1-schnell miễn phí.",
     )
 
     st.header("🧠 Mô hình Groq")
     stt_model = st.selectbox(
         "Mô hình nghe giọng nói (Voice → Text)",
-        ["whisper-large-v3-turbo", "whisper-large-v3"],
+        ["whisper-large-v3", "whisper-large-v3-turbo"],
         index=0,
     )
     planner_model = st.selectbox(
@@ -58,14 +58,7 @@ with st.sidebar:
         index=0,
     )
 
-    st.header("🎨 Mô hình tạo ảnh")
-    image_model = st.selectbox(
-        "Mô hình vẽ hình Pollinations",
-        ["flux", "gptimage", "seedream5", "qwen-image"],
-        index=0,
-    )
-
-    st.header("🎬 Cài đặt phân cảnh")
+    st.header("🎬 Cài đặt hiệu ứng")
     scene_min = st.slider("Thời lượng cảnh tối thiểu (giây)", 15, 25, 15)
     scene_max = st.slider("Thời lượng cảnh tối đa (giây)", 20, 30, 30)
     if scene_max < scene_min:
@@ -82,7 +75,7 @@ with st.sidebar:
 
     st.header("⚙️ Giới hạn an toàn")
     max_scenes_per_batch = st.slider("Số cảnh tối đa mỗi đợt 5 phút", 5, 25, 20)
-    image_timeout = st.slider("Thời gian chờ tải ảnh (giây)", 30, 180, 90)
+    image_timeout = st.slider("Thời gian chờ tạo ảnh (giây)", 30, 180, 90)
 
 # -----------------------------
 # Tiện ích hệ thống
@@ -270,121 +263,79 @@ TRANSCRIPT:
             "visual_prompt": "A symbolic whiteboard educational drawing of a person thinking, question marks, abstract diagrams, clean white background, minimalist black ink art",
         }]
 
-    # 1. Cảnh đầu tiên luôn chạm mốc 0.0s
+    # 1. Bắt đầu từ giây 0.0
     clean[0]["start"] = 0.0
 
-    # 2. Giữ nguyên toàn bộ 13-14 cảnh của AI: Kéo dài ảnh cảnh trước ra để phủ kín khoảng lặng tới cảnh sau
+    # 2. Giữ nguyên toàn bộ 13-14 cảnh của AI: Kéo dài ảnh cảnh trước ra phủ kín khoảng lặng tới cảnh sau
     for i in range(len(clean) - 1):
         clean[i]["end"] = clean[i + 1]["start"]
 
-    # 3. Kéo cảnh cuối cùng phủ kín đến hết batch_duration (khắc phục hụt 15s)
+    # 3. Kéo cảnh cuối phủ kín đến hết batch_duration (khắc phục hụt 15s)
     clean[-1]["end"] = batch_duration
 
     return clean
 
-def normalize_pollinations_key(api_key):
-    key = (api_key or "").strip()
-    if not key:
-        raise RuntimeError("Chưa nhập khóa POLLINATIONS_API_KEY.")
-    if not (key.startswith("sk_") or key.startswith("pk_")):
-        raise RuntimeError(
-            "Khóa Pollinations API không đúng định dạng. Khóa thường bắt đầu bằng sk_ hoặc pk_."
-        )
-    return key
+# -----------------------------
+# Hugging Face FLUX.1 Engine
+# -----------------------------
+def hf_flux_request(prompt, token, timeout=90):
+    token = (token or "").strip()
+    if not token:
+        raise RuntimeError("Chưa nhập Hugging Face Token.")
 
-def pollinations_request(prompt, api_key, model, timeout, width=WIDTH, height=HEIGHT):
-    key = normalize_pollinations_key(api_key)
     safe_prompt = sanitize_prompt_text(prompt)
+    full_prompt = (
+        f"{safe_prompt}, single coherent whiteboard infographic, 16:9 landscape composition, "
+        "pure white paper background, hand-drawn black ink line art, simple expressive educational illustration, "
+        "clean composition, subtle red and blue accent strokes only, clear visual hierarchy, arrows, "
+        "empty band near top for title, NO words, NO letters, NO text, NO watermark, 2D vector style"
+    )
 
-    full_prompt = f"""
-{safe_prompt}
-
-STYLE LOCK:
-single coherent whiteboard infographic, 16:9 landscape composition,
-pure white paper background, hand-drawn black ink line art,
-simple expressive educational illustration, clean composition,
-subtle red and blue accent strokes only,
-clear central visual hierarchy, arrows connecting cause and effect,
-leave a clean empty band near the top for a title,
-NO words, NO letters, NO captions, NO watermark, NO logo,
-no photorealism, no 3D render, no gradients, no clutter.
-"""
-    url = "https://gen.pollinations.ai/image/" + quote(full_prompt, safe="")
-    params = {
-        "model": model,
-        "width": width,
-        "height": height,
-        "nologo": "true",
-        "private": "true",
+    api_url = f"https://api-inference.huggingface.co/models/{HF_FLUX_MODEL}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "image/jpeg",
     }
+    payload = {"inputs": full_prompt}
 
-    last_error = None
     for attempt in range(1, 4):
         try:
-            r = requests.get(
-                url,
-                params=params,
-                headers={
-                    "Authorization": f"Bearer {key}",
-                    "Accept": "image/*",
-                },
-                timeout=timeout,
-            )
-            if r.status_code == 401:
-                raise RuntimeError("Pollinations lỗi 401: Khóa API không đúng hoặc đã hết hạn.")
-            if r.status_code == 403:
-                raise RuntimeError("Pollinations lỗi 403: Không có quyền truy cập mô hình này.")
-            if r.status_code == 429:
-                time.sleep(3 * attempt)
+            r = requests.post(api_url, headers=headers, json=payload, timeout=timeout)
+            if r.status_code == 200 and len(r.content) > 1000:
+                return r.content
+            if r.status_code == 503:
+                time.sleep(10 * attempt)
                 continue
-
-            if r.status_code == 400 and ("safety" in r.text.lower() or "violation" in r.text.lower()):
-                fallback_prompt = (
-                    "A symbolic minimal whiteboard infographic illustration, showing a character facing life decisions, "
-                    "arrows pointing to multiple paths, clean white background, educational doodle"
-                )
-                fb_url = "https://gen.pollinations.ai/image/" + quote(fallback_prompt, safe="")
-                r_fb = requests.get(fb_url, params=params, headers={"Authorization": f"Bearer {key}", "Accept": "image/*"}, timeout=timeout)
-                if r_fb.status_code == 200 and "image" in r_fb.headers.get("content-type", "").lower():
-                    return r_fb.content
-
+            if r.status_code == 401:
+                raise RuntimeError("Hugging Face báo lỗi 401: Token không đúng hoặc không có quyền Read.")
             if r.status_code >= 400:
-                detail = r.text[:500].replace("\n", " ")
-                raise RuntimeError(f"Pollinations phản hồi mã {r.status_code}: {detail}")
-
-            content_type = r.headers.get("content-type", "").lower()
-            if "image" not in content_type:
-                raise RuntimeError("Pollinations không trả về file hình ảnh.")
-            if not r.content:
-                raise RuntimeError("Dữ liệu ảnh nhận về bị rỗng.")
-            return r.content
+                err_msg = r.text[:300].replace("\n", " ")
+                raise RuntimeError(f"Hugging Face HTTP {r.status_code}: {err_msg}")
         except Exception as e:
-            last_error = e
             if attempt < 3:
-                time.sleep(2 * attempt)
+                time.sleep(3 * attempt)
             else:
-                raise last_error
+                raise RuntimeError(f"Lỗi kết nối Hugging Face FLUX: {e}")
 
-def pollinations_image(prompt, api_key, model, output_path, timeout):
-    data = pollinations_request(prompt, api_key, model, timeout)
+    raise RuntimeError("Hệ thống không thể tạo ảnh sau 3 lần thử.")
+
+def generate_image(prompt, token, output_path, timeout):
+    data = hf_flux_request(prompt, token, timeout)
     Path(output_path).write_bytes(data)
     try:
         with Image.open(output_path) as im:
             im.verify()
         with Image.open(output_path) as im:
-            im.convert("RGB").save(output_path, quality=94)
+            im.convert("RGB").resize((WIDTH, HEIGHT)).save(output_path, quality=94)
     except Exception as e:
         Path(output_path).unlink(missing_ok=True)
-        raise RuntimeError(f"File ảnh từ Pollinations không hợp lệ: {e}")
+        raise RuntimeError(f"File ảnh tạo ra không hợp lệ: {e}")
 
-def test_pollinations_api(api_key, model, timeout):
-    data = pollinations_request(
-        "A simple black ink whiteboard drawing of an idea bulb and a book, minimal composition, white background",
-        api_key,
-        model,
+def test_hf_api(token, timeout):
+    data = hf_flux_request(
+        "A simple black ink whiteboard drawing of an idea light bulb and an open book, minimal composition, white background",
+        token,
         timeout,
-        width=512,
-        height=288,
     )
     return Image.open(io.BytesIO(data)).convert("RGB")
 
@@ -631,7 +582,7 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style, progress_call
         img = batch_dir / f"scene_{i:03d}.jpg"
         vid = batch_dir / f"scene_{i:03d}.mp4"
         if not img.exists():
-            pollinations_image(s["visual_prompt"], pollen_key, image_model, img_raw, image_timeout)
+            generate_image(s["visual_prompt"], hf_token, img_raw, image_timeout)
             add_title(img_raw, s["title"], img)
         duration = max(1.0, float(s["end"]) - float(s["start"]))
         render_scene(img, duration, vid, hand_path, style)
@@ -675,14 +626,14 @@ def concat_batches(batch_videos, output_path):
 # Luồng ứng dụng chính
 # -----------------------------
 st.sidebar.divider()
-if st.sidebar.button("🔎 KIỂM TRA KẾT NỐI POLLINATIONS", use_container_width=True):
+if st.sidebar.button("🔎 KIỂM TRA TẠO ẢNH HUGGING FACE", use_container_width=True):
     try:
-        with st.spinner("Đang kiểm tra tạo ảnh thử nghiệm..."):
-            test_img = test_pollinations_api(pollen_key, image_model, 60)
-        st.success("Pollinations kết nối tốt — Khóa API và Mô hình hoạt động bình thường!")
-        st.image(test_img, caption=f"Mô hình đang dùng: {image_model}", use_container_width=True)
+        with st.spinner("Đang kết nối tới mô hình FLUX.1-schnell..."):
+            test_img = test_hf_api(hf_token, 60)
+        st.success("Hugging Face FLUX kết nối rất tốt — Sẵn sàng tạo ảnh!")
+        st.image(test_img, caption="Ảnh minh họa thử nghiệm từ FLUX.1-schnell", use_container_width=True)
     except Exception as e:
-        st.error(f"Lỗi kết nối: {e}")
+        st.error(f"Lỗi kiểm tra: {e}")
 
 audio = st.file_uploader(
     "🎤 Tải lên tệp ghi âm giọng nói",
@@ -697,13 +648,8 @@ if audio:
         if not groq_key:
             st.error("Vui lòng nhập Khóa Groq API.")
             st.stop()
-        if not pollen_key:
-            st.error("Vui lòng nhập Khóa Pollinations API.")
-            st.stop()
-        try:
-            pollen_key = normalize_pollinations_key(pollen_key)
-        except Exception as e:
-            st.error(str(e))
+        if not hf_token:
+            st.error("Vui lòng nhập Khóa Hugging Face Token.")
             st.stop()
 
         root = Path(tempfile.mkdtemp(prefix="wb_ai_"))
@@ -712,7 +658,7 @@ if audio:
             source.write_bytes(audio.getbuffer())
 
             duration = ffprobe_duration(source)
-            st.info(f"Thời lượng âm thanh: {duration/60:.2f} phút. Hệ thống xử lý theo đợt tối đa {BATCH_SECONDS//60} phút.")
+            st.info(f"Thời lượng âm thanh: {duration/60:.2f} phút. Hệ thống xử lý theo từng đợt 5 phút chuẩn.")
 
             client = groq_client(groq_key)
             batch_dir = root / "batches"
@@ -764,7 +710,7 @@ if audio:
                 batch_work = root / f"work_{idx+1:03d}"
                 batch_work.mkdir()
 
-                status.write(f"🎨 Đợt {idx+1}/{len(valid_chunks)} — Đang vẽ tranh và render hiệu ứng...")
+                status.write(f"🎨 Đợt {idx+1}/{len(valid_chunks)} — Đang tạo tranh FLUX và render hiệu ứng nét vẽ...")
                 def cb(frac, idx=idx):
                     progress.progress(min(1.0, (idx + frac) / len(valid_chunks)))
 
