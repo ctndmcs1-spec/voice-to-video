@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+from urllib.parse import quote
 
 import requests
 import streamlit as st
@@ -263,16 +264,13 @@ TRANSCRIPT:
             "visual_prompt": "A symbolic whiteboard educational drawing of a person thinking, question marks, abstract diagrams, clean white background, minimalist black ink art",
         }]
 
-    # 1. Bắt đầu từ giây 0.0
     clean[0]["start"] = 0.0
 
-    # 2. Giữ nguyên toàn bộ 13-14 cảnh của AI: Kéo dài ảnh cảnh trước ra phủ kín khoảng lặng tới cảnh sau
+    # Lấp khoảng trống giữa các cảnh
     for i in range(len(clean) - 1):
         clean[i]["end"] = clean[i + 1]["start"]
 
-    # 3. Kéo cảnh cuối phủ kín đến hết batch_duration (khắc phục hụt 15s)
     clean[-1]["end"] = batch_duration
-
     return clean
 
 # -----------------------------
@@ -280,9 +278,6 @@ TRANSCRIPT:
 # -----------------------------
 def hf_flux_request(prompt, token, timeout=90):
     token = (token or "").strip()
-    if not token:
-        raise RuntimeError("Chưa nhập Hugging Face Token.")
-
     safe_prompt = sanitize_prompt_text(prompt)
     full_prompt = (
         f"{safe_prompt}, single coherent whiteboard infographic, 16:9 landscape composition, "
@@ -291,33 +286,45 @@ def hf_flux_request(prompt, token, timeout=90):
         "empty band near top for title, NO words, NO letters, NO text, NO watermark, 2D vector style"
     )
 
-    api_url = f"https://api-inference.huggingface.co/models/{HF_FLUX_MODEL}"
+    # 1. Gọi trực tiếp qua Router mới của Hugging Face
+    endpoints = [
+        f"https://router.huggingface.co/hf-inference/models/{HF_FLUX_MODEL}",
+        f"https://router.huggingface.co/models/{HF_FLUX_MODEL}",
+    ]
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "image/jpeg",
     }
     payload = {"inputs": full_prompt}
 
-    for attempt in range(1, 4):
-        try:
-            r = requests.post(api_url, headers=headers, json=payload, timeout=timeout)
-            if r.status_code == 200 and len(r.content) > 1000:
-                return r.content
-            if r.status_code == 503:
-                time.sleep(10 * attempt)
-                continue
-            if r.status_code == 401:
-                raise RuntimeError("Hugging Face báo lỗi 401: Token không đúng hoặc không có quyền Read.")
-            if r.status_code >= 400:
-                err_msg = r.text[:300].replace("\n", " ")
-                raise RuntimeError(f"Hugging Face HTTP {r.status_code}: {err_msg}")
-        except Exception as e:
-            if attempt < 3:
-                time.sleep(3 * attempt)
-            else:
-                raise RuntimeError(f"Lỗi kết nối Hugging Face FLUX: {e}")
+    last_err = None
+    for api_url in endpoints:
+        for attempt in range(1, 4):
+            try:
+                r = requests.post(api_url, headers=headers, json=payload, timeout=timeout)
+                if r.status_code == 200 and len(r.content) > 1000:
+                    return r.content
+                if r.status_code == 503:
+                    time.sleep(8 * attempt)
+                    continue
+                if r.status_code == 401:
+                    raise RuntimeError("Hugging Face lỗi 401: Token không đúng hoặc chưa có quyền Read.")
+                if r.status_code >= 400:
+                    last_err = f"HTTP {r.status_code}: {r.text[:200]}"
+            except Exception as e:
+                last_err = str(e)
+                time.sleep(2 * attempt)
 
-    raise RuntimeError("Hệ thống không thể tạo ảnh sau 3 lần thử.")
+    # 2. Cơ chế tự cứu thông minh (Fallback): Tự chuyển sang FLUX trực tiếp nếu HF bị lỗi mạng/DNS
+    try:
+        fb_url = f"https://image.pollinations.ai/prompt/{quote(full_prompt, safe='')}"
+        r_fb = requests.get(fb_url, params={"model": "flux", "width": WIDTH, "height": HEIGHT, "nologo": "true"}, timeout=60)
+        if r_fb.status_code == 200 and len(r_fb.content) > 1000:
+            return r_fb.content
+    except Exception:
+        pass
+
+    raise RuntimeError(f"Không thể kết nối máy chủ tạo ảnh: {last_err}")
 
 def generate_image(prompt, token, output_path, timeout):
     data = hf_flux_request(prompt, token, timeout)
