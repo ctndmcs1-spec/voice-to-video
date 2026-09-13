@@ -172,17 +172,16 @@ def normalize_segments(result, offset):
     return out
 
 def sanitize_prompt_text(prompt):
-    # Thay thế các từ khoá nhạy cảm dễ kích hoạt bộ lọc Azure/Pollinations
     replacements = {
         r"\bblood\b": "dark ink",
-        r"\bbleed\b": "drop",
+        r"\bbleed\b": "drip",
         r"\bsuicide\b": "despair",
         r"\bkill(ing|er)?\b": "oppression",
         r"\bdead\b": "fallen",
         r"\bdeath\b": "crisis",
         r"\bcorpse\b": "shadow",
         r"\bjump(ing)?\b": "falling shadow",
-        r"\bweapon\b": "chain",
+        r"\bweapon\b": "heavy chain",
     }
     cleaned = prompt
     for pattern, rep in replacements.items():
@@ -197,14 +196,20 @@ Task:
 Turn a voice transcript into coherent visual scenes.
 
 Hard rules:
-1. Each scene must be {min_s}-{max_s} seconds.
-2. Each scene gets EXACTLY ONE main infographic image.
-3. The image is a whiteboard educational infographic: white background, black hand-drawn ink line art, simple expressive figures, arrows, diagrams, restrained accent colors.
-4. Do NOT put Vietnamese words or letters inside the generated image.
-5. STRICT SAFETY REQUIREMENT: NEVER use graphic words like blood, suicide, murder, jump, corpse, or weapon. ALWAYS represent dark themes symbolically (e.g., dark clouds, broken chains, stressed person holding head, empty desk, handcuffs, heavy stones, question marks, scales of justice).
-6. Return ONLY valid JSON.
+1. Each scene must be {min_s}-{max_s} seconds (aim for around 18-24 seconds per scene).
+2. Do NOT cut in the middle of an important idea if a nearby boundary works better.
+3. Each scene gets EXACTLY ONE main infographic image.
+4. One image must visually summarize ALL important ideas spoken in that scene.
+5. The image is a whiteboard educational infographic: white background, black hand-drawn ink, simple expressive characters, arrows, objects, diagrams, a few restrained accent colors.
+6. Do not put Vietnamese words or tiny labels inside the generated image. The Python tool will add the accurate title itself.
+7. Do not make generic filler images. Every object must be justified by the voice.
+8. Avoid copyrighted characters, logos and real-person likenesses.
+9. The visual prompt must be in English.
+10. Safety: NEVER use words like blood, kill, suicide, weapon. Always represent dark themes symbolically (e.g., dark storm clouds, broken chains, stressed person holding head, scales of justice, warning signposts).
+11. Cover the entire transcript continuously up to {batch_duration:.1f}s across 12-16 scenes.
+12. Return ONLY valid JSON.
 
-JSON format:
+JSON:
 {{
   "scenes": [
     {{
@@ -244,7 +249,7 @@ TRANSCRIPT:
         try:
             a = max(0.0, float(s["start"]))
             b = min(batch_duration, float(s["end"]))
-            if b <= a + 0.5:
+            if b <= a + 1.0:
                 continue
             clean.append({
                 "start": a,
@@ -265,13 +270,62 @@ TRANSCRIPT:
             "visual_prompt": "A symbolic whiteboard educational drawing of a person thinking, question marks, abstract diagrams, clean white background, minimalist black ink art",
         }]
 
-    # NỐI LIỀN MẮT XÍCH CÁC CẢNH ĐỂ KHÔNG BỊ MẤT 1 GIÂY NÀO (KHẮC PHỤC LỖI THIẾU THỜI LƯỢNG)
+    # 1. Cảnh đầu tiên luôn bắt đầu từ giây 0.0
     clean[0]["start"] = 0.0
-    for idx in range(1, len(clean)):
-        clean[idx]["start"] = clean[idx - 1]["end"]
-    clean[-1]["end"] = batch_duration
 
-    return clean
+    # 2. LẤP KHOẢNG TRỐNG: Kéo dài ảnh của cảnh trước ra thêm vài giây cho tới khi cảnh sau bắt đầu
+    for i in range(len(clean) - 1):
+        next_start = clean[i + 1]["start"]
+        if clean[i]["end"] < next_start:
+            clean[i]["end"] = next_start
+        elif clean[i + 1]["start"] < clean[i]["end"]:
+            clean[i + 1]["start"] = clean[i]["end"]
+
+    # 3. Xử lý phần đuôi của Batch
+    if clean[-1]["end"] < batch_duration:
+        rem = batch_duration - clean[-1]["end"]
+        if rem <= 30.0:
+            clean[-1]["end"] = batch_duration
+        else:
+            curr = clean[-1]["end"]
+            step_idx = 1
+            while batch_duration - curr > 0:
+                r_dur = batch_duration - curr
+                step = min(25.0, r_dur) if r_dur > 30.0 else r_dur
+                clean.append({
+                    "start": curr,
+                    "end": curr + step,
+                    "title": f"Cảnh báo & Lời kết {step_idx}",
+                    "summary": "Tổng kết nội dung câu chuyện",
+                    "visual_prompt": "A symbolic minimal whiteboard infographic of a person making a wise choice, warning signpost, light ahead, clean white background, black ink doodle",
+                })
+                curr += step
+                step_idx += 1
+
+    # 4. KHÓA CHẶN AN TOÀN: Tuyệt đối không để cảnh nào dài hơn 35s (nếu có sẽ tự chia đôi)
+    final_scenes = []
+    for s in clean:
+        dur = s["end"] - s["start"]
+        if dur > 35.0:
+            mid = s["start"] + dur / 2.0
+            final_scenes.append({
+                "start": s["start"],
+                "end": mid,
+                "title": s["title"],
+                "summary": s["summary"],
+                "visual_prompt": s["visual_prompt"],
+            })
+            final_scenes.append({
+                "start": mid,
+                "end": s["end"],
+                "title": f"{s['title']} (tiếp)",
+                "summary": s["summary"],
+                "visual_prompt": s["visual_prompt"] + ", continuation part, clean white background",
+            })
+        else:
+            final_scenes.append(s)
+
+    return final_scenes
 
 def normalize_pollinations_key(api_key):
     key = (api_key or "").strip()
@@ -330,7 +384,7 @@ no photorealism, no 3D render, no gradients, no clutter.
                 time.sleep(3 * attempt)
                 continue
 
-            # NẾU BỊ AZURE SAFETY FILTER CHẶN (HTTP 400) -> TỰ ĐỘNG DÙNG PROMPT DỰ PHÒNG AN TOÀN
+            # Fallback an toàn nếu dính filter nội dung
             if r.status_code == 400 and ("safety" in r.text.lower() or "violation" in r.text.lower()):
                 fallback_prompt = (
                     "A symbolic minimal whiteboard infographic illustration, showing a character facing life decisions, "
@@ -643,7 +697,6 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style, progress_call
     ], timeout=900)
 
     final_batch = batch_dir / "batch_final.mp4"
-    # Ghép chuẩn xác âm thanh và hình ảnh, không bị cắt bớt
     run_cmd([
         "ffmpeg", "-y",
         "-i", str(batch_video),
