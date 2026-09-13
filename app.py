@@ -4,11 +4,11 @@ import io
 import json
 import math
 import time
+import base64
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from urllib.parse import quote
 
 import requests
 import streamlit as st
@@ -17,12 +17,12 @@ from groq import Groq
 import cv2
 import numpy as np
 
-APP_TITLE = "Xưởng Video Vẽ Tay AI"
-BATCH_SECONDS = 5 * 60  # 5 phút chuẩn
+APP_TITLE = "Xưởng Video Vẽ Bảng Trắng AI"
+BATCH_SECONDS = 5 * 60  # Chuẩn 5 phút mỗi đợt
 FPS = 30
 WIDTH = 1280
 HEIGHT = 720
-HF_MODEL = "stabilityai/sdxl-turbo"
+CLOUDFLARE_AI_URL = "https://api.cloudflare.com/client/v4/accounts/"
 
 # -----------------------------
 # Giao diện / Cấu hình
@@ -30,7 +30,7 @@ HF_MODEL = "stabilityai/sdxl-turbo"
 st.set_page_config(page_title=APP_TITLE, page_icon="✏️", layout="wide")
 
 st.title("✏️ Xưởng Tạo Video Vẽ Bảng Trắng AI")
-st.caption("Giọng nói → Phân cảnh Groq → Vẽ nét mực đen SDXL-Turbo → Nét bút vẽ tay OpenCV → MP4")
+st.caption("Giọng nói → Groq Whisper → Phân cảnh Groq → Tranh FLUX Comic Doodle (Cloudflare AI) → Bút vẽ tay OpenCV → MP4")
 
 with st.sidebar:
     st.header("🔑 Cấu hình API")
@@ -38,13 +38,19 @@ with st.sidebar:
         "Khóa Groq API (Groq API Key)",
         value=st.secrets.get("GROQ_API_KEY", os.getenv("GROQ_API_KEY", "")),
         type="password",
-        help="Dùng cho nhận diện giọng nói và lên kịch bản phân cảnh.",
+        help="Dùng để nhận diện giọng nói và lên kịch bản phân cảnh.",
     )
-    hf_token = st.text_input(
-        "Khóa Hugging Face Token",
-        value=st.secrets.get("HF_TOKEN", os.getenv("HF_TOKEN", "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")),
+    cloudflare_account_id = st.text_input(
+        "Cloudflare Account ID",
+        value=st.secrets.get("CLOUDFLARE_ACCOUNT_ID", os.getenv("CLOUDFLARE_ACCOUNT_ID", "")),
         type="password",
-        help="Dùng để tạo tranh nét vẽ bảng trắng miễn phí không watermark.",
+        help="Account ID trong trang quản trị Cloudflare Dashboard.",
+    )
+    cloudflare_token = st.text_input(
+        "Cloudflare Workers AI API Token",
+        value=st.secrets.get("CLOUDFLARE_API_TOKEN", os.getenv("CLOUDFLARE_API_TOKEN", "")),
+        type="password",
+        help="API Token có quyền Workers AI Read/Run.",
     )
 
     st.header("🧠 Mô hình Groq")
@@ -56,6 +62,13 @@ with st.sidebar:
     planner_model = st.selectbox(
         "Mô hình biên kịch kịch bản",
         ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "qwen/qwen3.6-27b", "openai/gpt-oss-20b", "groq/compound-mini"],
+        index=0,
+    )
+
+    st.header("🎨 Cloudflare AI")
+    image_model = st.selectbox(
+        "Mô hình tạo ảnh Whiteboard",
+        ["@cf/black-forest-labs/flux-1-schnell"],
         index=0,
     )
 
@@ -76,7 +89,7 @@ with st.sidebar:
 
     st.header("⚙️ Giới hạn an toàn")
     max_scenes_per_batch = st.slider("Số cảnh tối đa mỗi đợt 5 phút", 5, 25, 20)
-    image_timeout = st.slider("Thời gian chờ tạo ảnh (giây)", 30, 180, 90)
+    image_timeout = st.slider("Thời gian chờ tạo ảnh (giây)", 30, 180, 120)
 
 # -----------------------------
 # Tiện ích hệ thống
@@ -185,33 +198,36 @@ def sanitize_prompt_text(prompt):
 
 def make_scene_plan(client, transcript_text, batch_start, batch_duration, model, min_s, max_s, max_scenes):
     system = f"""
-You are the visual director for a Vietnamese whiteboard explainer channel.
+You are the visual director for a high-end educational whiteboard explainer channel.
 
 Task:
-Turn a voice transcript into coherent visual scenes.
+Turn a voice transcript into rich, comic-style visual scenes.
 
-Hard rules:
+HARD RULES:
 1. Each scene must be {min_s}-{max_s} seconds.
-2. Do NOT cut in the middle of an important idea if a nearby boundary works better.
-3. Each scene gets EXACTLY ONE main infographic image.
-4. One image must visually summarize ALL important ideas spoken in that scene.
-5. The image is a whiteboard educational infographic: white background, black hand-drawn ink, simple expressive characters, arrows, objects, diagrams, a few restrained accent colors.
-6. Do not put Vietnamese words or tiny labels inside the generated image. The Python tool will add the accurate title itself.
-7. Do not make generic filler images. Every object must be justified by the voice.
-8. Avoid copyrighted characters, logos and real-person likenesses.
-9. The visual prompt must be in English.
-10. Safety: NEVER use words like blood, kill, suicide, weapon. Represent dark themes symbolically (e.g., storm clouds, broken chains, stressed figure holding head, scales of justice, warning signposts).
-11. Return ONLY valid JSON.
+2. Character Style: Professional 2D comic doodle art (chibi-proportions, clear expressive facial emotions like sweating, anxiety, shrugging, sadness, thick clean ink outlines). NO STICK FIGURES.
+3. Canvas Composition: Rich and well-filled 16:9 layout. Central expressive character surrounded by 2-3 visual situation branches, metaphor props, and connecting arrows.
+4. Accent Colors: Mention restrained bold red accent highlights on key symbols (like red warning marks, red gauges, red arrows).
+5. STRICTLY NO TEXT OR WORDS IN THE IMAGE:
+   - Do NOT use speech bubbles with words like "Sure", "Okay", "Sorry", "Please".
+   - Do NOT use signs or labels with English words like "Cheap", "Self-Worth", "Fear", "Liar".
+   - ALWAYS represent concepts through VISUAL METAPHORS and UNIVERSAL SYMBOLS:
+     * Instead of "Cheap": a tag with a downward red trend arrow.
+     * Instead of "Self-worth": a low battery icon or broken diamond.
+     * Instead of "Fear": a shadowy monster or dark storm cloud looming above.
+     * Instead of speech words: use '?', '!', '💔', '⚠️' inside bubbles.
+6. Safety: NEVER use words like blood, kill, suicide, weapon. Represent dark themes symbolically.
+7. Return ONLY valid JSON.
 
-JSON:
+JSON FORMAT:
 {{
   "scenes": [
     {{
       "start": 0.0,
       "end": 20.0,
-      "title": "short Vietnamese title",
-      "summary": "one sentence in Vietnamese",
-      "visual_prompt": "detailed symbolic whiteboard illustration in English"
+      "title": "tiêu đề tiếng Việt ngắn gọn",
+      "summary": "một câu tóm tắt tiếng Việt",
+      "visual_prompt": "detailed visual comic doodle scene description in English, purely symbolic with zero text"
     }}
   ]
 }}
@@ -259,91 +275,119 @@ TRANSCRIPT:
         clean = [{
             "start": 0.0,
             "end": batch_duration,
-            "title": "Tổng kết",
+            "title": "Tổng kết nội dung",
             "summary": (transcript_text[:120] if transcript_text else "Kết thúc nội dung"),
-            "visual_prompt": "A symbolic whiteboard educational drawing of a person thinking, question marks, abstract diagrams, clean white background, minimalist black ink art",
+            "visual_prompt": "A thoughtful 2D comic character sitting at a desk with question marks and light bulb symbols, bold ink lines, vibrant red accent highlights, pure white background",
         }]
 
-    # 1. Bắt đầu từ giây 0.0
     clean[0]["start"] = 0.0
 
-    # 2. Giữ nguyên toàn bộ 13-14 cảnh của AI: Kéo dài ảnh cảnh trước ra phủ kín khoảng lặng tới cảnh sau
+    # Lấp kín khoảng trống giữa các cảnh
     for i in range(len(clean) - 1):
         clean[i]["end"] = clean[i + 1]["start"]
 
-    # 3. Kéo cảnh cuối phủ kín đến hết batch_duration (khắc phục hụt 15s)
     clean[-1]["end"] = batch_duration
-
     return clean
 
 # -----------------------------
-# Hugging Face SDXL-Turbo Engine (Nét mực đen bảng trắng)
+# Cloudflare Workers AI Engine (Nâng cấp phong cách Comic Doodle)
 # -----------------------------
-def hf_image_request(prompt, token, timeout=75):
-    token = (token or "").strip()
-    if not token:
-        raise RuntimeError("Vui lòng điền Khóa Hugging Face Token.")
+def cloudflare_image_request(prompt, account_id, api_token, model, timeout=120):
+    account_id = (account_id or "").strip()
+    api_token = (api_token or "").strip()
+    if not account_id:
+        raise RuntimeError("Chưa nhập Cloudflare Account ID.")
+    if not api_token:
+        raise RuntimeError("Chưa nhập Cloudflare Workers AI API Token.")
 
+    url = f"{CLOUDFLARE_AI_URL}{account_id}/ai/run/{model}"
     safe_prompt = sanitize_prompt_text(prompt)
-    full_prompt = (
-        f"Black and white line art whiteboard drawing of {safe_prompt}, "
-        "minimalist black ink sketch on pure white paper background, clean vector lines, "
-        "coloring page lineart style, simple expressive educational doodle, "
-        "arrows and diagrams, no shading, no 3D render, no colors, no text, no watermark, 16:9 composition"
-    )
-
-    endpoints = [
-        f"https://router.huggingface.co/hf-inference/models/{HF_MODEL}",
-        f"https://router.huggingface.co/models/{HF_MODEL}",
-    ]
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "image/jpeg",
-    }
+    
+    # Ép chặt phong cách Comic Doodle dày dặn, có màu nhấn đỏ/xanh, cấm tuyệt đối mọi loại chữ
+    full_prompt = f"""
+Professional whiteboard explainer comic illustration of {safe_prompt}.
+STYLE SPECIFICATIONS:
+- High quality 2D comic doodle art style, thick black marker contour outlines, expressive cartoon characters with vivid facial expressions, full bodies, no stick figures.
+- Rich mindmap composition filling the 16:9 canvas with situation branches, visual metaphors, and doodle arrows.
+- Pure bright white background.
+- Selective vibrant red and blue spot color accents on key metaphor items and arrows.
+- STRICTLY WORDLESS: Absolutely NO English text, NO Vietnamese text, NO letters, NO words, NO typography, NO captions. 
+- All ideas conveyed purely through body language, facial emotions, and universal symbol icons (?, !, ⚠️, ❌, ⬇️).
+"""
     payload = {
-        "inputs": full_prompt,
-        "parameters": {"num_inference_steps": 2}
+        "prompt": full_prompt,
+        "steps": 4,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_token}",
+        "Content-Type": "application/json",
     }
 
-    last_err = None
-    for api_url in endpoints:
-        for attempt in range(1, 4):
-            try:
-                r = requests.post(api_url, headers=headers, json=payload, timeout=timeout)
-                if r.status_code == 200 and len(r.content) > 1000:
-                    return r.content
-                if r.status_code == 503:
-                    time.sleep(5 * attempt)
-                    continue
-                if r.status_code == 401:
-                    raise RuntimeError("Hugging Face lỗi 401: Token không chính xác hoặc không có quyền Read.")
-                if r.status_code >= 400:
-                    last_err = f"HTTP {r.status_code}: {r.text[:200]}"
-            except Exception as e:
-                last_err = str(e)
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=timeout)
+            if response.status_code == 401:
+                raise RuntimeError("Cloudflare 401: API Token không hợp lệ hoặc không có quyền truy cập Workers AI.")
+            if response.status_code == 403:
+                raise RuntimeError("Cloudflare 403: Tài khoản hoặc Token không có quyền dùng model Workers AI này.")
+            if response.status_code == 429:
+                time.sleep(3 * attempt)
+                continue
+            if response.status_code >= 400:
+                detail = response.text[:1000]
+                raise RuntimeError(f"Cloudflare HTTP {response.status_code}: {detail}")
+
+            data = response.json()
+            if not data.get("success", True):
+                raise RuntimeError(f"Cloudflare AI lỗi: {data}")
+
+            result = data.get("result", {})
+            image_b64 = result.get("image")
+            if not image_b64:
+                raise RuntimeError("Cloudflare không trả về dữ liệu ảnh Base64.")
+
+            image_bytes = base64.b64decode(image_b64)
+            if not image_bytes:
+                raise RuntimeError("Dữ liệu ảnh Cloudflare trả về bị rỗng.")
+            return image_bytes
+        except Exception as e:
+            last_error = e
+            if attempt < 3:
                 time.sleep(2 * attempt)
+            else:
+                raise last_error
 
-    raise RuntimeError(f"Không thể tạo ảnh từ Hugging Face: {last_err}")
-
-def generate_image(prompt, token, output_path, timeout):
-    data = hf_image_request(prompt, token, timeout)
+def cloudflare_image(prompt, account_id, api_token, model, output_path, timeout=120):
+    data = cloudflare_image_request(
+        prompt=prompt,
+        account_id=account_id,
+        api_token=api_token,
+        model=model,
+        timeout=timeout,
+    )
     Path(output_path).write_bytes(data)
     try:
         with Image.open(output_path) as im:
             im.verify()
         with Image.open(output_path) as im:
-            im.convert("RGB").resize((WIDTH, HEIGHT)).save(output_path, quality=94)
+            im = im.convert("RGB")
+            im = im.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
+            im.save(output_path, "JPEG", quality=95)
     except Exception as e:
         Path(output_path).unlink(missing_ok=True)
-        raise RuntimeError(f"File ảnh tạo ra không hợp lệ: {e}")
+        raise RuntimeError(f"Ảnh Cloudflare không hợp lệ: {e}")
 
-def test_hf_api(token, timeout):
-    data = hf_image_request(
-        "A simple black ink whiteboard drawing of an idea light bulb and an open book, minimal composition, white background",
-        token,
-        timeout,
+def test_cloudflare_api(account_id, api_token, model, timeout=120):
+    data = cloudflare_image_request(
+        prompt="A stressed comic character sitting with head in hands, surrounded by floating question mark icons, messy arrows, bold outlines, selective red accent highlights, pure white background, wordless",
+        account_id=account_id,
+        api_token=api_token,
+        model=model,
+        timeout=timeout,
     )
-    return Image.open(io.BytesIO(data)).convert("RGB")
+    im = Image.open(io.BytesIO(data)).convert("RGB")
+    return im.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
 
 def font_for(size):
     candidates = [
@@ -588,7 +632,7 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style, progress_call
         img = batch_dir / f"scene_{i:03d}.jpg"
         vid = batch_dir / f"scene_{i:03d}.mp4"
         if not img.exists():
-            generate_image(s["visual_prompt"], hf_token, img_raw, image_timeout)
+            cloudflare_image(s["visual_prompt"], cloudflare_account_id, cloudflare_token, image_model, img_raw, image_timeout)
             add_title(img_raw, s["title"], img)
         duration = max(1.0, float(s["end"]) - float(s["start"]))
         render_scene(img, duration, vid, hand_path, style)
@@ -632,14 +676,14 @@ def concat_batches(batch_videos, output_path):
 # Luồng ứng dụng chính
 # -----------------------------
 st.sidebar.divider()
-if st.sidebar.button("🔎 KIỂM TRA TẠO ẢNH HUGGING FACE", use_container_width=True):
+if st.sidebar.button("🔎 KIỂM TRA CLOUDFLARE AI", use_container_width=True):
     try:
-        with st.spinner("Đang kết nối tới mô hình SDXL-Turbo..."):
-            test_img = test_hf_api(hf_token, 60)
-        st.success("Hugging Face kết nối rất tốt — Tranh nét vẽ bảng trắng chuẩn xác!")
-        st.image(test_img, caption="Ảnh minh họa thử nghiệm từ SDXL-Turbo", use_container_width=True)
+        with st.spinner("Cloudflare đang tạo ảnh thử nghiệm phong cách Comic Doodle..."):
+            test_img = test_cloudflare_api(cloudflare_account_id, cloudflare_token, image_model, 120)
+        st.success("✅ Cloudflare Workers AI hoạt động cực tốt — Tranh đậm nét, có màu nhấn, không chữ!")
+        st.image(test_img, caption=f"Model: {image_model} (Chuẩn phong cách Comic Doodle)", use_container_width=True)
     except Exception as e:
-        st.error(f"Lỗi kiểm tra: {e}")
+        st.error(f"❌ Cloudflare AI lỗi: {e}")
 
 audio = st.file_uploader(
     "🎤 Tải lên tệp ghi âm giọng nói",
@@ -654,8 +698,11 @@ if audio:
         if not groq_key:
             st.error("Vui lòng nhập Khóa Groq API.")
             st.stop()
-        if not hf_token:
-            st.error("Vui lòng nhập Khóa Hugging Face Token.")
+        if not cloudflare_account_id:
+            st.error("Vui lòng nhập Cloudflare Account ID.")
+            st.stop()
+        if not cloudflare_token:
+            st.error("Vui lòng nhập Cloudflare Workers AI API Token.")
             st.stop()
 
         root = Path(tempfile.mkdtemp(prefix="wb_ai_"))
@@ -695,7 +742,7 @@ if audio:
                     for x in segs
                 )
 
-                status.write(f"✂️ Đợt {idx+1}/{len(valid_chunks)} — Đang lập kịch bản phân cảnh...")
+                status.write(f"✂️ Đợt {idx+1}/{len(valid_chunks)} — Đang lập kịch bản phân cảnh Comic Doodle...")
                 scenes = make_scene_plan(
                     client,
                     batch_text,
@@ -716,7 +763,7 @@ if audio:
                 batch_work = root / f"work_{idx+1:03d}"
                 batch_work.mkdir()
 
-                status.write(f"🎨 Đợt {idx+1}/{len(valid_chunks)} — Đang tạo tranh nét mực và render chuyển động bút...")
+                status.write(f"🎨 Đợt {idx+1}/{len(valid_chunks)} — Đang tạo tranh FLUX và render nét vẽ...")
                 def cb(frac, idx=idx):
                     progress.progress(min(1.0, (idx + frac) / len(valid_chunks)))
 
@@ -738,7 +785,7 @@ if audio:
             concat_batches(batch_videos, final)
 
             st.success(
-                f"Đã tạo thành công {all_scene_count} cảnh chuẩn nét vẽ tay và đồng bộ 100% âm thanh!"
+                f"Đã tạo thành công {all_scene_count} cảnh chuẩn nét vẽ Comic Doodle, sạch chữ tiếng Anh và đồng bộ 100% âm thanh!"
             )
             st.video(str(final))
             st.download_button(
