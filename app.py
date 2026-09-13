@@ -17,74 +17,75 @@ from groq import Groq
 import cv2
 import numpy as np
 
-APP_TITLE = "Whiteboard AI Studio"
-BATCH_SECONDS = 5 * 60
+APP_TITLE = "Xưởng Video Vẽ Tay AI"
+BATCH_SECONDS = 5 * 60  # Giữ nguyên 5 phút chuẩn
 FPS = 30
 WIDTH = 1280
 HEIGHT = 720
 
 # -----------------------------
-# UI / configuration
+# Giao diện / Cấu hình
 # -----------------------------
 st.set_page_config(page_title=APP_TITLE, page_icon="✏️", layout="wide")
 
-st.title("✏️ Whiteboard AI Studio")
-st.caption("Voice → Groq → Progressive Hand Draw → FFmpeg → MP4")
+st.title("✏️ Xưởng Tạo Video Vẽ Bảng Trắng AI")
+st.caption("Giọng nói → Lên kịch bản cảnh → Tạo ảnh AI → Vẽ tay từng nét → FFmpeg → MP4")
 
 with st.sidebar:
-    st.header("🔑 API")
+    st.header("🔑 Cấu hình API")
     groq_key = st.text_input(
-        "Groq API Key",
+        "Khóa Groq API (Groq API Key)",
         value=st.secrets.get("GROQ_API_KEY", os.getenv("GROQ_API_KEY", "")),
         type="password",
+        help="Dùng cho nhận diện giọng nói và lên kịch bản phân cảnh.",
     )
     pollen_key = st.text_input(
-        "Pollinations API Key",
+        "Khóa Pollinations API (Pollinations API Key)",
         value=st.secrets.get("POLLINATIONS_API_KEY", os.getenv("POLLINATIONS_API_KEY", "")),
         type="password",
-        help="Cần thiết để tạo ảnh. Groq không hỗ trợ text-to-image.",
+        help="Dùng để sinh ảnh vẽ phong cách bảng trắng.",
     )
 
-    st.header("🧠 Groq models")
+    st.header("🧠 Mô hình Groq")
     stt_model = st.selectbox(
-        "Voice → text",
+        "Mô hình nghe giọng nói (Voice → Text)",
         ["whisper-large-v3-turbo", "whisper-large-v3"],
         index=0,
     )
     planner_model = st.selectbox(
-        "Scene planner",
+        "Mô hình biên kịch kịch bản",
         ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "qwen/qwen3.6-27b", "openai/gpt-oss-20b", "groq/compound-mini"],
         index=0,
     )
 
-    st.header("🎨 Image")
+    st.header("🎨 Mô hình tạo ảnh")
     image_model = st.selectbox(
-        "Pollinations image model",
+        "Mô hình vẽ hình Pollinations",
         ["flux", "gptimage", "seedream5", "qwen-image"],
         index=0,
     )
 
-    st.header("🎬 Animation")
-    scene_min = st.slider("Minimum scene (seconds)", 15, 25, 15)
-    scene_max = st.slider("Maximum scene (seconds)", 20, 30, 30)
+    st.header("🎬 Cài đặt phân cảnh")
+    scene_min = st.slider("Thời lượng cảnh tối thiểu (giây)", 15, 25, 15)
+    scene_max = st.slider("Thời lượng cảnh tối đa (giây)", 20, 30, 30)
     if scene_max < scene_min:
         scene_max = scene_min
 
     draw_style = st.selectbox(
-        "Animation style",
+        "Phong cách vẽ hoạt họa",
         [
-            "Whiteboard + moving hand",
-            "Whiteboard + moving hand + zoom",
-            "Clean infographic motion",
+            "Bảng trắng + Bàn tay đưa nét vẽ",
+            "Bảng trắng + Bàn tay vẽ + Phóng to nhẹ",
+            "Chuyển động đồ họa sạch (Không hiện tay)",
         ],
     )
 
-    st.header("⚙️ Safety")
-    max_scenes_per_batch = st.slider("Max scenes per 5-min batch", 5, 25, 20)
-    image_timeout = st.slider("Image timeout (sec)", 30, 180, 90)
+    st.header("⚙️ Giới hạn an toàn")
+    max_scenes_per_batch = st.slider("Số cảnh tối đa mỗi đợt 5 phút", 5, 25, 20)
+    image_timeout = st.slider("Thời gian chờ tải ảnh (giây)", 30, 180, 90)
 
 # -----------------------------
-# Utilities
+# Tiện ích hệ thống
 # -----------------------------
 def run_cmd(cmd, timeout=600):
     p = subprocess.run(
@@ -95,7 +96,7 @@ def run_cmd(cmd, timeout=600):
         timeout=timeout,
     )
     if p.returncode != 0:
-        raise RuntimeError(p.stderr[-5000:] or "Command failed")
+        raise RuntimeError(p.stderr[-5000:] or "Lệnh hệ thống thất bại")
     return p.stdout
 
 def ffprobe_duration(path):
@@ -125,7 +126,7 @@ def extract_json(text):
                 return json.loads(text[s:e])
             except Exception:
                 continue
-    raise ValueError("AI did not return valid JSON")
+    raise ValueError("AI không trả về cấu trúc JSON hợp lệ")
 
 def groq_client(key):
     return Groq(api_key=key)
@@ -196,7 +197,7 @@ Task:
 Turn a voice transcript into coherent visual scenes.
 
 Hard rules:
-1. Each scene must be {min_s}-{max_s} seconds (aim for around 18-24 seconds per scene).
+1. Each scene must be {min_s}-{max_s} seconds.
 2. Do NOT cut in the middle of an important idea if a nearby boundary works better.
 3. Each scene gets EXACTLY ONE main infographic image.
 4. One image must visually summarize ALL important ideas spoken in that scene.
@@ -205,9 +206,8 @@ Hard rules:
 7. Do not make generic filler images. Every object must be justified by the voice.
 8. Avoid copyrighted characters, logos and real-person likenesses.
 9. The visual prompt must be in English.
-10. Safety: NEVER use words like blood, kill, suicide, weapon. Always represent dark themes symbolically (e.g., dark storm clouds, broken chains, stressed person holding head, scales of justice, warning signposts).
-11. Cover the entire transcript continuously up to {batch_duration:.1f}s across 12-16 scenes.
-12. Return ONLY valid JSON.
+10. Safety: NEVER use words like blood, kill, suicide, weapon. Represent dark themes symbolically (e.g., storm clouds, broken chains, stressed figure holding head, scales of justice, warning signposts).
+11. Return ONLY valid JSON.
 
 JSON:
 {{
@@ -265,76 +265,30 @@ TRANSCRIPT:
         clean = [{
             "start": 0.0,
             "end": batch_duration,
-            "title": "Tổng quan",
+            "title": "Tổng kết",
             "summary": (transcript_text[:120] if transcript_text else "Kết thúc nội dung"),
             "visual_prompt": "A symbolic whiteboard educational drawing of a person thinking, question marks, abstract diagrams, clean white background, minimalist black ink art",
         }]
 
-    # 1. Cảnh đầu tiên luôn bắt đầu từ giây 0.0
+    # 1. Cảnh đầu tiên luôn chạm mốc 0.0s
     clean[0]["start"] = 0.0
 
-    # 2. LẤP KHOẢNG TRỐNG: Kéo dài ảnh của cảnh trước ra thêm vài giây cho tới khi cảnh sau bắt đầu
+    # 2. Giữ nguyên toàn bộ 13-14 cảnh của AI: Kéo dài ảnh cảnh trước ra để phủ kín khoảng lặng tới cảnh sau
     for i in range(len(clean) - 1):
-        next_start = clean[i + 1]["start"]
-        if clean[i]["end"] < next_start:
-            clean[i]["end"] = next_start
-        elif clean[i + 1]["start"] < clean[i]["end"]:
-            clean[i + 1]["start"] = clean[i]["end"]
+        clean[i]["end"] = clean[i + 1]["start"]
 
-    # 3. Xử lý phần đuôi của Batch
-    if clean[-1]["end"] < batch_duration:
-        rem = batch_duration - clean[-1]["end"]
-        if rem <= 30.0:
-            clean[-1]["end"] = batch_duration
-        else:
-            curr = clean[-1]["end"]
-            step_idx = 1
-            while batch_duration - curr > 0:
-                r_dur = batch_duration - curr
-                step = min(25.0, r_dur) if r_dur > 30.0 else r_dur
-                clean.append({
-                    "start": curr,
-                    "end": curr + step,
-                    "title": f"Cảnh báo & Lời kết {step_idx}",
-                    "summary": "Tổng kết nội dung câu chuyện",
-                    "visual_prompt": "A symbolic minimal whiteboard infographic of a person making a wise choice, warning signpost, light ahead, clean white background, black ink doodle",
-                })
-                curr += step
-                step_idx += 1
+    # 3. Kéo cảnh cuối cùng phủ kín đến hết batch_duration (khắc phục hụt 15s)
+    clean[-1]["end"] = batch_duration
 
-    # 4. KHÓA CHẶN AN TOÀN: Tuyệt đối không để cảnh nào dài hơn 35s (nếu có sẽ tự chia đôi)
-    final_scenes = []
-    for s in clean:
-        dur = s["end"] - s["start"]
-        if dur > 35.0:
-            mid = s["start"] + dur / 2.0
-            final_scenes.append({
-                "start": s["start"],
-                "end": mid,
-                "title": s["title"],
-                "summary": s["summary"],
-                "visual_prompt": s["visual_prompt"],
-            })
-            final_scenes.append({
-                "start": mid,
-                "end": s["end"],
-                "title": f"{s['title']} (tiếp)",
-                "summary": s["summary"],
-                "visual_prompt": s["visual_prompt"] + ", continuation part, clean white background",
-            })
-        else:
-            final_scenes.append(s)
-
-    return final_scenes
+    return clean
 
 def normalize_pollinations_key(api_key):
     key = (api_key or "").strip()
     if not key:
-        raise RuntimeError("Thiếu POLLINATIONS_API_KEY.")
+        raise RuntimeError("Chưa nhập khóa POLLINATIONS_API_KEY.")
     if not (key.startswith("sk_") or key.startswith("pk_")):
         raise RuntimeError(
-            "Pollinations API key không đúng định dạng hiện tại. "
-            "Key hợp lệ thường bắt đầu bằng sk_ hoặc pk_."
+            "Khóa Pollinations API không đúng định dạng. Khóa thường bắt đầu bằng sk_ hoặc pk_."
         )
     return key
 
@@ -377,14 +331,13 @@ no photorealism, no 3D render, no gradients, no clutter.
                 timeout=timeout,
             )
             if r.status_code == 401:
-                raise RuntimeError("Pollinations trả 401 Unauthorized: API key không hợp lệ hoặc hết hạn.")
+                raise RuntimeError("Pollinations lỗi 401: Khóa API không đúng hoặc đã hết hạn.")
             if r.status_code == 403:
-                raise RuntimeError("Pollinations trả 403 Forbidden.")
+                raise RuntimeError("Pollinations lỗi 403: Không có quyền truy cập mô hình này.")
             if r.status_code == 429:
                 time.sleep(3 * attempt)
                 continue
 
-            # Fallback an toàn nếu dính filter nội dung
             if r.status_code == 400 and ("safety" in r.text.lower() or "violation" in r.text.lower()):
                 fallback_prompt = (
                     "A symbolic minimal whiteboard infographic illustration, showing a character facing life decisions, "
@@ -397,13 +350,13 @@ no photorealism, no 3D render, no gradients, no clutter.
 
             if r.status_code >= 400:
                 detail = r.text[:500].replace("\n", " ")
-                raise RuntimeError(f"Pollinations HTTP {r.status_code}: {detail}")
+                raise RuntimeError(f"Pollinations phản hồi mã {r.status_code}: {detail}")
 
             content_type = r.headers.get("content-type", "").lower()
             if "image" not in content_type:
-                raise RuntimeError("Pollinations không trả về file ảnh.")
+                raise RuntimeError("Pollinations không trả về file hình ảnh.")
             if not r.content:
-                raise RuntimeError("Pollinations trả về dữ liệu ảnh rỗng.")
+                raise RuntimeError("Dữ liệu ảnh nhận về bị rỗng.")
             return r.content
         except Exception as e:
             last_error = e
@@ -422,7 +375,7 @@ def pollinations_image(prompt, api_key, model, output_path, timeout):
             im.convert("RGB").save(output_path, quality=94)
     except Exception as e:
         Path(output_path).unlink(missing_ok=True)
-        raise RuntimeError(f"File ảnh Pollinations không hợp lệ: {e}")
+        raise RuntimeError(f"File ảnh từ Pollinations không hợp lệ: {e}")
 
 def test_pollinations_api(api_key, model, timeout):
     data = pollinations_request(
@@ -461,7 +414,7 @@ def add_title(image_path, title, output_path):
     img.save(output_path, quality=95)
 
 # -----------------------------
-# Progressive Hand Draw Engine
+# Bộ máy vẽ tay từng nét (OpenCV)
 # -----------------------------
 def generate_fallback_hand():
     S = 320
@@ -587,7 +540,7 @@ def render_scene(image_path, duration, output_path, hand_path, style):
 
     original_bgr = cv2.imread(str(image_path))
     if original_bgr is None:
-        raise RuntimeError(f"Không thể đọc ảnh: {image_path}")
+        raise RuntimeError(f"Không đọc được file ảnh: {image_path}")
     original_bgr = cv2.resize(original_bgr, (WIDTH, HEIGHT))
     white_canvas = np.full_like(original_bgr, 255)
     reveal_mask = np.zeros((HEIGHT, WIDTH), dtype=np.uint8)
@@ -648,10 +601,10 @@ def render_scene(image_path, duration, output_path, hand_path, style):
         alpha = (blur.astype(np.float32) / 255.0)[:, :, None]
         frame = (original_bgr * alpha + white_canvas * (1.0 - alpha)).astype(np.uint8)
 
-        if hand_visible and style != "Clean infographic motion":
+        if hand_visible and ("Không hiện tay" not in style and "Clean" not in style):
             paste_hand(frame, hand_bgr, hand_alpha, hand_pos_x - tip_x, hand_pos_y - tip_y)
 
-        if style == "Whiteboard + moving hand + zoom":
+        if "Phóng to" in style or "zoom" in style.lower():
             scale = 1.0 + 0.05 * (f_idx / total_frames)
             cw, ch = int(WIDTH / scale), int(HEIGHT / scale)
             x1 = (WIDTH - cw) // 2
@@ -668,7 +621,7 @@ def render_scene(image_path, duration, output_path, hand_path, style):
         raise RuntimeError(f"FFmpeg thất bại: {err[-2000:]}")
 
 # -----------------------------
-# Batch and Render Pipelines
+# Quy trình render theo đợt (Batch)
 # -----------------------------
 def render_batch(batch_audio, scenes, batch_dir, hand_path, style, progress_callback=None):
     scene_videos = []
@@ -719,32 +672,33 @@ def concat_batches(batch_videos, output_path):
     ], timeout=1800)
 
 # -----------------------------
-# Main Application
+# Luồng ứng dụng chính
 # -----------------------------
 st.sidebar.divider()
-if st.sidebar.button("🔎 TEST POLLINATIONS API", use_container_width=True):
+if st.sidebar.button("🔎 KIỂM TRA KẾT NỐI POLLINATIONS", use_container_width=True):
     try:
-        with st.spinner("Đang test Pollinations..."):
+        with st.spinner("Đang kiểm tra tạo ảnh thử nghiệm..."):
             test_img = test_pollinations_api(pollen_key, image_model, 60)
-        st.success("Pollinations OK — API key + model hoạt động.")
-        st.image(test_img, caption=f"Test model: {image_model}", use_container_width=True)
+        st.success("Pollinations kết nối tốt — Khóa API và Mô hình hoạt động bình thường!")
+        st.image(test_img, caption=f"Mô hình đang dùng: {image_model}", use_container_width=True)
     except Exception as e:
-        st.error(str(e))
+        st.error(f"Lỗi kết nối: {e}")
 
 audio = st.file_uploader(
-    "🎤 Upload voice",
+    "🎤 Tải lên tệp ghi âm giọng nói",
     type=["mp3", "m4a", "wav", "ogg", "webm", "mp4", "mpeg", "mpga"],
+    help="Hỗ trợ các định dạng âm thanh phổ biến.",
 )
 
 if audio:
     st.audio(audio)
 
-    if st.button("🚀 CREATE VIDEO", type="primary", use_container_width=True):
+    if st.button("🚀 BẮT ĐẦU TẠO VIDEO", type="primary", use_container_width=True):
         if not groq_key:
-            st.error("Bạn chưa nhập GROQ_API_KEY.")
+            st.error("Vui lòng nhập Khóa Groq API.")
             st.stop()
         if not pollen_key:
-            st.error("Bạn chưa nhập POLLINATIONS_API_KEY.")
+            st.error("Vui lòng nhập Khóa Pollinations API.")
             st.stop()
         try:
             pollen_key = normalize_pollinations_key(pollen_key)
@@ -758,7 +712,7 @@ if audio:
             source.write_bytes(audio.getbuffer())
 
             duration = ffprobe_duration(source)
-            st.info(f"Audio: {duration/60:.2f} phút. Tool sẽ xử lý từng batch tối đa 5 phút.")
+            st.info(f"Thời lượng âm thanh: {duration/60:.2f} phút. Hệ thống xử lý theo đợt tối đa {BATCH_SECONDS//60} phút.")
 
             client = groq_client(groq_key)
             batch_dir = root / "batches"
@@ -781,7 +735,7 @@ if audio:
 
             for idx, (bi, chunk, bdur) in enumerate(valid_chunks):
                 bstart = bi * BATCH_SECONDS
-                status.write(f"🧠 Batch {idx+1}/{len(valid_chunks)} — transcribing...")
+                status.write(f"🧠 Đợt {idx+1}/{len(valid_chunks)} — Đang nhận diện giọng nói...")
                 tr = transcribe_file(client, chunk, stt_model)
                 segs = normalize_segments(tr, bstart)
                 batch_text = "\n".join(
@@ -789,7 +743,7 @@ if audio:
                     for x in segs
                 )
 
-                status.write(f"✂️ Batch {idx+1}/{len(valid_chunks)} — planning scenes...")
+                status.write(f"✂️ Đợt {idx+1}/{len(valid_chunks)} — Đang lập kịch bản phân cảnh...")
                 scenes = make_scene_plan(
                     client,
                     batch_text,
@@ -801,7 +755,7 @@ if audio:
                     max_scenes_per_batch,
                 )
 
-                st.write(f"**Batch {idx+1}: {bdur:.1f}s → {len(scenes)} scenes**")
+                st.write(f"**Đợt {idx+1}: {bdur:.1f}s → {len(scenes)} cảnh**")
                 for si, s in enumerate(scenes, 1):
                     st.caption(
                         f"{si:02d}. {s['start']:.1f}s–{s['end']:.1f}s — {s['title']}"
@@ -810,7 +764,7 @@ if audio:
                 batch_work = root / f"work_{idx+1:03d}"
                 batch_work.mkdir()
 
-                status.write(f"🎨 Batch {idx+1}/{len(valid_chunks)} — progressive drawing scenes...")
+                status.write(f"🎨 Đợt {idx+1}/{len(valid_chunks)} — Đang vẽ tranh và render hiệu ứng...")
                 def cb(frac, idx=idx):
                     progress.progress(min(1.0, (idx + frac) / len(valid_chunks)))
 
@@ -826,25 +780,25 @@ if audio:
                 shutil.rmtree(batch_work, ignore_errors=True)
 
             progress.progress(1.0)
-            status.write("🎬 Concatenating all batches...")
+            status.write("🎬 Đang kết hợp video hoàn chỉnh...")
 
             final = root / "whiteboard_final.mp4"
             concat_batches(batch_videos, final)
 
             st.success(
-                f"Hoàn thành! Đã tạo {all_scene_count} scene chuẩn hiệu ứng vẽ tay và đồng bộ 100% âm thanh."
+                f"Đã tạo thành công {all_scene_count} cảnh chuẩn nét vẽ tay và đồng bộ 100% âm thanh!"
             )
             st.video(str(final))
             st.download_button(
-                "⬇️ Download MP4",
+                "⬇️ TẢI VIDEO MP4 VỀ MÁY",
                 data=final.read_bytes(),
-                file_name="whiteboard_ai_final.mp4",
+                file_name="video_ve_tay_hoan_chinh.mp4",
                 mime="video/mp4",
                 use_container_width=True,
             )
 
         except Exception as e:
             st.exception(e)
-            st.warning("Nếu lỗi xảy ra ở một scene, hãy kiểm tra traceback log.")
+            st.warning("Nếu gặp lỗi, vui lòng kiểm tra thông báo trong mục Quản lý ứng dụng.")
         finally:
             pass
