@@ -1,637 +1,629 @@
-# -*- coding: utf-8 -*-
+
 import os
 import re
+import io
 import json
 import math
-import random
+import time
 import shutil
-import hashlib
 import subprocess
 import tempfile
-import time
-import urllib.parse
+from pathlib import Path
+from urllib.parse import quote
 
-import streamlit as st
 import requests
-from PIL import Image, ImageOps
+import streamlit as st
+from PIL import Image, ImageDraw, ImageFont
 from groq import Groq
-from duckduckgo_search import DDGS
 
-st.set_page_config(page_title="Studio POV Master Engine - Voice Match", page_icon="🎬", layout="centered")
+APP_TITLE = "Whiteboard AI Studio"
+BATCH_SECONDS = 5 * 60
+FPS = 30
+WIDTH = 1280
+HEIGHT = 720
 
-W, H = 1280, 720
-FPS = 25
-STT_MODEL = "whisper-large-v3-turbo"
-LLM_MODEL = "openai/gpt-oss-20b"
-PEXELS_PHOTO_URL = "https://api.pexels.com/v1/search"
-PEXELS_VIDEO_URL = "https://api.pexels.com/videos/search"
+# -----------------------------
+# UI / configuration
+# -----------------------------
+st.set_page_config(page_title=APP_TITLE, page_icon="✏️", layout="wide")
 
-# Ngưỡng chia cảnh MỚI — nhiều cảnh hơn
-MIN_SCENE_DUR = 2.0    # tối thiểu 2s/cảnh
-MAX_SCENE_DUR = 4.0    # tối đa 4s/cảnh trước khi chẻ
-TARGET_SCENE_DUR = 2.8 # mục tiêu ~2.8s/cảnh
+st.title("✏️ Whiteboard AI Studio")
+st.caption("Voice → Groq → scenes 15–30s → 1 infographic/scene → hand-draw animation → FFmpeg → MP4")
 
-if "used_img_hashes" not in st.session_state:
-    st.session_state.used_img_hashes = set()
-if "used_vid_ids" not in st.session_state:
-    st.session_state.used_vid_ids = set()
+with st.sidebar:
+    st.header("🔑 API")
+    groq_key = st.text_input(
+        "Groq API Key",
+        value=st.secrets.get("GROQ_API_KEY", os.getenv("GROQ_API_KEY", "")),
+        type="password",
+    )
+    pollen_key = st.text_input(
+        "Pollinations API Key",
+        value=st.secrets.get("POLLINATIONS_API_KEY", os.getenv("POLLINATIONS_API_KEY", "")),
+        type="password",
+        help="Needed for AI image generation. Groq itself does not provide text-to-image.",
+    )
 
-st.title("🎬 Studio POV Master Engine Pro")
-st.caption("Cảnh dày hơn • Query đa tầng • Khớp voice 100%")
+    st.header("🧠 Groq models")
+    stt_model = st.selectbox(
+        "Voice → text",
+        ["whisper-large-v3-turbo", "whisper-large-v3"],
+        index=0,
+    )
+    planner_model = st.selectbox(
+        "Scene planner",
+        ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "qwen/qwen3.6-27b", "openai/gpt-oss-20b", "groq/compound-mini"],
+        index=0,
+    )
 
-groq_key = st.text_input("Groq API Key (Bắt buộc)", type="password", placeholder="gsk_...")
-pexels_key = st.text_input("Pexels API Key (Khuyến nghị)", type="password")
-audio_file = st.file_uploader("Tải lên file Voice (MP3, WAV, M4A, OGG)", type=["mp3", "wav", "m4a", "ogg"])
+    st.header("🎨 Image")
+    image_model = st.selectbox(
+        "Pollinations image model",
+        ["flux", "gptimage", "seedream5", "qwen-image"],
+        index=0,
+    )
 
-# ==============================================================================
-# HÀM PHỤ TRỢ
-# ==============================================================================
-def download_file(url, dest, headers=None, min_size=30000, timeout=8):
+    st.header("🎬 Animation")
+    scene_min = st.slider("Minimum scene (seconds)", 15, 25, 15)
+    scene_max = st.slider("Maximum scene (seconds)", 20, 30, 30)
+    if scene_max < scene_min:
+        scene_max = scene_min
+
+    draw_style = st.selectbox(
+        "Animation style",
+        [
+            "Whiteboard + moving hand",
+            "Whiteboard + moving hand + zoom",
+            "Clean infographic motion",
+        ],
+    )
+
+    st.header("⚙️ Safety")
+    max_scenes_per_batch = st.slider("Max scenes per 5-min batch", 5, 25, 20)
+    image_timeout = st.slider("Image timeout (sec)", 30, 180, 90)
+
+# -----------------------------
+# Utilities
+# -----------------------------
+def run_cmd(cmd, timeout=600):
+    p = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout,
+    )
+    if p.returncode != 0:
+        raise RuntimeError(p.stderr[-5000:] or "Command failed")
+    return p.stdout
+
+def ffprobe_duration(path):
+    out = run_cmd([
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(path)
+    ], timeout=60)
+    return float(out.strip())
+
+def safe_name(s, n=60):
+    s = re.sub(r"[^a-zA-Z0-9_-]+", "_", s).strip("_")
+    return (s or "scene")[:n]
+
+def extract_json(text):
+    text = text.strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
+    text = re.sub(r"\s*```$", "", text)
+    # First try the whole response
     try:
-        r = requests.get(url, headers=headers or {"User-Agent": "Mozilla/5.0"},
-                         timeout=timeout, stream=True)
-        if r.status_code != 200:
-            return False
-        with open(dest, "wb") as f:
-            for chunk in r.iter_content(chunk_size=16384):
-                f.write(chunk)
-        return os.path.getsize(dest) >= min_size
-    except Exception:
-        return False
-
-
-def image_content_hash(path):
-    try:
-        with Image.open(path) as im:
-            small = im.convert("L").resize((32, 32))
-            return hashlib.md5(small.tobytes()).hexdigest()
-    except Exception:
-        return hashlib.md5(str(random.random()).encode()).hexdigest()
-
-
-def has_audio_stream(filepath):
-    try:
-        r = subprocess.run(["ffmpeg", "-i", filepath], capture_output=True, text=True, timeout=10)
-        return "Audio:" in r.stderr
-    except Exception:
-        return False
-
-
-def get_duration(path):
-    try:
-        r = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", path],
-            capture_output=True, text=True, timeout=10
-        )
-        return float(r.stdout.strip() or 10.0)
-    except Exception:
-        return 10.0
-
-# ==============================================================================
-# CHIA CẢNH DÀY — CHIA THEO DẤU CÂU + CẮT NHỎ CÂU DÀI
-# ==============================================================================
-def split_text_by_punctuation(text):
-    """Chia câu thành các mệnh đề theo dấu câu: . ! ? , ; —"""
-    parts = re.split(r'(?<=[.!?;])\s+|(?<=,)\s+(?=[A-ZĐÀÁẢÃẠĂẰẮẲẴẶÂẦẤẨẪẬÈÉẺẼẸÊỀẾỂỄỆÌÍỈĨỊÒÓỎÕỌÔỒỐỔỖỘƠỜỚỞỠỢÙÚỦŨỤƯỪỨỬỮỰỲÝỶỸỴ])', text)
-    parts = [p.strip() for p in parts if p.strip() and len(p.strip()) > 2]
-    return parts or [text]
-
-
-def build_segments_from_whisper(raw_segs, total_dur):
-    """
-    Xây dựng segment dày:
-    1. Gộp whisper segments nhỏ thành câu hoàn chỉnh (theo dấu câu)
-    2. Nếu câu > MAX_SCENE_DUR → chẻ tiếp
-    """
-    # Bước 1: gộp whisper segments thành "câu" theo dấu câu cuối
-    raw_sentences = []
-    buf_text = ""
-    buf_start = 0.0
-    for seg in raw_segs:
-        t = (seg.get("text") or "").strip()
-        if not t:
-            continue
-        if not buf_text:
-            buf_start = float(seg["start"])
-        buf_text = (buf_text + " " + t).strip()
-        # Nếu kết thúc bằng dấu câu mạnh → chốt câu
-        if re.search(r'[.!?]\s*$', buf_text):
-            raw_sentences.append({
-                "start": buf_start,
-                "end": float(seg["end"]),
-                "text": buf_text
-            })
-            buf_text = ""
-    if buf_text:
-        raw_sentences.append({
-            "start": buf_start,
-            "end": total_dur,
-            "text": buf_text
-        })
-    if not raw_sentences:
-        raw_sentences = [{"start": 0.0, "end": total_dur, "text": "story scene"}]
-
-    # Bước 2: chẻ câu dài thành nhiều cảnh ngắn
-    segments = []
-    for sent in raw_sentences:
-        dur = max(0.1, sent["end"] - sent["start"])
-        text = sent["text"]
-
-        # Nếu câu đã ngắn (< MAX) → giữ nguyên
-        if dur <= MAX_SCENE_DUR:
-            segments.append({"start": sent["start"], "end": sent["end"], "text": text})
-            continue
-
-        # Câu dài → chẻ theo dấu câu
-        parts = split_text_by_punctuation(text)
-        if len(parts) <= 1:
-            # Không có dấu câu phụ → chẻ theo số từ
-            words = text.split()
-            n_chunks = max(2, math.ceil(dur / TARGET_SCENE_DUR))
-            chunk_size = max(2, len(words) // n_chunks)
-            parts = [" ".join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size)]
-
-        # Phân bổ thời gian theo tỉ lệ độ dài ký tự
-        total_chars = sum(len(p) for p in parts) or 1
-        cur_t = sent["start"]
-        for p in parts:
-            ratio = len(p) / total_chars
-            part_dur = max(MIN_SCENE_DUR * 0.6, dur * ratio)
-            end_t = min(sent["end"], cur_t + part_dur)
-            segments.append({"start": cur_t, "end": end_t, "text": p.strip()})
-            cur_t = end_t
-        # Sửa lệch cuối
-        if segments and abs(segments[-1]["end"] - sent["end"]) > 0.05:
-            segments[-1]["end"] = sent["end"]
-
-    # Bước 3: gộp các mảnh quá ngắn (< MIN_SCENE_DUR) vào mảnh trước
-    merged = []
-    for s in segments:
-        if merged and (s["end"] - s["start"]) < MIN_SCENE_DUR * 0.6:
-            merged[-1]["text"] += " " + s["text"]
-            merged[-1]["end"] = s["end"]
-        else:
-            merged.append(s)
-
-    return merged or [{"start": 0.0, "end": total_dur, "text": "story scene"}]
-
-# ==============================================================================
-# FETCH ẢNH
-# ==============================================================================
-def fetch_image_pexels(query, p_key, used_urls, used_hashes, dest):
-    if not p_key or not p_key.strip():
-        return False
-    headers = {"Authorization": p_key.strip()}
-    for page in random.sample(range(1, 4), 3):
-        try:
-            url = f"{PEXELS_PHOTO_URL}?query={urllib.parse.quote(query)}&per_page=15&page={page}&orientation=landscape"
-            r = requests.get(url, headers=headers, timeout=8)
-            if not (r.ok and r.json().get("photos")):
-                continue
-            photos = r.json()["photos"]
-            random.shuffle(photos)
-            for p in photos:
-                u = p["src"].get("large2x") or p["src"].get("large")
-                if not u or u in used_urls:
-                    continue
-                if download_file(u, dest, min_size=40000):
-                    ch = image_content_hash(dest)
-                    if ch in used_hashes:
-                        continue
-                    used_urls.add(u)
-                    used_hashes.add(ch)
-                    return True
-        except Exception:
-            continue
-    return False
-
-
-def fetch_image_wikimedia(query, used_urls, used_hashes, dest):
-    try:
-        url = (f"https://commons.wikimedia.org/w/api.php?action=query&generator=search"
-               f"&gsrsearch={urllib.parse.quote(query)}&gsrlimit=15"
-               f"&prop=imageinfo&iiprop=url|size&format=json")
-        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
-        if not r.ok:
-            return False
-        items = list(r.json().get("query", {}).get("pages", {}).values())
-        random.shuffle(items)
-        for info in items:
-            img_info = info.get("imageinfo", [{}])[0]
-            u = img_info.get("url")
-            if not u or u in used_urls:
-                continue
-            if not u.lower().endswith((".jpg", ".jpeg", ".png")):
-                continue
-            if img_info.get("width", 0) < 800:
-                continue
-            if download_file(u, dest, min_size=40000):
-                ch = image_content_hash(dest)
-                if ch in used_hashes:
-                    continue
-                used_urls.add(u)
-                used_hashes.add(ch)
-                return True
+        return json.loads(text)
     except Exception:
         pass
-    return False
-
-
-def fetch_image_ddg(query, used_urls, used_hashes, dest, is_english):
-    try:
-        region = "wt-wt" if is_english else "vn-vi"
-        with DDGS() as ddgs:
-            results = list(ddgs.images(query, region=region, max_results=12))
-        random.shuffle(results)
-        for r in results:
-            u = r.get("image")
-            if not u or not u.startswith("http") or u in used_urls:
+    # Then find the largest JSON object
+    starts = [m.start() for m in re.finditer(r"\{", text)]
+    ends = [m.end() for m in re.finditer(r"\}", text)]
+    for s in starts:
+        for e in reversed(ends):
+            if e <= s:
                 continue
-            if download_file(u, dest, min_size=45000, timeout=6):
-                try:
-                    with Image.open(dest) as t:
-                        if t.size[0] < 700 or t.size[1] < 400:
-                            continue
-                        t.verify()
-                except Exception:
-                    continue
-                ch = image_content_hash(dest)
-                if ch in used_hashes:
-                    continue
-                used_urls.add(u)
-                used_hashes.add(ch)
-                return True
-    except Exception:
-        pass
-    return False
-
-
-def _finalize_image(path):
-    try:
-        with Image.open(path) as im:
-            fitted = ImageOps.fit(im.convert("RGB"), (W, H), Image.LANCZOS)
-            fitted.save(path, "JPEG", quality=92)
-    except Exception:
-        _make_safe_fallback(path)
-    return path
-
-
-def _make_safe_fallback(path):
-    img = Image.new("RGB", (W, H), (18, 22, 32))
-    img.save(path, "JPEG", quality=88)
-
-
-def fetch_matching_image(query_candidates, idx, workdir, used_urls, used_hashes, p_key, is_english):
-    """
-    query_candidates: list các query string (ưu tiên) — thử lần lượt.
-    """
-    dest = os.path.join(workdir, f"img_{idx:03d}.jpg")
-
-    # Mở rộng biến thể từ mỗi candidate
-    all_variants = []
-    for q in query_candidates:
-        q = (q or "").strip()
-        if not q:
-            continue
-        all_variants.append(q)
-        words = [w for w in re.findall(r'[a-zA-Z0-9àáảãạăằắẳẵặâầấẩẫậèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵđ]+',
-                                       q, re.IGNORECASE)]
-        if len(words) >= 4:
-            all_variants.append(" ".join(words[:4]))
-        if len(words) >= 2:
-            all_variants.append(" ".join(words[:2]))
-
-    # Loại trùng
-    seen = set()
-    variants = []
-    for v in all_variants:
-        vl = v.lower()
-        if vl not in seen:
-            seen.add(vl)
-            variants.append(v)
-
-    # Tầng 1: Pexels
-    for q in variants:
-        if fetch_image_pexels(q, p_key, used_urls, used_hashes, dest):
-            return _finalize_image(dest)
-
-    # Tầng 2: Wikimedia
-    for q in variants:
-        if fetch_image_wikimedia(q, used_urls, used_hashes, dest):
-            return _finalize_image(dest)
-
-    # Tầng 3: DuckDuckGo
-    for q in variants:
-        if fetch_image_ddg(q, used_urls, used_hashes, dest, is_english):
-            return _finalize_image(dest)
-
-    _make_safe_fallback(dest)
-    return dest
-
-# ==============================================================================
-# FETCH VIDEO B-ROLL
-# ==============================================================================
-def fetch_broll_clip(query_candidates, idx, target_frames, p_key, workdir, used_vid_ids):
-    if not p_key or not p_key.strip():
-        return None
-
-    clip_dest = os.path.join(workdir, f"clip_{idx:03d}.mp4")
-    raw_vid = os.path.join(workdir, f"raw_{idx:03d}.mp4")
-    dur = target_frames / FPS
-    headers = {"Authorization": p_key.strip()}
-
-    terms = []
-    for q in query_candidates:
-        q = (q or "").strip()
-        if q:
-            terms.append(q)
-            words = [w for w in re.findall(r'[a-zA-Z]+', q) if len(w) > 2]
-            if len(words) >= 3:
-                terms.append(" ".join(words[:3]))
-
-    for term in terms:
-        for page in random.sample(range(1, 4), 3):
             try:
-                url = (f"{PEXELS_VIDEO_URL}?query={urllib.parse.quote(term)}"
-                       f"&per_page=10&page={page}&orientation=landscape")
-                r = requests.get(url, headers=headers, timeout=8)
-                if not (r.ok and r.json().get("videos")):
-                    continue
-                videos = r.json()["videos"]
-                random.shuffle(videos)
-                for v in videos:
-                    v_id = v.get("id")
-                    if not v_id or v_id in used_vid_ids:
-                        continue
-                    files = v.get("video_files", [])
-                    hd = [f for f in files if f.get("height", 0) >= 720 and f.get("file_type") == "video/mp4"]
-                    pick = (hd or files)
-                    if not pick:
-                        continue
-                    target_url = pick[0].get("link")
-                    if not target_url:
-                        continue
-                    if download_file(target_url, raw_vid, min_size=80000, timeout=20):
-                        used_vid_ids.add(v_id)
-                        try:
-                            keep_audio = has_audio_stream(raw_vid)
-                            vf = f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},fps={FPS},format=yuv420p"
-                            cmd = ["ffmpeg", "-y", "-i", raw_vid, "-t", f"{dur:.3f}", "-vf", vf]
-                            if keep_audio:
-                                cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "22",
-                                        "-c:a", "aac", "-b:a", "160k", "-ar", "44100", clip_dest]
-                            else:
-                                cmd += ["-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "22", clip_dest]
-                            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-                            try:
-                                os.remove(raw_vid)
-                            except OSError:
-                                pass
-                            return clip_dest
-                        except Exception:
-                            if os.path.exists(raw_vid):
-                                os.remove(raw_vid)
+                return json.loads(text[s:e])
             except Exception:
                 continue
-    return None
+    raise ValueError("AI did not return valid JSON")
 
-# ==============================================================================
-# KEN BURNS
-# ==============================================================================
-def create_kenburns_clip(img_path, target_frames, out_clip, mode=0):
-    frames = max(25, target_frames)
-    dur = frames / FPS
-    step = 0.15 / frames
-    m = mode % 4
+def groq_client(key):
+    return Groq(api_key=key)
 
-    if not os.path.exists(img_path) or os.path.getsize(img_path) < 3000:
-        _make_safe_fallback(img_path)
-
-    if m == 0:
-        z, x, y = f"min(zoom+{step:.6f},1.15)", "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
-    elif m == 1:
-        z, x, y = "1.15", f"(iw-iw/zoom)*(on/{frames})", "ih/2-(ih/zoom/2)"
-    elif m == 2:
-        z, x, y = f"if(eq(on,1),1.15,max(1.0,zoom-{step:.6f}))", "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
-    else:
-        z, x, y = "1.15", f"(iw-iw/zoom)*(1-on/{frames})", "ih/2-(ih/zoom/2)"
-
-    vf = (f"scale=2560:1440,"
-          f"zoompan=z='{z}':x='{x}':y='{y}':d={frames}:s=2560x1440:fps={FPS},"
-          f"scale={W}:{H}:flags=lanczos,format=yuv420p")
-
-    subprocess.run([
-        "ffmpeg", "-y", "-loop", "1", "-i", img_path, "-vf", vf,
-        "-t", f"{dur:.3f}", "-c:v", "libx264", "-preset", "ultrafast",
-        "-pix_fmt", "yuv420p", out_clip
-    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-
-# ==============================================================================
-# AI BÓC TÁCH — TRẢ 3 QUERY CANDIDATES / CẢNH
-# ==============================================================================
-def ai_extract_query_candidates(client, seg_batch, b_start, is_english):
-    """
-    Mỗi cảnh → 3 query candidates (EN ưu tiên, VN làm dự phòng).
-    """
-    lines = "\n".join([f"[{i + b_start}] {s['text']}" for i, s in enumerate(seg_batch)])
-
-    prompt = f"""Bạn là Visual Director chuyên tìm stock footage khớp 100% với lời thoại tiếng {"Anh" if is_english else "Việt"}.
-
-Với MỖI câu thoại, trả về 3 query tiếng Anh KHÁC NHAU để tìm hình ảnh/video khớp nhất:
-- query_1 (chính xác nhất): [CHỦ THỂ] + [HÀNH ĐỘNG] + [BỐI CẢNH cụ thể]
-- query_2 (gần nghĩa): biến thể dùng từ đồng nghĩa hoặc góc máy khác
-- query_3 (dự phòng): mở rộng vẫn cùng chủ đề
-
-QUY TẮC BẮT BUỘC:
-1. Phải bám vào DANH TỪ và ĐỘNG TỪ có trong câu thoại gốc (người, vật, hành động, địa điểm).
-2. CẤM từ cảm xúc trừu tượng: sad, lonely, depressed, thinking, moody, vibe, feeling.
-3. CẤM từ chung chung: life, moment, scene, person, thing.
-4. Mỗi query 4–8 từ tiếng Anh, có thể search được trên Pexels/Google.
-5. query_vn: bản dịch tiếng Việt ngắn gọn để backup search.
-
-Đoạn thoại:
-{lines}
-
-Trả về DUY NHẤT JSON:
-{{"scenes": [
-  {{"index": {b_start},
-    "queries": ["specific query 1", "synonym query 2", "broader query 3"],
-    "query_vn": "cụm từ tiếng Việt ngắn"}}
-]}}"""
-
-    try:
-        resp = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
+def transcribe_file(client, path, model):
+    with open(path, "rb") as f:
+        result = client.audio.transcriptions.create(
+            file=(Path(path).name, f.read()),
+            model=model,
+            response_format="verbose_json",
+            timestamp_granularities=["segment"],
+            language="vi",
+            temperature=0.0,
         )
-        content = resp.choices[0].message.content
-        match = re.search(r'\{.*\}', content, re.DOTALL)
-        if not match:
-            return {}
-        parsed = json.loads(match.group(0)).get("scenes", [])
-        result = {}
-        for it in parsed:
-            if "index" not in it:
-                continue
-            idx = int(it["index"])
-            queries = it.get("queries") or []
-            if isinstance(queries, str):
-                queries = [queries]
-            vn = (it.get("query_vn") or "").strip()
-            result[idx] = {"queries": [q for q in queries if q], "query_vn": vn}
-        return result
-    except Exception:
-        return {}
+    return result
 
+def chunk_audio(src, out_dir):
+    # Always process in 5-minute batches to reduce memory pressure.
+    pattern = str(Path(out_dir) / "batch_%03d.m4a")
+    run_cmd([
+        "ffmpeg", "-y", "-i", str(src),
+        "-map", "0:a:0",
+        "-c:a", "aac", "-b:a", "96k",
+        "-f", "segment", "-segment_time", str(BATCH_SECONDS),
+        "-reset_timestamps", "1",
+        pattern
+    ], timeout=900)
+    return sorted(Path(out_dir).glob("batch_*.m4a"))
 
-def fallback_query_from_text(text, is_english):
-    """Nếu AI fail → trích từ khóa trực tiếp từ câu thoại."""
-    if is_english:
-        words = [w for w in re.findall(r'[a-zA-Z]+', text) if len(w) > 3]
-        return [" ".join(words[:5]) if words else "everyday scene"]
-    else:
-        # Tiếng Việt: dùng nguyên câu làm query VN
-        clean = re.sub(r'[^\w\sàáảãạăằắẳẵặâầấẩẫậèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵđ]',
-                       '', text, flags=re.IGNORECASE).strip()
-        return [clean[:80] if clean else "everyday scene"]
+def normalize_segments(result, offset):
+    data = result.model_dump() if hasattr(result, "model_dump") else result
+    segments = data.get("segments", []) if isinstance(data, dict) else getattr(result, "segments", [])
+    out = []
+    for s in segments or []:
+        if isinstance(s, dict):
+            stt = float(s.get("start", 0))
+            end = float(s.get("end", stt))
+            text = str(s.get("text", "")).strip()
+        else:
+            stt = float(getattr(s, "start", 0))
+            end = float(getattr(s, "end", stt))
+            text = str(getattr(s, "text", "")).strip()
+        if text:
+            out.append({"start": stt + offset, "end": end + offset, "text": text})
+    return out
 
-# ==============================================================================
-# PIPELINE
-# ==============================================================================
-if st.button("⚡ Bắt Đầu Dựng Video Thành Phẩm", use_container_width=True, type="primary"):
-    if not groq_key or not groq_key.strip():
-        st.error("Vui lòng nhập Groq API Key!")
-    elif not audio_file:
-        st.error("Vui lòng tải file Voice lên trước!")
-    else:
-        status = st.status("Đang khởi động xưởng sản xuất...", expanded=True)
-        workdir = tempfile.mkdtemp(prefix="master_prod_")
-        used_urls = set()
-        used_img_hashes = st.session_state.used_img_hashes
-        used_vid_ids = st.session_state.used_vid_ids
+def make_scene_plan(client, transcript_text, batch_start, batch_duration, model, min_s, max_s, max_scenes):
+    system = f"""
+You are the visual director for a Vietnamese whiteboard explainer channel.
 
+Task:
+Turn a voice transcript into coherent visual scenes.
+
+Hard rules:
+1. Each scene must be {min_s}-{max_s} seconds.
+2. Do NOT cut in the middle of an important idea if a nearby boundary works better.
+3. Each scene gets EXACTLY ONE main infographic image.
+4. One image must visually summarize ALL important ideas spoken in that scene.
+5. The image is a whiteboard educational infographic: white background, black hand-drawn ink, simple expressive characters, arrows, objects, diagrams, a few restrained accent colors.
+6. Do not put Vietnamese words or tiny labels inside the generated image. The Python tool will add the accurate title itself.
+7. Do not make generic filler images. Every object must be justified by the voice.
+8. Avoid copyrighted characters, logos and real-person likenesses.
+9. The visual prompt must be in English because the image model performs better with English prompts.
+10. Keep scenes between {min_s} and {max_s}; the final scene may be shorter only if the batch ends.
+11. Return ONLY valid JSON.
+
+JSON:
+{{
+  "scenes": [
+    {{
+      "start": 0.0,
+      "end": 20.0,
+      "title": "short Vietnamese title",
+      "summary": "one sentence in Vietnamese",
+      "visual_prompt": "detailed English prompt for ONE coherent whiteboard infographic image"
+    }}
+  ]
+}}
+"""
+    user = f"""
+Batch begins at absolute time {batch_start:.2f}s.
+Batch duration: {batch_duration:.2f}s.
+
+TRANSCRIPT:
+{transcript_text}
+"""
+    r = client.chat.completions.create(
+        model=model,
+        temperature=0.2,
+        max_tokens=12000,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    )
+    obj = extract_json(r.choices[0].message.content)
+    scenes = obj.get("scenes", [])
+    clean = []
+    for s in scenes[:max_scenes]:
         try:
-            audio_path = os.path.join(workdir, audio_file.name)
-            with open(audio_path, "wb") as f:
-                f.write(audio_file.getbuffer())
+            a = max(0.0, float(s["start"]))
+            b = min(batch_duration, float(s["end"]))
+            if b <= a + 1:
+                continue
+            clean.append({
+                "start": a,
+                "end": b,
+                "title": str(s.get("title", "Cảnh")),
+                "summary": str(s.get("summary", "")),
+                "visual_prompt": str(s.get("visual_prompt", "")),
+            })
+        except Exception:
+            continue
+    if not clean:
+        raise ValueError("No valid scenes returned by planner")
+    # Ensure coverage from 0 to batch end. Small gaps are assigned to the previous scene.
+    clean[0]["start"] = 0.0
+    clean[-1]["end"] = batch_duration
+    return clean
 
-            total_audio_dur = get_duration(audio_path)
-            total_required_frames = int(round(total_audio_dur * FPS))
-            client = Groq(api_key=groq_key.strip())
+def normalize_pollinations_key(api_key):
+    key = (api_key or "").strip()
+    if not key:
+        raise RuntimeError("Thiếu POLLINATIONS_API_KEY.")
+    if not (key.startswith("sk_") or key.startswith("pk_")):
+        raise RuntimeError(
+            "Pollinations API key không đúng định dạng hiện tại. "
+            "Key hợp lệ thường bắt đầu bằng sk_ hoặc pk_."
+        )
+    return key
 
-            # ---------- 1. WHISPER ----------
-            status.update(label="🎙️ 1/4: Whisper bóc tách timestamp...")
-            compressed = os.path.join(workdir, "whisper_input.mp3")
-            subprocess.run([
-                "ffmpeg", "-y", "-i", audio_path, "-vn",
-                "-ar", "16000", "-ac", "1", "-b:a", "48k", compressed
-            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-            with open(compressed, "rb") as fh:
-                resp = client.audio.transcriptions.create(
-                    file=fh, model=STT_MODEL, response_format="verbose_json"
+def pollinations_request(prompt, api_key, model, timeout, width=WIDTH, height=HEIGHT):
+    key = normalize_pollinations_key(api_key)
+    full_prompt = f"""
+{prompt}
+
+STYLE LOCK:
+single coherent whiteboard infographic, 16:9 landscape composition,
+pure white paper background, hand-drawn black ink line art,
+simple expressive educational illustration, clean composition,
+subtle red and blue accent strokes only,
+clear central visual hierarchy, arrows connecting cause and effect,
+leave a clean empty band near the top for a title,
+NO words, NO letters, NO captions, NO watermark, NO logo,
+no photorealism, no 3D render, no gradients, no clutter.
+"""
+    url = "https://gen.pollinations.ai/image/" + quote(full_prompt, safe="")
+    params = {
+        "model": model,
+        "width": width,
+        "height": height,
+        "nologo": "true",
+        "private": "true",
+    }
+
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            r = requests.get(
+                url,
+                params=params,
+                headers={
+                    "Authorization": f"Bearer {key}",
+                    "Accept": "image/*",
+                },
+                timeout=timeout,
+            )
+            if r.status_code == 401:
+                raise RuntimeError(
+                    "Pollinations trả 401 Unauthorized: API key không hợp lệ, "
+                    "hết hạn hoặc chưa được cấp quyền. Hãy tạo/copy lại key tại enter.pollinations.ai."
                 )
-            data = resp.model_dump() if hasattr(resp, "model_dump") else dict(resp)
-            raw_segs = data.get("segments") or []
-            detected_lang = (data.get("language") or "vietnamese").lower()
-            is_english = "en" in detected_lang
+            if r.status_code == 403:
+                raise RuntimeError(
+                    "Pollinations trả 403 Forbidden: key không có quyền dùng model/tài nguyên này."
+                )
+            if r.status_code == 429:
+                raise RuntimeError(
+                    "Pollinations đang rate-limit (429). Hệ thống sẽ thử lại."
+                )
+            if r.status_code >= 400:
+                detail = r.text[:700].replace("\n", " ")
+                raise RuntimeError(f"Pollinations HTTP {r.status_code}: {detail}")
 
-            # ---------- 2. CHIA CẢNH DÀY ----------
-            segments = build_segments_from_whisper(raw_segs, total_audio_dur)
-            status.write(f"📊 Chia thành **{len(segments)} cảnh** (~{total_audio_dur / len(segments):.1f}s/cảnh)")
+            content_type = r.headers.get("content-type", "").lower()
+            if "image" not in content_type:
+                raise RuntimeError(
+                    f"Pollinations không trả ảnh (content-type={content_type}). "
+                    f"Response: {r.text[:500]}"
+                )
+            if not r.content:
+                raise RuntimeError("Pollinations trả về dữ liệu ảnh rỗng.")
+            return r.content
+        except Exception as e:
+            last_error = e
+            if attempt < 3:
+                time.sleep(2 * attempt)
+            else:
+                raise last_error
 
-            # Phân bổ frame chính xác
-            accumulated = 0
-            for i in range(len(segments)):
-                if i < len(segments) - 1:
-                    seg_dur = segments[i + 1]["start"] - segments[i]["start"]
-                    segments[i]["target_frames"] = max(15, int(round(seg_dur * FPS)))
-                    accumulated += segments[i]["target_frames"]
-                else:
-                    segments[i]["target_frames"] = max(15, total_required_frames - accumulated)
 
-            # ---------- 3. AI BÓC TÁCH 3 QUERY/CẢNH ----------
-            status.update(label="🧠 3/5: AI sinh 3 query candidates cho mỗi cảnh...")
-            by_idx = {}
-            batch_size = 8
-            for b_start in range(0, len(segments), batch_size):
-                sub = segments[b_start:b_start + batch_size]
-                parsed = ai_extract_query_candidates(client, sub, b_start, is_english)
-                by_idx.update(parsed)
-                status.write(f"✓ Đã phân tích câu {b_start + 1}–{b_start + len(sub)}")
+def pollinations_image(prompt, api_key, model, output_path, timeout):
+    data = pollinations_request(prompt, api_key, model, timeout)
+    Path(output_path).write_bytes(data)
+    try:
+        with Image.open(output_path) as im:
+            im.verify()
+        with Image.open(output_path) as im:
+            im.convert("RGB").save(output_path, quality=94)
+    except Exception as e:
+        Path(output_path).unlink(missing_ok=True)
+        raise RuntimeError(f"File ảnh Pollinations không hợp lệ: {e}")
 
-            # ---------- 4. DỰNG CẢNH ----------
-            status.update(label="🎬 4/5: Tìm ảnh/video khớp voice...")
-            clips_txt = os.path.join(workdir, "clips.txt")
-            with open(clips_txt, "w", encoding="utf-8") as f_clips:
-                for idx, sc in enumerate(segments):
-                    sc_data = by_idx.get(idx, {})
-                    queries = sc_data.get("queries") or []
-                    query_vn = sc_data.get("query_vn") or ""
 
-                    # Nếu AI fail → fallback từ chính câu thoại
-                    if not queries:
-                        queries = fallback_query_from_text(sc["text"], is_english)
-                    # Thêm query_vn làm candidate cuối
-                    candidates = list(queries)
-                    if query_vn and query_vn not in candidates:
-                        candidates.append(query_vn)
+def test_pollinations_api(api_key, model, timeout):
+    # Tiny live test: proves auth + selected image model work before a long run.
+    data = pollinations_request(
+        "A very simple black ink whiteboard drawing of a light bulb and a pencil, "
+        "minimal composition, white background",
+        api_key,
+        model,
+        timeout,
+        width=512,
+        height=288,
+    )
+    img = Image.open(io.BytesIO(data)).convert("RGB")
+    return img
 
-                    t_frames = sc["target_frames"]
+def font_for(size):
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return ImageFont.truetype(p, size)
+    return ImageFont.load_default()
 
-                    # Tăng tỉ lệ video B-roll lên 1/2 scene
-                    clip_path = None
-                    is_video_slot = (idx % 2 == 1) and (idx != len(segments) - 1)
-                    if is_video_slot and pexels_key:
-                        clip_path = fetch_broll_clip(candidates, idx, t_frames,
-                                                     pexels_key, workdir, used_vid_ids)
+def add_title(image_path, title, output_path):
+    img = Image.open(image_path).convert("RGB").resize((WIDTH, HEIGHT))
+    draw = ImageDraw.Draw(img)
+    # White title band; keeps generated image text-free and title accurate.
+    band_h = 105
+    draw.rectangle([0, 0, WIDTH, band_h], fill="white")
+    f = font_for(44)
+    # Fit title to width
+    while True:
+        box = draw.textbbox((0, 0), title, font=f)
+        if box[2] - box[0] <= WIDTH - 80 or getattr(f, "size", 44) <= 24:
+            break
+        f = font_for(max(24, getattr(f, "size", 44) - 2))
+    tw = box[2] - box[0]
+    draw.text(((WIDTH - tw) / 2, 25), title, fill="black", font=f)
+    img.save(output_path, quality=95)
 
-                    if not clip_path:
-                        img_path = fetch_matching_image(
-                            candidates, idx, workdir,
-                            used_urls, used_img_hashes, pexels_key, is_english
-                        )
-                        clip_path = os.path.join(workdir, f"clip_{idx:03d}.mp4")
-                        create_kenburns_clip(img_path, t_frames, clip_path, mode=idx)
+def make_hand_png(path):
+    # Simple clean hand + pencil illustration. It is deliberately stylized
+    # so the animation is lightweight and works without a separate asset.
+    S = 260
+    im = Image.new("RGBA", (S, S), (255, 255, 255, 0))
+    d = ImageDraw.Draw(im)
+    # palm/fingers
+    d.ellipse((65, 55, 210, 220), fill=(242, 220, 190, 255), outline=(20,20,20,255), width=5)
+    d.rounded_rectangle((92, 20, 145, 125), 20, fill=(242,220,190,255), outline=(20,20,20,255), width=5)
+    d.rounded_rectangle((135, 35, 185, 135), 20, fill=(242,220,190,255), outline=(20,20,20,255), width=5)
+    d.rounded_rectangle((48, 72, 105, 145), 22, fill=(242,220,190,255), outline=(20,20,20,255), width=5)
+    # pencil
+    d.polygon([(145, 185), (232, 98), (245, 111), (158, 198)], fill=(210,40,40,255), outline=(20,20,20,255))
+    d.polygon([(232,98),(251,89),(245,111)], fill=(230,210,170,255), outline=(20,20,20,255))
+    d.line((154, 195, 165, 207), fill=(20,20,20,255), width=5)
+    im.save(path)
 
-                    f_clips.write(f"file '{os.path.abspath(clip_path)}'\n")
-                    tag = "VIDEO" if is_video_slot and clip_path else "IMG"
-                    status.write(f"✓ [{tag}] Cảnh {idx + 1}/{len(segments)}: `{(candidates[0] if candidates else '')[:55]}`")
+def render_scene(image_path, duration, output_path, hand_path, style):
+    # Lightweight "draw-on" feeling:
+    # - image fades in from white
+    # - hand/pencil travels over the board
+    # - slow camera zoom adds life
+    # This is intentionally FFmpeg-only after the image is created.
+    if style == "Whiteboard + moving hand + zoom":
+        zoom = "zoompan=z='min(zoom+0.0007,1.10)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:fps=30:s=1280x720"
+    elif style == "Clean infographic motion":
+        zoom = "zoompan=z='min(zoom+0.00035,1.05)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:fps=30:s=1280x720"
+    else:
+        zoom = "zoompan=z='min(zoom+0.00045,1.07)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:fps=30:s=1280x720"
 
-            # ---------- 5. XUẤT MASTER ----------
-            status.update(label="⚡ 5/5: Ghép master + loudnorm...")
-            out_path = os.path.join(workdir, "output.mp4")
+    # Hand is an overlay; it moves across the image while the scene plays.
+    # The underlying image is whiteboard-style, so the combined result resembles
+    # a hand-drawn explainer rather than a normal slideshow.
+    hand_enable = style != "Clean infographic motion"
+    cmd = [
+        "ffmpeg", "-y",
+        "-loop", "1", "-i", str(image_path),
+        "-loop", "1", "-i", str(hand_path),
+        "-t", f"{duration:.3f}",
+        "-filter_complex",
+        (
+            f"[0:v]scale=1280:720:force_original_aspect_ratio=decrease,"
+            f"pad=1280:720:(ow-iw)/2:(oh-ih)/2:white,"
+            f"{zoom},fade=t=in:st=0:d=0.8[v];"
+            f"[1:v]scale=170:-1[hand];"
+            f"[v][hand]overlay="
+            f"x='if(lt(t,{duration/2:.3f}), 80+(1180-80)*t/{duration/2:.3f}, "
+            f"1180-(1180-80)*(t-{duration/2:.3f})/{duration/2:.3f})':"
+            f"y='if(lt(t,{duration/2:.3f}), 500-(500-120)*t/{duration/2:.3f}, "
+            f"120+(500-120)*(t-{duration/2:.3f})/{duration/2:.3f})':"
+            f"enable='{str(hand_enable).lower()}'[outv]"
+        ),
+        "-map", "[outv]",
+        "-an", "-c:v", "libx264", "-preset", "veryfast",
+        "-pix_fmt", "yuv420p", "-r", str(FPS),
+        str(output_path),
+    ]
+    run_cmd(cmd, timeout=max(180, int(duration * 8)))
 
-            subprocess.run([
-                "ffmpeg", "-y",
-                "-f", "concat", "-safe", "0", "-i", clips_txt,
-                "-i", audio_path,
-                "-map", "0:v:0", "-map", "1:a:0",
-                "-t", f"{total_audio_dur:.3f}",
-                "-c:v", "copy",
-                "-c:a", "aac", "-b:a", "192k",
-                "-af", "loudnorm=I=-14:TP=-1.5:LRA=11",
-                out_path
-            ], check=True)
+def render_batch(batch_audio, scenes, batch_dir, hand_path, style, progress_callback=None):
+    scene_videos = []
+    total = len(scenes)
+    for i, s in enumerate(scenes, 1):
+        img_raw = batch_dir / f"scene_{i:03d}_raw.png"
+        img = batch_dir / f"scene_{i:03d}.jpg"
+        vid = batch_dir / f"scene_{i:03d}.mp4"
+        if not img.exists():
+            pollinations_image(s["visual_prompt"], pollen_key, image_model, img_raw, image_timeout)
+            add_title(img_raw, s["title"], img)
+        duration = max(1.0, float(s["end"]) - float(s["start"]))
+        render_scene(img, duration, vid, hand_path, style)
+        scene_videos.append(vid)
+        if progress_callback:
+            progress_callback(i / total)
+    concat_file = batch_dir / "concat.txt"
+    concat_file.write_text("\n".join(f"file '{p.resolve()}'" for p in scene_videos), encoding="utf-8")
+    batch_video = batch_dir / "batch_video.mp4"
+    run_cmd([
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+        "-i", str(concat_file),
+        "-c", "copy", "-movflags", "+faststart",
+        str(batch_video)
+    ], timeout=900)
+    # Match batch audio exactly.
+    final_batch = batch_dir / "batch_final.mp4"
+    run_cmd([
+        "ffmpeg", "-y",
+        "-i", str(batch_video),
+        "-i", str(batch_audio),
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+        "-shortest", "-movflags", "+faststart",
+        str(final_batch)
+    ], timeout=900)
+    return final_batch
 
-            status.update(label=f"✅ Video hoàn thành ({len(segments)} cảnh)!", state="complete")
+def concat_batches(batch_videos, output_path):
+    concat = output_path.parent / "batches.txt"
+    concat.write_text("\n".join(f"file '{p.resolve()}'" for p in batch_videos), encoding="utf-8")
+    run_cmd([
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+        "-i", str(concat),
+        "-c", "copy", "-movflags", "+faststart",
+        str(output_path)
+    ], timeout=1800)
 
-            with open(out_path, "rb") as vid_file:
-                video_bytes = vid_file.read()
+# -----------------------------
+# Main
+# -----------------------------
+st.sidebar.divider()
+if st.sidebar.button("🔎 TEST POLLINATIONS API", use_container_width=True):
+    try:
+        with st.spinner("Đang test Pollinations..."):
+            test_img = test_pollinations_api(pollen_key, image_model, 60)
+        st.success("Pollinations OK — API key + model hoạt động.")
+        st.image(test_img, caption=f"Test model: {image_model}", use_container_width=True)
+    except Exception as e:
+        st.error(str(e))
 
-            st.video(video_bytes)
+audio = st.file_uploader(
+    "🎤 Upload voice",
+    type=["mp3", "m4a", "wav", "ogg", "webm", "mp4", "mpeg", "mpga"],
+)
+
+if audio:
+    st.audio(audio)
+
+    if st.button("🚀 CREATE VIDEO", type="primary", use_container_width=True):
+        if not groq_key:
+            st.error("Bạn chưa nhập GROQ_API_KEY.")
+            st.stop()
+        if not pollen_key:
+            st.error("Bạn chưa nhập POLLINATIONS_API_KEY. Groq không có text-to-image; tool dùng Pollinations cho phần ảnh.")
+            st.stop()
+        try:
+            pollen_key = normalize_pollinations_key(pollen_key)
+        except Exception as e:
+            st.error(str(e))
+            st.stop()
+
+        root = Path(tempfile.mkdtemp(prefix="wb_ai_"))
+        try:
+            source = root / audio.name
+            source.write_bytes(audio.getbuffer())
+
+            duration = ffprobe_duration(source)
+            st.info(f"Audio: {duration/60:.2f} phút. Tool sẽ xử lý từng batch tối đa 5 phút.")
+
+            client = groq_client(groq_key)
+            batch_dir = root / "batches"
+            batch_dir.mkdir()
+            chunks = chunk_audio(source, batch_dir)
+
+            hand_path = root / "hand.png"
+            make_hand_png(hand_path)
+
+            batch_videos = []
+            all_scene_count = 0
+            progress = st.progress(0)
+            status = st.empty()
+
+            for bi, chunk in enumerate(chunks):
+                bstart = bi * BATCH_SECONDS
+                bdur = ffprobe_duration(chunk)
+                status.write(f"🧠 Batch {bi+1}/{len(chunks)} — transcribing...")
+                tr = transcribe_file(client, chunk, stt_model)
+                segs = normalize_segments(tr, bstart)
+                batch_text = "\n".join(
+                    f"[{x['start']:.2f}-{x['end']:.2f}] {x['text']}"
+                    for x in segs
+                )
+
+                status.write(f"✂️ Batch {bi+1}/{len(chunks)} — planning scenes...")
+                scenes = make_scene_plan(
+                    client,
+                    batch_text,
+                    bstart,
+                    bdur,
+                    planner_model,
+                    scene_min,
+                    scene_max,
+                    max_scenes_per_batch,
+                )
+
+                st.write(f"**Batch {bi+1}: {bdur:.1f}s → {len(scenes)} scenes**")
+                for si, s in enumerate(scenes, 1):
+                    st.caption(
+                        f"{si:02d}. {s['start']:.1f}s–{s['end']:.1f}s — {s['title']}"
+                    )
+
+                batch_work = root / f"work_{bi+1:03d}"
+                batch_work.mkdir()
+
+                status.write(f"🎨 Batch {bi+1}/{len(chunks)} — generating images + animation...")
+                def cb(frac, bi=bi):
+                    progress.progress(min(1.0, (bi + frac) / len(chunks)))
+
+                bv = render_batch(
+                    chunk, scenes, batch_work, hand_path, draw_style, cb
+                )
+
+                # Move the finished batch outside the temporary work directory
+                # before cleanup. Otherwise the old V1 deleted the very MP4 that
+                # was needed later for final concatenation.
+                saved_batch = root / f"batch_final_{bi+1:03d}.mp4"
+                shutil.copy2(bv, saved_batch)
+                batch_videos.append(saved_batch)
+                all_scene_count += len(scenes)
+
+                # Free scene images/videos between 5-minute batches.
+                shutil.rmtree(batch_work, ignore_errors=True)
+
+            progress.progress(1.0)
+            status.write("🎬 Concatenating all batches...")
+
+            final = root / "whiteboard_final.mp4"
+            concat_batches(batch_videos, final)
+
+            st.success(
+                f"Done! {all_scene_count} scenes, processed in {len(chunks)} batch(es) of ≤5 minutes."
+            )
+            st.video(str(final))
             st.download_button(
-                label="⬇️ Tải Video Master",
-                data=video_bytes,
-                file_name=f"master_{int(time.time())}.mp4",
+                "⬇️ Download MP4",
+                data=final.read_bytes(),
+                file_name="whiteboard_ai_final.mp4",
                 mime="video/mp4",
-                use_container_width=True
+                use_container_width=True,
             )
 
         except Exception as e:
-            status.update(label=f"❌ Thất bại: {str(e)}", state="error")
-            st.error(f"Chi tiết lỗi: {e}")
+            st.exception(e)
+            st.warning(
+                "Nếu lỗi xảy ra ở một scene, hãy xem traceback. V1 ưu tiên dễ test và ổn định; "
+                "sau khi test thành công có thể thêm resume từng scene, retry ảnh và subtitle."
+            )
         finally:
-            shutil.rmtree(workdir, ignore_errors=True)
+            # Keep final file alive while Streamlit renders the download/video.
+            # Temporary cleanup is intentionally delayed by OS/runtime.
+            pass

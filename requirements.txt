@@ -1,7 +1,4 @@
-streamlit
-requests
-Pillow
-groq
-duckduckgo_search
-imageio-ffmpeg
-faster-whisper
+streamlit==1.50.0
+groq>=0.31.0
+requests>=2.32.0
+Pillow>=11.0.0
