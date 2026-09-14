@@ -397,7 +397,8 @@ def cloudflare_image_request(prompt, account_id, api_token, model, timeout=120):
 
 def pollinations_image_request(prompt, api_key="", timeout=120):
     full_prompt = build_full_prompt(prompt)
-    encoded_prompt = urllib.parse.quote(full_prompt)
+    # Mã hóa triệt để ký tự đặc biệt (kể cả dấu / với safe="") để tránh lỗi 404 URL
+    encoded_prompt = urllib.parse.quote(full_prompt, safe="")
     
     url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width={WIDTH}&height={HEIGHT}&nologo=true&seed={int(time.time())}"
     if api_key:
