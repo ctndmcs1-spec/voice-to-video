@@ -8,7 +8,6 @@ import base64
 import shutil
 import subprocess
 import tempfile
-import urllib.parse
 from pathlib import Path
 
 import requests
@@ -24,6 +23,7 @@ FPS = 30
 WIDTH = 1280
 HEIGHT = 720
 CLOUDFLARE_AI_URL = "https://api.cloudflare.com/client/v4/accounts/"
+POLLINATIONS_API_URL = "https://image.pollinations.ai/prompt/"
 
 # -----------------------------
 # Giao diện / Cấu hình
@@ -52,10 +52,10 @@ with st.sidebar:
         type="password",
     )
     pollinations_key = st.text_input(
-        "Khóa Pollinations API (Dự phòng)",
+        "Pollinations API Key",
         value=st.secrets.get("POLLINATIONS_API_KEY", os.getenv("POLLINATIONS_API_KEY", "")),
         type="password",
-        help="Sử dụng khi Cloudflare API gặp lỗi hoặc quá tải.",
+        help="Khóa xác thực khi gọi API tạo ảnh Pollinations.ai.",
     )
 
     st.header("🧠 Mô hình Groq")
@@ -64,18 +64,31 @@ with st.sidebar:
         ["whisper-large-v3", "whisper-large-v3-turbo"],
         index=0,
     )
+    # Đặt Qwen làm mặc định để tiếng Việt mượt mà và chuẩn nghĩa nhất
     planner_model = st.selectbox(
         "Mô hình biên kịch (Khuyên dùng Qwen)",
         ["qwen/qwen3.8-27b", "openai/gpt-oss-120b", "openai/gpt-oss-20b"],
         index=0,
     )
 
-    st.header("🎨 Cloudflare AI")
-    image_model = st.selectbox(
-        "Mô hình tạo ảnh",
-        ["@cf/black-forest-labs/flux-1-schnell"],
+    st.header("🎨 AI Tạo Ảnh")
+    image_provider = st.selectbox(
+        "Nhà cung cấp tạo ảnh",
+        ["Cloudflare Workers AI", "Pollinations.ai API"],
         index=0,
     )
+    if "Cloudflare" in image_provider:
+        image_model = st.selectbox(
+            "Mô hình tạo ảnh Cloudflare",
+            ["@cf/black-forest-labs/flux-1-schnell"],
+            index=0,
+        )
+    else:
+        image_model = st.selectbox(
+            "Mô hình tạo ảnh Pollinations",
+            ["flux", "turbo", "flux-realism", "any-dark"],
+            index=0,
+        )
 
     st.header("🎬 Phong cách diễn hoạt")
     draw_style = st.selectbox(
@@ -199,7 +212,7 @@ def sanitize_prompt_text(prompt):
     return cleaned
 
 # -----------------------------
-# Bộ điều phối kịch bản
+# Bộ điều phối kịch bản (Đa dạng hóa phong cách chữ & Chuẩn nhịp)
 # -----------------------------
 def make_scene_plan(client, transcript_text, batch_start, batch_duration, model, min_s, max_s, max_scenes):
     expected_scenes = max(1, round(batch_duration / 23.0))
@@ -210,15 +223,18 @@ Nhiệm vụ: Chia đoạn âm thanh {batch_duration:.0f}s thành khoảng {expe
 
 QUY TẮC NỘI DUNG VÀ ĐA DẠNG HÓA CHỮ (RẤT QUAN TRỌNG):
 1. "title": Tiêu đề tiếng Việt ngắn gọn (3-6 từ, viết hoa) tóm tắt luận điểm chính của cảnh.
+   - Dùng tiếng Việt tự nhiên: "CỐ GẮNG HÀI LÒNG MỌI NGƯỜI", "HẬU QUẢ KHI LUÔN NÓI ĐỒNG Ý", "NỖI SỢ BỊ PHÁN XÉT", "ĐÁNH MẤT BẢN THÂN".
+   - TUYỆT ĐỐI KHÔNG dùng từ ghép bậy bạ kiểu dịch máy (như 'đán mọc', 'đáng người', 'vô vì').
 2. ĐA DẠNG HÓA KIỂU CHỮ TRÊN TRANH ("callout_type" và "callout_text"):
-     * "speech": Bong bóng thoại tròn ("LÃI SUẤT QUÁ CAO!", "LẠI PHẢI NHẬN À?", "KHÔNG DÁM TỪ CHỐI...")
-     * "thought": Đám mây suy nghĩ ("HỌ CÓ GHÉT MÌNH KHÔNG?", "BIẾT TÍNH SAO ĐÂY?...")
-     * "sticker": Nhãn dán Comic ("BẪY TÂM LÝ!", "MẤT HẾT TỰ DO!", "KIỆT SỨC!")
-     * "none": Để trống (callout_text = ""), không chèn chữ gì.
-3. VỊ TRÍ CHỮ ("callout_side"): Chọn "left" hoặc "right".
+   - ĐỪNG cảnh nào cũng dùng cùng một kiểu chữ! Hãy luân phiên thay đổi linh hoạt:
+     * "speech": Bong bóng thoại tròn (nhân vật thốt lên: "LÃI SUẤT QUÁ CAO!", "LẠI PHẢI NHẬN À?", "KHÔNG DÁM TỪ CHỐI...")
+     * "thought": Đám mây suy nghĩ (nhân vật tự vấn: "HỌ CÓ GHÉT MÌNH KHÔNG?", "BIẾT TÍNH SAO ĐÂY?", "SAO MỆT MỎI THẾ...")
+     * "sticker": Nhãn dán Comic nhấn mạnh hậu quả/bài học: "BẪY TÂM LÝ!", "MẤT HẾT TỰ DO!", "RẤT SAI LẦM!", "KIỆT SỨC!"
+     * "none": Để trống (callout_text = ""), không chèn chữ gì để người xem tập trung vào tranh vẽ.
+3. VỊ TRÍ CHỮ ("callout_side"): Chọn "left" (nếu đặt cạnh bối cảnh bên trái) hoặc "right" (nếu đặt trên đầu nhân vật bên phải).
 4. MÔ TẢ TRANH ("visual_prompt"):
    - Tiếng Anh cho FLUX, phong cách 2D comic doodle bảng trắng, nét mực đen dày rõ nét, có điểm nhấn màu đỏ/xanh.
-   - Nhân vật vẽ bán thân (waist-up) biểu cảm lo âu.
+   - Nhân vật vẽ bán thân (waist-up) biểu cảm lo âu, toát mồ hôi, nhún vai.
    - CẤM TIỆT VẼ CHỮ, CẤM VẼ BẢNG TRẮNG CÓ KHAY BÚT, CẤM VẼ BONG BÓNG THOẠI RỖNG.
 5. Trả về đúng JSON.
 
@@ -289,6 +305,7 @@ TRANSCRIPT:
             "visual_prompt": "A 16:9 educational whiteboard comic: left side has contract papers with downward trend arrow, right side has a waist-up comic man sweating and stressed, bold black lines, selective red color, pure white background, no text",
         }]
 
+    # Gộp cảnh ngắn tự động (Tuyệt đối không để cảnh nào dưới 17 giây)
     merged = []
     for s in clean:
         if not merged:
@@ -310,6 +327,7 @@ TRANSCRIPT:
         clean[i]["end"] = clean[i + 1]["start"]
     clean[-1]["end"] = batch_duration
 
+    # Đảm bảo cảnh dài nhất không quá 35s
     final_scenes = []
     for s in clean:
         dur = s["end"] - s["start"]
@@ -339,11 +357,18 @@ TRANSCRIPT:
     return final_scenes
 
 # -----------------------------
-# Engine Tạo Ảnh: Cloudflare AI & Pollinations Fallback
+# Cloudflare Workers AI Engine
 # -----------------------------
-def build_full_prompt(prompt):
+def cloudflare_image_request(prompt, account_id, api_token, model, timeout=120):
+    account_id = (account_id or "").strip()
+    api_token = (api_token or "").strip()
+    if not account_id or not api_token:
+        raise RuntimeError("Chưa cấu hình Cloudflare Account ID hoặc API Token.")
+
+    url = f"{CLOUDFLARE_AI_URL}{account_id}/ai/run/{model}"
     safe_prompt = sanitize_prompt_text(prompt)
-    return f"""
+
+    full_prompt = f"""
 Comprehensive 16:9 widescreen educational whiteboard comic illustration of {safe_prompt}.
 CRITICAL STYLE REQUIREMENTS:
 - Authentic 2D comic doodle art style, thick black ink contour outlines, expressive cartoon characters with vivid facial expressions, waist-up shot or sitting at desk. NO awkward stick-legs.
@@ -353,15 +378,7 @@ CRITICAL STYLE REQUIREMENTS:
 - Selective vibrant red and green/blue spot colors on key elements.
 - STRICTLY WORDLESS: Absolutely NO English words, NO Vietnamese words, NO letters, NO numbers, NO captions, NO empty speech balloons, NO calendars.
 """
-
-def cloudflare_image_request(prompt, account_id, api_token, model, timeout=120):
-    account_id = (account_id or "").strip()
-    api_token = (api_token or "").strip()
-    if not account_id or not api_token:
-        raise RuntimeError("Chưa cấu hình Cloudflare Account ID hoặc API Token.")
-
-    url = f"{CLOUDFLARE_AI_URL}{account_id}/ai/run/{model}"
-    payload = {"prompt": build_full_prompt(prompt), "steps": 4}
+    payload = {"prompt": full_prompt, "steps": 4}
     headers = {"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"}
 
     last_error = None
@@ -395,44 +412,9 @@ def cloudflare_image_request(prompt, account_id, api_token, model, timeout=120):
             else:
                 raise last_error
 
-def pollinations_image_request(prompt, api_key="", timeout=120):
-    full_prompt = build_full_prompt(prompt)
-    # Mã hóa triệt để ký tự đặc biệt (kể cả dấu / với safe="") để tránh lỗi 404 URL
-    encoded_prompt = urllib.parse.quote(full_prompt, safe="")
-    
-    url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width={WIDTH}&height={HEIGHT}&nologo=true&seed={int(time.time())}"
-    if api_key:
-        url += f"&key={api_key.strip()}"
-        
-    headers = {"User-Agent": "Mozilla/5.0"}
-    response = requests.get(url, headers=headers, timeout=timeout)
-    
-    if response.status_code != 200:
-        raise RuntimeError(f"Pollinations HTTP {response.status_code}: {response.text[:300]}")
-    if not response.content:
-        raise RuntimeError("Pollinations không trả về dữ liệu ảnh.")
-        
-    return response.content
-
 def cloudflare_image(prompt, account_id, api_token, model, output_path, timeout=120):
     data = cloudflare_image_request(prompt, account_id, api_token, model, timeout)
-    save_and_process_image(data, output_path)
-
-def generate_image_with_fallback(prompt, account_id, api_token, model, pol_key, output_path, timeout=120):
-    try:
-        # 1. Thử tạo ảnh bằng Cloudflare API
-        cloudflare_image(prompt, account_id, api_token, model, output_path, timeout)
-    except Exception as cf_err:
-        # 2. Nếu Cloudflare lỗi, tự động Fallback sang Pollinations API
-        try:
-            st.warning(f"⚠️ Cloudflare AI lỗi ({cf_err}). Đang chuyển sang Pollinations API...")
-            data = pollinations_image_request(prompt, api_key=pol_key, timeout=timeout)
-            save_and_process_image(data, output_path)
-        except Exception as pol_err:
-            raise RuntimeError(f"Cả Cloudflare API ({cf_err}) và Pollinations API ({pol_err}) đều thất bại!")
-
-def save_and_process_image(image_bytes, output_path):
-    Path(output_path).write_bytes(image_bytes)
+    Path(output_path).write_bytes(data)
     try:
         with Image.open(output_path) as im:
             im.verify()
@@ -442,13 +424,82 @@ def save_and_process_image(image_bytes, output_path):
             im.save(output_path, "JPEG", quality=95)
     except Exception as e:
         Path(output_path).unlink(missing_ok=True)
-        raise RuntimeError(f"Dữ liệu ảnh không hợp lệ: {e}")
+        raise RuntimeError(f"Ảnh Cloudflare không hợp lệ: {e}")
 
 def test_cloudflare_api(account_id, api_token, model, timeout=120):
     data = cloudflare_image_request(
         prompt="A 16:9 whiteboard comic: left side has contract papers with falling red arrow, right side has a waist-up comic man sweating and stressed at desk, bold black lines, selective red color, pure white background, zero text, no pen tray",
         account_id=account_id,
         api_token=api_token,
+        model=model,
+        timeout=timeout,
+    )
+    im = Image.open(io.BytesIO(data)).convert("RGB")
+    return im.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
+
+# -----------------------------
+# Pollinations.ai API Engine (Mới thêm)
+# -----------------------------
+def pollinations_image_request(prompt, api_key, model="flux", width=WIDTH, height=HEIGHT, timeout=120):
+    safe_prompt = sanitize_prompt_text(prompt)
+    full_prompt = f"""
+Comprehensive 16:9 widescreen educational whiteboard comic illustration of {safe_prompt}.
+CRITICAL STYLE REQUIREMENTS:
+- Authentic 2D comic doodle art style, thick black ink contour outlines, expressive cartoon characters with vivid facial expressions, waist-up shot or sitting at desk. NO awkward stick-legs.
+- Balanced layout: subject matter on left, character on right, leaving clean open white space for overlays.
+- PURE SOLID FLAT WHITE PAPER BACKGROUND.
+- ABSOLUTELY NO physical whiteboard frame, NO aluminum borders, NO pen tray, NO markers on table, NO eraser.
+- Selective vibrant red and green/blue spot colors on key elements.
+- STRICTLY WORDLESS: Absolutely NO English words, NO Vietnamese words, NO letters, NO numbers, NO captions, NO empty speech balloons, NO calendars.
+"""
+    encoded_prompt = requests.utils.quote(full_prompt)
+    url = f"{POLLINATIONS_API_URL}{encoded_prompt}?width={width}&height={height}&model={model}&nologo=true"
+    
+    headers = {}
+    if api_key:
+        api_key = api_key.strip()
+        headers["Authorization"] = f"Bearer {api_key}"
+        url += f"&key={api_key}"
+
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            response = requests.get(url, headers=headers, timeout=timeout)
+            if response.status_code == 401:
+                raise RuntimeError("Pollinations 401: API Key không hợp lệ.")
+            if response.status_code >= 400:
+                raise RuntimeError(f"Pollinations HTTP {response.status_code}: {response.text[:500]}")
+            
+            content_type = response.headers.get("content-type", "")
+            if "image" not in content_type and len(response.content) < 1000:
+                raise RuntimeError(f"Pollinations phản hồi không phải ảnh: {response.text[:500]}")
+                
+            return response.content
+        except Exception as e:
+            last_error = e
+            if attempt < 3:
+                time.sleep(2 * attempt)
+            else:
+                raise last_error
+
+def pollinations_image(prompt, api_key, model, output_path, timeout=120):
+    data = pollinations_image_request(prompt, api_key, model, WIDTH, HEIGHT, timeout)
+    Path(output_path).write_bytes(data)
+    try:
+        with Image.open(output_path) as im:
+            im.verify()
+        with Image.open(output_path) as im:
+            im = im.convert("RGB")
+            im = im.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
+            im.save(output_path, "JPEG", quality=95)
+    except Exception as e:
+        Path(output_path).unlink(missing_ok=True)
+        raise RuntimeError(f"Ảnh Pollinations không hợp lệ: {e}")
+
+def test_pollinations_api(api_key, model, timeout=120):
+    data = pollinations_image_request(
+        prompt="A 16:9 whiteboard comic: left side has contract papers with falling red arrow, right side has a waist-up comic man sweating and stressed at desk, bold black lines, selective red color, pure white background, zero text, no pen tray",
+        api_key=api_key,
         model=model,
         timeout=timeout,
     )
@@ -472,6 +523,7 @@ def add_comic_overlays(image_path, title, callout_type, callout_text, callout_si
     img = Image.open(image_path).convert("RGB").resize((WIDTH, HEIGHT))
     draw = ImageDraw.Draw(img)
 
+    # 1. Tiêu đề chính phía trên — Khóa an toàn 850px chống cắt cụt chữ khi camera zoom
     if title:
         band_h = 95
         draw.rectangle([0, 0, WIDTH, band_h], fill="white")
@@ -489,16 +541,19 @@ def add_comic_overlays(image_path, title, callout_type, callout_text, callout_si
         tw = box[2] - box[0]
         draw.text(((WIDTH - tw) / 2, 26), title, fill="black", font=f_title)
 
+    # 2. Xử lý các kiểu chữ biến hóa theo từng cảnh
     if callout_text and callout_type != "none":
         f_text = font_for(25)
         bb = draw.textbbox((0, 0), callout_text, font=f_text)
         bw, bh = bb[2] - bb[0], bb[3] - bb[1]
 
+        # Xác định tọa độ trung tâm dựa vào callout_side
         if callout_side == "left":
             cx, cy = int(WIDTH * 0.28), int(HEIGHT * 0.35)
         else:
             cx, cy = int(WIDTH * 0.74), int(HEIGHT * 0.32)
 
+        # KIỂU 1: Bong bóng thoại (Speech Bubble bo góc có đuôi)
         if callout_type == "speech":
             pad_x, pad_y = 18, 12
             rect = [cx - bw // 2 - pad_x, cy - bh // 2 - pad_y, cx + bw // 2 + pad_x, cy + bh // 2 + pad_y]
@@ -509,15 +564,18 @@ def add_comic_overlays(image_path, title, callout_type, callout_text, callout_si
             draw.line([(cx - 30, cy + bh // 2 + pad_y), (cx - 10, cy + bh // 2 + pad_y)], fill="white", width=5)
             draw.text((cx - bw // 2, cy - bh // 2 - 2), callout_text, fill="#1b5e20", font=f_text)
 
+        # KIỂU 2: Đám mây suy nghĩ (Thought Cloud với các hạt tròn)
         elif callout_type == "thought":
             pad_x, pad_y = 22, 14
             rect = [cx - bw // 2 - pad_x, cy - bh // 2 - pad_y, cx + bw // 2 + pad_x, cy + bh // 2 + pad_y]
             draw.rounded_rectangle(rect, radius=24, fill="white", outline="black", width=3)
+            # 3 bóng tròn nhỏ chỉ về đầu nhân vật
             draw.ellipse([cx - 20, cy + bh // 2 + pad_y + 4, cx - 10, cy + bh // 2 + pad_y + 14], fill="white", outline="black", width=3)
             draw.ellipse([cx - 28, cy + bh // 2 + pad_y + 17, cx - 22, cy + bh // 2 + pad_y + 23], fill="white", outline="black", width=2)
             draw.ellipse([cx - 34, cy + bh // 2 + pad_y + 26, cx - 30, cy + bh // 2 + pad_y + 30], fill="white", outline="black", width=2)
             draw.text((cx - bw // 2, cy - bh // 2 - 2), callout_text, fill="#0d47a1", font=f_text)
 
+        # KIỂU 3: Nhãn dán Comic Sticker (Viền đỏ/cam nổi bật, đặt ở góc dưới)
         else:
             pad_x, pad_y = 16, 9
             bx, by = int(WIDTH * 0.75), int(HEIGHT * 0.88)
@@ -528,7 +586,7 @@ def add_comic_overlays(image_path, title, callout_type, callout_text, callout_si
     img.save(output_path, quality=95)
 
 # -----------------------------
-# Bộ máy Bàn tay & Khử bóng mờ
+# Bộ máy Bàn tay & TRIỆT TIÊU 100% BÓNG MỜ
 # -----------------------------
 def generate_fallback_hand():
     S = 320
@@ -562,23 +620,30 @@ def load_hand_asset(hand_path, target_width=320):
     bgr = cv2.cvtColor(hand_np[:, :, :3], cv2.COLOR_RGB2BGR)
     alpha = hand_np[:, :, 3]
 
+    # --- KHẮC PHỤC TRIỆT ĐỂ BÓNG MỜ HÌNH CHỮ NHẬT ---
+    # 1. Cắt đứt hoàn toàn 6 pixel sát 4 cạnh viền ngoài
     alpha[:6, :] = 0
     alpha[-6:, :] = 0
     alpha[:, :6] = 0
     alpha[:, -6:] = 0
 
+    # 2. Lọc bỏ toàn bộ alpha rác nhỏ hơn 110
     alpha[alpha < 110] = 0
 
+    # 3. Connected Components: Chỉ giữ lại vùng da thịt & cây bút (vùng lớn nhất), xóa sạch bóng rác
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats((alpha > 50).astype(np.uint8))
     if num_labels > 1:
         largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
         alpha[labels != largest_label] = 0
 
+    # 4. Erode (co viền) vào trong 3 pixel để mép tay sạch bong, không còn một hạt bụi viền
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     alpha = cv2.erode(alpha, kernel, iterations=1)
 
+    # 5. Làm mềm nhẹ bên trong (Không để giá trị lan ra ngoài vùng 0)
     blurred_alpha = cv2.GaussianBlur(alpha, (3, 3), 0)
     alpha = np.minimum(alpha, blurred_alpha)
+    # ------------------------------------------------
 
     ys, xs = np.where(alpha > 120)
     tip_x, tip_y = (int(xs[np.argmin(xs + ys * 1.15)]), int(ys[np.argmin(xs + ys * 1.15)])) if len(xs) > 0 else (0, 0)
@@ -704,7 +769,7 @@ def ease_in_out(t):
     return 0.5 * (1.0 - math.cos(math.pi * t))
 
 # -----------------------------
-# PHONG CÁCH 1: Kiến Thức Thú Vị V2
+# PHONG CÁCH 1: Kiến Thức Thú Vị V2 (Khóa Camera không cắt Tiêu đề)
 # -----------------------------
 def render_scene_kttv_v2(image_path, duration, output_path, hand_path):
     total_frames = max(1, round(duration * FPS))
@@ -779,6 +844,7 @@ def render_scene_kttv_v2(image_path, duration, output_path, hand_path):
         if hand_visible:
             paste_hand(frame_world, hand_bgr, hand_alpha, hand_pos_x - tip_x, hand_pos_y - tip_y)
 
+        # CỐ ĐỊNH y1=0 ĐỂ KHÔNG BAO GIỜ CẮT CỤT TIÊU ĐỀ
         if f_idx < draw_frames:
             scale = 1.20
             smooth_cx = smooth_cx * 0.94 + hand_pos_x * 0.06
@@ -901,7 +967,7 @@ def render_scene_hybrid(image_path, duration, output_path, hand_path):
         raise RuntimeError("FFmpeg render thất bại trong Chế độ 2.")
 
 # -----------------------------
-# PHONG CÁCH 3: Kiến Thức Thú Vị Pure
+# PHONG CÁCH 3: Kiến Thức Thú Vị (Ẩn tay, chỉ Pan/Zoom)
 # -----------------------------
 def render_scene_kttv_pure(image_path, duration, output_path):
     total_frames = max(1, round(duration * FPS))
@@ -948,7 +1014,7 @@ def render_scene_kttv_pure(image_path, duration, output_path):
     proc.wait()
 
 # -----------------------------
-# PHONG CÁCH 4: Bảng trắng cổ điển
+# PHONG CÁCH 4: Bảng trắng cổ điển (Góc máy tĩnh, tay vẽ)
 # -----------------------------
 def render_scene_classic_hand(image_path, duration, output_path, hand_path):
     total_frames = max(1, round(duration * FPS))
@@ -1009,25 +1075,18 @@ def render_scene_classic_hand(image_path, duration, output_path, hand_path):
 # -----------------------------
 # Quy trình render theo đợt
 # -----------------------------
-def render_batch(batch_audio, scenes, batch_dir, hand_path, style, pol_key="", progress_callback=None):
+def render_batch(batch_audio, scenes, batch_dir, hand_path, style, image_provider, cloudflare_account_id, cloudflare_token, pollinations_key, image_model, image_timeout, progress_callback=None):
     scene_videos = []
     total = len(scenes)
     for i, s in enumerate(scenes, 1):
         img_raw = batch_dir / f"scene_{i:03d}_raw.png"
         img = batch_dir / f"scene_{i:03d}.jpg"
         vid = batch_dir / f"scene_{i:03d}.mp4"
-        
         if not img.exists():
-            # Tự động gọi Fallback giữa Cloudflare & Pollinations
-            generate_image_with_fallback(
-                s["visual_prompt"],
-                cloudflare_account_id,
-                cloudflare_token,
-                image_model,
-                pol_key,
-                img_raw,
-                image_timeout
-            )
+            if "Cloudflare" in image_provider:
+                cloudflare_image(s["visual_prompt"], cloudflare_account_id, cloudflare_token, image_model, img_raw, image_timeout)
+            else:
+                pollinations_image(s["visual_prompt"], pollinations_key, image_model, img_raw, image_timeout)
             add_comic_overlays(img_raw, s["title"], s.get("callout_type", "speech"), s.get("callout_text", ""), s.get("callout_side", "right"), img)
 
         duration = max(1.0, float(s["end"]) - float(s["start"]))
@@ -1083,8 +1142,11 @@ def concat_batches(batch_videos, output_path):
 st.sidebar.divider()
 if st.sidebar.button("🔎 KIỂM TRA ẢNH MẪU COMIC", use_container_width=True):
     try:
-        with st.spinner("Cloudflare đang vẽ tranh minh họa..."):
-            test_img = test_cloudflare_api(cloudflare_account_id, cloudflare_token, image_model, 120)
+        with st.spinner("AI đang vẽ tranh minh họa..."):
+            if "Cloudflare" in image_provider:
+                test_img = test_cloudflare_api(cloudflare_account_id, cloudflare_token, image_model, 120)
+            else:
+                test_img = test_pollinations_api(pollinations_key, image_model, 120)
         st.success("✅ Ảnh tạo thành công — Bố cục rộng, sạch chữ rác, sẵn sàng ghép thoại!")
         st.image(test_img, caption="Ảnh mẫu Comic Doodle (Chuẩn Kiến Thức Thú Vị)", use_container_width=True)
     except Exception as e:
@@ -1096,9 +1158,14 @@ if audio:
     st.audio(audio)
 
     if st.button("🚀 BẮT ĐẦU TẠO VIDEO V2", type="primary", use_container_width=True):
-        if not groq_key or not cloudflare_account_id or not cloudflare_token:
-            st.error("Vui lòng nhập đầy đủ Groq API Key, Cloudflare Account ID và Token.")
+        if not groq_key:
+            st.error("Vui lòng nhập Groq API Key.")
             st.stop()
+        if "Cloudflare" in image_provider and (not cloudflare_account_id or not cloudflare_token):
+            st.error("Vui lòng nhập đầy đủ Cloudflare Account ID và Token.")
+            st.stop()
+        if "Pollinations" in image_provider and not pollinations_key:
+            st.warning("Bạn chưa nhập Pollinations API Key. Hệ thống vẫn tiếp tục thử gọi API...")
 
         root = Path(tempfile.mkdtemp(prefix="wb_final_fix_"))
         try:
@@ -1142,7 +1209,7 @@ if audio:
                 def cb(frac, idx=idx):
                     progress.progress(min(1.0, (idx + frac) / len(valid_chunks)))
 
-                bv = render_batch(chunk, scenes, batch_work, hand_path, draw_style, pollinations_key, cb)
+                bv = render_batch(chunk, scenes, batch_work, hand_path, draw_style, image_provider, cloudflare_account_id, cloudflare_token, pollinations_key, image_model, image_timeout, cb)
                 saved_batch = root / f"batch_final_{idx+1:03d}.mp4"
                 shutil.copy2(bv, saved_batch)
                 batch_videos.append(saved_batch)
