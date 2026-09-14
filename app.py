@@ -1,9 +1,13 @@
 """
-Xưởng Video Diễn Hoạt Kiến Thức AI — Bản Siêu Cấp V3
-- Đa nhà cung cấp ảnh với fallback tự động
-- Prompt sáng tạo đa dạng bố cục (không lặp khuôn bàn + bút)
-- 8 kiểu camera motion cho từng cảnh
-- Giữ nguyên 100% logic cốt lõi: hand animation, comic overlays, batch processing
+Xưởng Video Diễn Hoạt Kiến Thức AI — Bản Siêu Cấp V4
+=====================================================
+Nâng cấp V4 so với V3:
+- Tách title band 95px khỏi vùng camera (không bao giờ cắt tiêu đề)
+- Wide shot 100% ở đầu cảnh, zoom/pan chỉ sau khi vẽ xong
+- Vẽ tuần tự 3 phase theo nhịp: chính → phụ → nền
+- Vẽ nhanh hơn: bán kính 34px, 55% thời gian cảnh
+- 8 camera motion + 3 chế độ chọn (Auto/Random/Cố định)
+- 7 nhà cung cấp ảnh fallback tự động
 """
 
 import os
@@ -13,6 +17,7 @@ import json
 import math
 import time
 import base64
+import random
 import shutil
 import subprocess
 import tempfile
@@ -28,11 +33,16 @@ import numpy as np
 # ============================================================
 # CẤU HÌNH CHUNG
 # ============================================================
-APP_TITLE = "Xưởng Video Diễn Hoạt Kiến Thức AI (Bản Siêu Cấp V3)"
+APP_TITLE = "Xưởng Video Diễn Hoạt Kiến Thức AI (Bản Siêu Cấp V4)"
 BATCH_SECONDS = 5 * 60
 FPS = 30
 WIDTH = 1280
 HEIGHT = 720
+TITLE_BAND_H = 95
+CONTENT_H = HEIGHT - TITLE_BAND_H  # 625
+REVEAL_RADIUS = 34  # Bán kính vẽ (tăng để vẽ nhanh hơn)
+DRAW_DURATION_RATIO = 0.55  # Vẽ trong 55% thời gian cảnh
+PHASE_RATIOS = (0.40, 0.35, 0.25)  # Phase 1: 40%, Phase 2: 35%, Phase 3: 25%
 
 # --- Agnes AI ---
 AGNES_API_URL = "https://apihub.agnes-ai.com/v1/images/generations"
@@ -64,8 +74,8 @@ POLLINATIONS_BASE = "https://image.pollinations.ai/prompt/"
 # GIAO DIỆN / CẤU HÌNH
 # ============================================================
 st.set_page_config(page_title=APP_TITLE, page_icon="🎬", layout="wide")
-st.title("🎬 Xưởng Video Diễn Hoạt Kiến Thức AI — Siêu Cấp V3")
-st.caption("Groq (STT + Biên kịch) + 7 nhà cung cấp ảnh AI fallback + Sáng tạo bố cục đa dạng + 8 kiểu camera motion")
+st.title("🎬 Xưởng Video Diễn Hoạt Kiến Thức AI — Siêu Cấp V4")
+st.caption("Vẽ tuần tự 3 phase + Title band cố định + Wide shot đầu cảnh + 7 nhà cung cấp ảnh fallback")
 
 with st.sidebar:
     st.header("🔑 API Keys")
@@ -114,11 +124,7 @@ with st.sidebar:
         )
 
     st.header("🧠 Mô hình Groq")
-    stt_model = st.selectbox(
-        "STT Model",
-        ["whisper-large-v3", "whisper-large-v3-turbo"],
-        index=0,
-    )
+    stt_model = st.selectbox("STT Model", ["whisper-large-v3", "whisper-large-v3-turbo"], index=0)
     planner_model = st.selectbox(
         "Biên kịch Model",
         ["qwen/qwen3.8-27b", "openai/gpt-oss-120b", "openai/gpt-oss-20b"],
@@ -129,8 +135,8 @@ with st.sidebar:
     draw_style = st.selectbox(
         "Chọn phong cách",
         [
-            "1. Kiến Thức Thú Vị V2 (Vẽ tuần tự + Bong bóng thoại + Pan/Zoom)",
-            "2. Độc bản Hybrid (Tay vẽ + Camera Steadicam)",
+            "1. Kiến Thức Thú Vị V2 (Vẽ tuần tự 3 phase + Camera Pan/Zoom)",
+            "2. Độc bản Hybrid (Tay vẽ bám nét + Camera Steadicam)",
             "3. Chỉ Camera Pan & Zoom (ẩn bàn tay)",
             "4. Bảng trắng cổ điển (Tay vẽ góc máy tĩnh)",
         ],
@@ -148,6 +154,7 @@ with st.sidebar:
             "Cố định: pan_left_to_right",
             "Cố định: pan_right_to_left",
             "Cố định: ken_burns_slow",
+            "Cố định: static",
         ],
         index=0,
     )
@@ -263,7 +270,67 @@ def sanitize_prompt_text(prompt):
     return cleaned
 
 # ============================================================
-# BỘ ĐIỀU PHỐI KỊCH BẢN (NÂNG CẤP: SÁNG TẠO BỐ CỤC + CAMERA MOTION)
+# TITLE BAND HELPERS (MỚI V4)
+# ============================================================
+def split_title_band(image_bgr):
+    """Tách band tiêu đề (y=0..95) và vùng nội dung (y=95..720)."""
+    title_band = image_bgr[:TITLE_BAND_H, :].copy()
+    content = image_bgr[TITLE_BAND_H:, :].copy()
+    return title_band, content
+
+def compose_frame(title_band_bgr, content_bgr):
+    """Ghép band tiêu đề + vùng nội dung đã crop thành frame 1280x720."""
+    canvas = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
+    canvas[:TITLE_BAND_H] = title_band_bgr
+    canvas[TITLE_BAND_H:] = content_bgr
+    return canvas
+
+def crop_content_with_motion(content_bgr, scale, cx, cy):
+    """Crop vùng nội dung (1280x625) theo scale + tâm. Không cắt title."""
+    ch, cw = content_bgr.shape[:2]
+    crop_w = max(1, min(cw, int(cw / max(0.5, scale))))
+    crop_h = max(1, min(ch, int(ch / max(0.5, scale))))
+    x1 = max(0, min(cw - crop_w, int(cx - crop_w / 2)))
+    y1 = max(0, min(ch - crop_h, int(cy - crop_h / 2)))
+    crop = content_bgr[y1:y1 + crop_h, x1:x1 + crop_w]
+    return cv2.resize(crop, (cw, ch), interpolation=cv2.INTER_LINEAR)
+
+def trajectory_to_content_space(trajectory_full):
+    """Chuyển tọa độ trajectory từ 1280x720 sang 1280x625 (bỏ 95px title)."""
+    out = []
+    for (px, py) in trajectory_full:
+        if py >= TITLE_BAND_H:
+            out.append((int(px), int(py - TITLE_BAND_H)))
+    if not out:
+        out = [(WIDTH // 2, CONTENT_H // 2)]
+    return out
+
+def split_trajectory_into_phases(trajectory, ratios=PHASE_RATIOS):
+    """Chia trajectory thành 3 phase theo tỉ lệ thời gian."""
+    n = len(trajectory)
+    if n < 3:
+        return [trajectory, [], []]
+    b1 = max(1, int(n * ratios[0]))
+    b2 = max(b1 + 1, int(n * (ratios[0] + ratios[1])))
+    b2 = min(b2, n - 1)
+    return [
+        trajectory[:b1],
+        trajectory[b1:b2],
+        trajectory[b2:],
+    ]
+
+def reveal_phase(reveal_mask, phase_pts, progress, radius=REVEAL_RADIUS):
+    """Vẽ các điểm của phase vào reveal_mask theo tiến độ 0..1."""
+    if not phase_pts:
+        return
+    count = max(1, int(progress * len(phase_pts)))
+    count = min(count, len(phase_pts))
+    for pt in phase_pts[:count]:
+        cv2.circle(reveal_mask, pt, radius, 255, -1)
+    return phase_pts[count - 1] if count > 0 else phase_pts[0]
+
+# ============================================================
+# BỘ ĐIỀU PHỐI KỊCH BẢN
 # ============================================================
 def make_scene_plan(client, transcript_text, batch_start, batch_duration, model,
                     min_s, max_s, max_scenes, camera_mode="auto"):
@@ -276,10 +343,10 @@ Nhiệm vụ: Chia đoạn âm thanh {batch_duration:.0f}s thành khoảng {expe
 QUY TẮC VỀ TIÊU ĐỀ ("title"):
 - Tiếng Việt tự nhiên, 3-6 từ, VIẾT HOA, tóm tắt luận điểm chính.
 - KHÔNG dùng từ ghép kiểu dịch máy (như 'đán mọc', 'đáng người', 'vô vì').
-- Ví dụ tốt: "CỐ GẮNG HÀI LÒNG MỌI NGƯỜI", "NỖI SỢ BỊ PHÁN XÉT", "ĐÁNH MẤT BẢN THÂN".
+- Ví dụ tốt: "CỐ GẮNG HÀI LÒNG MỌI NGƯỜI", "NỖI SỢ BỊ PHÁN XÉT".
 
 QUY TẮC VỀ CHỮ TRÊN TRANH ("callout_type", "callout_text"):
-- "speech": bong bóng thoại (nhân vật nói: "KHỔ QUÁ RỒI!", "LẠI PHẢI NHẬN À?")
+- "speech": bong bóng thoại (nhân vật nói: "KHỔ QUÁ RỒI!")
 - "thought": đám mây suy nghĩ (nhân vật tự vấn: "HỌ CÓ GHÉT MÌNH KHÔNG?")
 - "sticker": nhãn dán nhấn mạnh: "BẪY TÂM LÝ!", "MẤT HẾT TỰ DO!"
 - "none": không có chữ
@@ -288,48 +355,38 @@ QUY TẮC VỀ CHỮ TRÊN TRANH ("callout_type", "callout_text"):
 QUY TẮC QUAN TRỌNG NHẤT — MÔ TẢ TRANH ("visual_prompt") PHẢI SÁNG TẠO VÀ ĐA DẠNG:
 
 MỖI CẢNH LÀ MỘT "SÂN KHẤU" KHÁC NHAU. TUYỆT ĐỐI KHÔNG lặp lại bố cục.
-KHÔNG được bắt đầu nhiều cảnh bằng cùng một mô tả. KHÔNG có khuôn mẫu "nhân vật ngồi bàn có bút".
+KHÔNG có khuôn mẫu "nhân vật ngồi bàn có bút".
 
-Mô tả trong visual_prompt (tiếng Anh), phải bao gồm 4-5 yếu tố:
-1. NHÂN VẬT + TƯ THẾ đa dạng: đứng, ngồi xổm, chạy, ngã, chỉ tay, ôm đầu, đứng giữa biển, đứng trên núi, bay lơ lửng, chui vào hộp, bị trói, đang bơi, đang leo, đang chiến đấu...
-2. HÀNH ĐỘNG cụ thể: ký giấy, đóng dấu, bị kéo, bị đẩy, gánh nặng, đang rơi, đang đuổi theo, đang trốn...
-3. BỐI CẢNH khác nhau: bãi biển hoàng hôn, thành phố, sa mạc, mê cung, đấu trường, văn phòng, trên mây, dưới nước, trong bóng tối, trên đỉnh núi, trong rừng...
-4. ĐỒ VẬT ẨN DỤ: dây xích, đồng hồ cát, con rối, tảng đá, quả bóng, cánh cửa, gương soi, la bàn, chìa khóa, mê cung...
-5. CẢM XÚC rõ ràng: buồn, sợ, giận, ngạc nhiên, kiệt sức, cô đơn, tự tin, do dự...
-6. MÀU NHẤN: 1-2 màu (đỏ/xanh/cam/vàng) cho điểm quan trọng.
+Mô tả trong visual_prompt (tiếng Anh), bao gồm 4-5 yếu tố:
+1. NHÂN VẬT + TƯ THẾ: đứng, ngồi xổm, chạy, ngã, chỉ tay, ôm đầu, đứng giữa biển, đứng trên núi, bay lơ lửng, chui vào hộp, bị trói, đang bơi...
+2. HÀNH ĐỘNG: ký giấy, đóng dấu, bị kéo, gánh nặng, đang rơi, đang trốn...
+3. BỐI CẢNH: bãi biển hoàng hôn, thành phố, sa mạc, mê cung, đấu trường, văn phòng, trên mây, dưới nước, trong bóng tối...
+4. ĐỒ VẬT ẨN DỤ: dây xích, đồng hồ cát, con rối, tảng đá, cánh cửa, gương soi, la bàn...
+5. CẢM XÚC: buồn, sợ, giận, ngạc nhiên, kiệt sức, cô đơn, tự tin...
+6. MÀU NHẤN: 1-2 màu (đỏ/xanh/cam/vàng).
 
-VÍ DỤ TỐT (đa dạng bố cục):
+VÍ DỤ TỐT:
 - "2D comic doodle: a young man standing at the edge of a cliff at sunset, looking down at a vast ocean of papers below, red sunset, blue waves, white background, bold black outlines, no text"
-- "2D comic doodle: a man trapped inside a giant glass jar, hands pressing against the walls, other people watching from outside pointing, red accents on the jar edges, white background, no text"
-- "2D comic doodle: a man kneeling on the ground, carrying a mountain of heavy rocks on his back labeled with symbols, sweat drops, red spot color on the heaviest rock, white background, no text"
-- "2D comic doodle: a man running on a treadmill that is actually a giant clock, chains held by hands reaching from off-screen, red clock hands, white background, no text"
-- "2D comic doodle: a man standing on top of a giant question mark, surrounded by floating question mark bubbles, confused expression, blue and red accents, white background, no text"
-- "2D comic doodle: a man in a small boat on a stormy sea, holding an umbrella made of paper contracts, lightning above, blue waves and red lightning, white background, no text"
-- "2D comic doodle: a man in the center of a labyrinth of mirrors, his reflection shown in multiple distorted versions, red reflection accents, white background, no text"
+- "2D comic doodle: a man trapped inside a giant glass jar, hands pressing against the walls, other people watching from outside pointing, red accents, white background, no text"
+- "2D comic doodle: a man kneeling on the ground, carrying a mountain of heavy rocks on his back, sweat drops, red spot color on the heaviest rock, white background, no text"
 
-VÍ DỤ XẤU (bị cấm — vì lặp khuôn):
-- "a man sitting at a desk with papers on the left" ← lặp bố cục
-- "a waist-up man with contract papers and red arrow" ← khuôn cũ
+VÍ DỤ XẤU (bị cấm):
+- "a man sitting at a desk with papers on the left"
+- "a waist-up man with contract papers and red arrow"
 
-CÁC RÀNG BUỘC PHONG CÁCH (CHỈ về style, KHÔNG áp bố cục):
-- Phong cách: 2D comic doodle, nét mực đen dày, nét vẽ tay ngộ nghĩnh.
-- Nền: TRẮNG TINH hoặc có yếu tố bối cảnh đơn giản (biển, mây, sa mạc...).
-- KHÔNG chữ, KHÔNG số, KHÔNG bong bóng thoại rỗng (tool sẽ tự vẽ chữ overlay sau).
-- Có thể có bàn/đồ vật nếu phù hợp nội dung, KHÔNG bắt buộc.
+RÀNG BUỘC PHONG CÁCH (CHỈ về style):
+- 2D comic doodle, nét mực đen dày, nét vẽ tay ngộ nghĩnh.
+- Nền TRẮNG TINH hoặc bối cảnh đơn giản.
+- KHÔNG chữ, số, bong bóng thoại rỗng.
+- Có thể có bàn/đồ vật nếu phù hợp, KHÔNG bắt buộc.
 
 QUY TẮC CAMERA MOTION ("camera_motion"):
-Với mỗi cảnh, chọn MỘT kiểu chuyển động phù hợp với cảm xúc/nội dung:
-- "zoom_in_center": phóng to vào trung tâm (nhấn mạnh, gay cấn)
-- "zoom_out_center": thu nhỏ ra (giải tỏa, kết thúc)
-- "pan_left_to_right": lướt ngang trái→phải (giới thiệu, dẫn dắt)
-- "pan_right_to_left": lướt ngang phải→trái (hồi tưởng, quay lại)
-- "zoom_in_top_left": phóng to góc trên trái (tò mò, khám phá)
-- "zoom_in_bottom_right": phóng to góc dưới phải (chú ý chi tiết)
-- "ken_burns_slow": chuyển động chậm kết hợp pan + zoom (mơ màng)
-- "static": đứng yên (nhấn mạnh nội dung tĩnh)
-LUÂN PHIÊN, tránh lặp lại liên tiếp cùng một kiểu.
+Chọn MỘT kiểu phù hợp cảm xúc/nội dung:
+- "zoom_in_center", "zoom_out_center", "pan_left_to_right", "pan_right_to_left",
+- "zoom_in_top_left", "zoom_in_bottom_right", "ken_burns_slow", "static"
+LUÂN PHIÊN, tránh lặp liên tiếp.
 
-LUÔN LUÔN trả về đúng JSON.
+LUÔN trả về đúng JSON.
 
 JSON FORMAT:
 {{
@@ -339,7 +396,7 @@ JSON FORMAT:
       "title": "NỖI SỢ BỊ PHÁN XÉT",
       "callout_type": "thought", "callout_text": "TỚ ĐANG NGHĨ GÌ?", "callout_side": "right",
       "camera_motion": "zoom_in_center",
-      "visual_prompt": "2D comic doodle: a young man standing alone on a small floating island in the middle of a vast white void, giant floating eyes watching him from all directions, sweat drops, red accents on the eyes, pure white background, bold black outlines, no text"
+      "visual_prompt": "2D comic doodle: a young man standing alone on a small floating island in a vast white void, giant floating eyes watching him from all directions, sweat drops, red accents on the eyes, pure white background, bold black outlines, no text"
     }}
   ]
 }}
@@ -412,7 +469,7 @@ TRANSCRIPT:
             "visual_prompt": "2D comic doodle: a man standing at the edge of a cliff at sunset, looking down at a vast ocean of papers below, red sunset, blue waves, white background, bold black outlines, no text",
         }]
 
-    # Gộp cảnh ngắn tự động (< 17s)
+    # Gộp cảnh ngắn (< 17s)
     merged = []
     for s in clean:
         if not merged:
@@ -441,9 +498,7 @@ TRANSCRIPT:
         if dur > 35.0:
             mid = s["start"] + dur / 2.0
             final_scenes.append({
-                "start": s["start"],
-                "end": mid,
-                "title": s["title"],
+                "start": s["start"], "end": mid, "title": s["title"],
                 "callout_type": s.get("callout_type", "speech"),
                 "callout_text": s.get("callout_text", ""),
                 "callout_side": s.get("callout_side", "right"),
@@ -451,21 +506,16 @@ TRANSCRIPT:
                 "visual_prompt": s["visual_prompt"],
             })
             final_scenes.append({
-                "start": mid,
-                "end": s["end"],
-                "title": f"{s['title']} (TIẾP)",
-                "callout_type": "sticker",
-                "callout_text": "CẦN CẨN TRỌNG!",
-                "callout_side": "right",
-                "camera_motion": "zoom_out_center",
+                "start": mid, "end": s["end"], "title": f"{s['title']} (TIẾP)",
+                "callout_type": "sticker", "callout_text": "CẦN CẨN TRỌNG!",
+                "callout_side": "right", "camera_motion": "zoom_out_center",
                 "visual_prompt": s["visual_prompt"] + ", continuation scene, different angle, clean white background",
             })
         else:
             final_scenes.append(s)
 
-    # Nếu mode là "random", override camera_motion bằng random
+    # Override camera_motion nếu user chọn
     if camera_mode == "random":
-        import random
         motions_list = list(valid_motions - {"static"})
         for s in final_scenes:
             s["camera_motion"] = random.choice(motions_list)
@@ -481,7 +531,7 @@ TRANSCRIPT:
 # MULTI-PROVIDER IMAGE ENGINES
 # ============================================================
 def _build_full_prompt(prompt):
-    """Chỉ giữ style constraints, KHÔNG áp bố cục. Để AI tự do sáng tạo theo visual_prompt."""
+    """Chỉ giữ style constraints, KHÔNG áp bố cục."""
     safe = sanitize_prompt_text(prompt)
     return f"""{safe}.
 
@@ -496,7 +546,6 @@ STYLE CONSTRAINTS (chỉ về phong cách vẽ, KHÔNG áp bố cục):
 """
 
 def _validate_image_bytes(data, provider_name):
-    """Kiểm tra dữ liệu trả về có phải ảnh hợp lệ không."""
     if not data or len(data) < 500:
         raise RuntimeError(f"{provider_name}: dữ liệu quá nhỏ ({len(data) if data else 0} bytes)")
     if not (data[:3] == b'\xff\xd8\xff' or data[:8] == b'\x89PNG\r\n\x1a\n' or data[:4] == b'RIFF'):
@@ -514,9 +563,7 @@ def agnes_image_request(prompt, api_key, timeout=120):
     full_prompt = _build_full_prompt(prompt)
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {
-        "model": AGNES_MODEL,
-        "prompt": full_prompt,
-        "size": "1280x720",
+        "model": AGNES_MODEL, "prompt": full_prompt, "size": "1280x720",
         "extra_body": {"response_format": "b64_json"},
     }
     for attempt in range(1, 4):
@@ -524,8 +571,7 @@ def agnes_image_request(prompt, api_key, timeout=120):
             r = requests.post(AGNES_API_URL, headers=headers, json=payload, timeout=timeout)
             if r.status_code == 429:
                 if attempt < 3:
-                    time.sleep(5 * attempt)
-                    continue
+                    time.sleep(5 * attempt); continue
                 raise RuntimeError("Agnes AI: rate limit sau 3 lần thử")
             if r.status_code >= 400:
                 raise RuntimeError(f"Agnes AI HTTP {r.status_code}: {r.text[:300]}")
@@ -565,8 +611,7 @@ def cloudflare_image_request(prompt, account_id, api_token, timeout=120, steps=4
             r = requests.post(url, headers=headers, json=payload, timeout=timeout)
             if r.status_code == 429:
                 if attempt < 3:
-                    time.sleep(3 * attempt)
-                    continue
+                    time.sleep(3 * attempt); continue
                 raise RuntimeError("Cloudflare: hết quota 10k neurons/ngày")
             if r.status_code >= 400:
                 raise RuntimeError(f"Cloudflare HTTP {r.status_code}: {r.text[:300]}")
@@ -603,13 +648,11 @@ def hf_image_request(prompt, token, timeout=120):
             r = requests.post(url, headers=headers, json={"inputs": full_prompt}, timeout=timeout)
             if r.status_code == 503:
                 if attempt < 3:
-                    time.sleep(10 * attempt)
-                    continue
+                    time.sleep(10 * attempt); continue
                 raise RuntimeError("Hugging Face: model đang load, thử lại sau")
             if r.status_code == 429:
                 if attempt < 3:
-                    time.sleep(5 * attempt)
-                    continue
+                    time.sleep(5 * attempt); continue
                 raise RuntimeError("Hugging Face: hết quota miễn phí")
             if r.status_code >= 400:
                 raise RuntimeError(f"Hugging Face HTTP {r.status_code}: {r.text[:300]}")
@@ -640,8 +683,7 @@ def freetheai_image_request(prompt, api_key, timeout=120):
             r = requests.post(FREETHEAI_BASE, headers=headers, json=payload, timeout=timeout)
             if r.status_code == 429:
                 if attempt < 3:
-                    time.sleep(5 * attempt)
-                    continue
+                    time.sleep(5 * attempt); continue
                 raise RuntimeError("FreeTheAi: rate limit")
             if r.status_code >= 400:
                 raise RuntimeError(f"FreeTheAi HTTP {r.status_code}: {r.text[:300]}")
@@ -674,12 +716,8 @@ def together_image_request(prompt, api_key, timeout=120):
     full_prompt = _build_full_prompt(prompt)
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {
-        "model": TOGETHER_MODEL,
-        "prompt": full_prompt,
-        "width": WIDTH,
-        "height": HEIGHT,
-        "steps": 4,
-        "n": 1,
+        "model": TOGETHER_MODEL, "prompt": full_prompt,
+        "width": WIDTH, "height": HEIGHT, "steps": 4, "n": 1,
         "response_format": "b64_json",
     }
     for attempt in range(1, 4):
@@ -687,8 +725,7 @@ def together_image_request(prompt, api_key, timeout=120):
             r = requests.post(TOGETHER_BASE, headers=headers, json=payload, timeout=timeout)
             if r.status_code == 429:
                 if attempt < 3:
-                    time.sleep(5 * attempt)
-                    continue
+                    time.sleep(5 * attempt); continue
                 raise RuntimeError("Together AI: rate limit")
             if r.status_code >= 400:
                 raise RuntimeError(f"Together AI HTTP {r.status_code}: {r.text[:300]}")
@@ -726,8 +763,7 @@ def nexa_image_request(prompt, api_key, timeout=120):
             r = requests.post(NEXA_BASE, headers=headers, json=payload, timeout=timeout)
             if r.status_code == 429:
                 if attempt < 3:
-                    time.sleep(5 * attempt)
-                    continue
+                    time.sleep(5 * attempt); continue
                 raise RuntimeError("NexaAPI: rate limit")
             if r.status_code >= 400:
                 raise RuntimeError(f"NexaAPI HTTP {r.status_code}: {r.text[:300]}")
@@ -752,7 +788,7 @@ def nexa_image_request(prompt, api_key, timeout=120):
             else:
                 raise RuntimeError(f"NexaAPI lỗi: {e}")
 
-# --- 7. POLLINATIONS (anonymous fallback) ---
+# --- 7. POLLINATIONS ---
 def pollinations_image_request(prompt, timeout=120, seed=None):
     full_prompt = _build_full_prompt(prompt)
     encoded = requests.utils.quote(full_prompt, safe="")
@@ -765,8 +801,7 @@ def pollinations_image_request(prompt, timeout=120, seed=None):
             r = requests.get(url, params=params, timeout=timeout, headers={"Accept": "image/*"})
             if r.status_code == 429:
                 if attempt < 2:
-                    time.sleep(15)
-                    continue
+                    time.sleep(15); continue
                 raise RuntimeError("Pollinations: rate limit 15s")
             if r.status_code >= 400:
                 raise RuntimeError(f"Pollinations HTTP {r.status_code}: {r.text[:200]}")
@@ -788,7 +823,6 @@ def pollinations_image_request(prompt, timeout=120, seed=None):
 # FALLBACK ORCHESTRATOR
 # ============================================================
 def generate_image_with_fallback(prompt, provider_configs, timeout=120, seed=None):
-    """Thử từng nhà cung cấp theo thứ tự ưu tiên. Trả về (image_bytes, provider_name)."""
     errors = []
     for cfg in provider_configs:
         name = cfg["name"]
@@ -800,23 +834,19 @@ def generate_image_with_fallback(prompt, provider_configs, timeout=120, seed=Non
             if data and len(data) > 500:
                 return data, name
         except Exception as e:
-            err_msg = str(e)[:200]
-            errors.append(f"{name}: {err_msg}")
+            errors.append(f"{name}: {str(e)[:200]}")
             continue
-
-    error_summary = "\n".join(f"• {e}" for e in errors) if errors else "Không có nhà cung cấp nào được cấu hình"
+    error_summary = "\n".join(f"• {e}" for e in errors) if errors else "Không có nhà cung cấp nào"
     raise RuntimeError(f"Tất cả nhà cung cấp đều thất bại:\n{error_summary}")
 
 def build_provider_list(cf_account, cf_token, hf_token, freetheai_key,
                          together_key, nexa_key, agnes_key, flux_steps=4):
-    """Xây dựng danh sách nhà cung cấp theo thứ tự ưu tiên, chỉ gồm những cái có key."""
     providers = []
     if agnes_key and agnes_key.strip():
         providers.append({"name": "Agnes AI", "fn": agnes_image_request, "args": [agnes_key.strip()]})
     if cf_account and cf_token and cf_account.strip() and cf_token.strip():
         providers.append({
-            "name": "Cloudflare",
-            "fn": cloudflare_image_request,
+            "name": "Cloudflare", "fn": cloudflare_image_request,
             "args": [cf_account.strip(), cf_token.strip()],
             "kwargs": {"steps": flux_steps},
         })
@@ -828,18 +858,13 @@ def build_provider_list(cf_account, cf_token, hf_token, freetheai_key,
         providers.append({"name": "Together AI", "fn": together_image_request, "args": [together_key.strip()]})
     if nexa_key and nexa_key.strip():
         providers.append({"name": "NexaAPI", "fn": nexa_image_request, "args": [nexa_key.strip()]})
-    # Pollinations luôn có sẵn làm fallback cuối cùng
     providers.append({
-        "name": "Pollinations (anonymous)",
-        "fn": pollinations_image_request,
-        "args": [],
-        "kwargs": {"seed": None},
-        "supports_seed": ["seed"],
+        "name": "Pollinations (anonymous)", "fn": pollinations_image_request,
+        "args": [], "kwargs": {"seed": None}, "supports_seed": ["seed"],
     })
     return providers
 
 def save_image_from_bytes(data, output_path):
-    """Lưu bytes ảnh vào file, resize về chuẩn video."""
     if not data:
         raise RuntimeError("Dữ liệu ảnh rỗng (None/empty)")
     Path(output_path).write_bytes(data)
@@ -873,9 +898,9 @@ def add_comic_overlays(image_path, title, callout_type, callout_text, callout_si
     img = Image.open(image_path).convert("RGB").resize((WIDTH, HEIGHT))
     draw = ImageDraw.Draw(img)
 
+    # Vẽ title vào band 95px (sẽ được tách ra và giữ cố định khi render)
     if title:
-        band_h = 95
-        draw.rectangle([0, 0, WIDTH, band_h], fill="white")
+        draw.rectangle([0, 0, WIDTH, TITLE_BAND_H], fill="white")
         SAFE_TITLE_WIDTH = 850
         f_size = 36
         f_title = font_for(f_size)
@@ -894,9 +919,9 @@ def add_comic_overlays(image_path, title, callout_type, callout_text, callout_si
         bb = draw.textbbox((0, 0), callout_text, font=f_text)
         bw, bh = bb[2] - bb[0], bb[3] - bb[1]
         if callout_side == "left":
-            cx, cy = int(WIDTH * 0.28), int(HEIGHT * 0.35)
+            cx, cy = int(WIDTH * 0.28), int(HEIGHT * 0.40)
         else:
-            cx, cy = int(WIDTH * 0.74), int(HEIGHT * 0.32)
+            cx, cy = int(WIDTH * 0.74), int(HEIGHT * 0.38)
 
         if callout_type == "speech":
             pad_x, pad_y = 18, 12
@@ -925,7 +950,7 @@ def add_comic_overlays(image_path, title, callout_type, callout_text, callout_si
     img.save(output_path, quality=95)
 
 # ============================================================
-# BÀN TAY & TRIỆT TIÊU BÓNG MỜ (GIỮ NGUYÊN)
+# BÀN TAY & TRIỆT TIÊU BÓNG MỜ
 # ============================================================
 def generate_fallback_hand():
     S = 320
@@ -959,7 +984,6 @@ def load_hand_asset(hand_path, target_width=320):
     bgr = cv2.cvtColor(hand_np[:, :, :3], cv2.COLOR_RGB2BGR)
     alpha = hand_np[:, :, 3]
 
-    # Khử bóng mờ hình chữ nhật
     alpha[:6, :] = 0
     alpha[-6:, :] = 0
     alpha[:, :6] = 0
@@ -1016,10 +1040,10 @@ def extract_continuous_trajectory(image_path):
     _, binary = cv2.threshold(gray, 225, 255, cv2.THRESH_BINARY_INV)
 
     title_mask = np.zeros_like(binary)
-    title_mask[:95, :] = binary[:95, :]
+    title_mask[:TITLE_BAND_H, :] = binary[:TITLE_BAND_H, :]
 
     body_mask = np.zeros_like(binary)
-    body_mask[95:, :] = binary[95:, :]
+    body_mask[TITLE_BAND_H:, :] = binary[TITLE_BAND_H:, :]
 
     t_cnts, _ = cv2.findContours(title_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     b_cnts, _ = cv2.findContours(body_mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
@@ -1045,13 +1069,13 @@ def extract_staggered_trajectories(image_path):
     _, binary = cv2.threshold(gray, 225, 255, cv2.THRESH_BINARY_INV)
 
     m_title = np.zeros_like(binary)
-    m_title[:95, :] = binary[:95, :]
+    m_title[:TITLE_BAND_H, :] = binary[:TITLE_BAND_H, :]
 
     m_left = np.zeros_like(binary)
-    m_left[95:HEIGHT, :int(WIDTH * 0.48)] = binary[95:HEIGHT, :int(WIDTH * 0.48)]
+    m_left[TITLE_BAND_H:HEIGHT, :int(WIDTH * 0.48)] = binary[TITLE_BAND_H:HEIGHT, :int(WIDTH * 0.48)]
 
     m_right_char = np.zeros_like(binary)
-    m_right_char[95:int(HEIGHT * 0.72), int(WIDTH * 0.48):] = binary[95:int(HEIGHT * 0.72), int(WIDTH * 0.48):]
+    m_right_char[TITLE_BAND_H:int(HEIGHT * 0.72), int(WIDTH * 0.48):] = binary[TITLE_BAND_H:int(HEIGHT * 0.72), int(WIDTH * 0.48):]
 
     m_bottom_badge = np.zeros_like(binary)
     m_bottom_badge[int(HEIGHT * 0.72):, int(WIDTH * 0.48):] = binary[int(HEIGHT * 0.72):, int(WIDTH * 0.48):]
@@ -1104,35 +1128,36 @@ def ease_in_out(t):
 # CAMERA MOTION PRESETS
 # ============================================================
 def get_motion_keyframes(motion):
-    """Trả về list keyframes: (t, scale, cx, cy). t từ 0.0 → 1.0."""
+    """Trả về list keyframes: (t, scale, cx, cy). t từ 0.0 → 1.0.
+    cx, cy trong hệ tọa độ 1280x720, sẽ được scale về CONTENT_H khi dùng."""
     presets = {
         "zoom_in_center": [
             (0.0, 1.00, WIDTH * 0.50, HEIGHT * 0.50),
-            (1.0, 1.28, WIDTH * 0.50, HEIGHT * 0.50),
+            (1.0, 1.22, WIDTH * 0.50, HEIGHT * 0.50),
         ],
         "zoom_out_center": [
-            (0.0, 1.28, WIDTH * 0.50, HEIGHT * 0.50),
+            (0.0, 1.22, WIDTH * 0.50, HEIGHT * 0.50),
             (1.0, 1.00, WIDTH * 0.50, HEIGHT * 0.50),
         ],
         "pan_left_to_right": [
-            (0.0, 1.18, WIDTH * 0.30, HEIGHT * 0.50),
-            (1.0, 1.18, WIDTH * 0.70, HEIGHT * 0.50),
+            (0.0, 1.12, WIDTH * 0.35, HEIGHT * 0.50),
+            (1.0, 1.12, WIDTH * 0.65, HEIGHT * 0.50),
         ],
         "pan_right_to_left": [
-            (0.0, 1.18, WIDTH * 0.70, HEIGHT * 0.50),
-            (1.0, 1.18, WIDTH * 0.30, HEIGHT * 0.50),
+            (0.0, 1.12, WIDTH * 0.65, HEIGHT * 0.50),
+            (1.0, 1.12, WIDTH * 0.35, HEIGHT * 0.50),
         ],
         "zoom_in_top_left": [
             (0.0, 1.00, WIDTH * 0.50, HEIGHT * 0.50),
-            (1.0, 1.30, WIDTH * 0.28, HEIGHT * 0.28),
+            (1.0, 1.24, WIDTH * 0.30, HEIGHT * 0.35),
         ],
         "zoom_in_bottom_right": [
             (0.0, 1.00, WIDTH * 0.50, HEIGHT * 0.50),
-            (1.0, 1.30, WIDTH * 0.72, HEIGHT * 0.72),
+            (1.0, 1.24, WIDTH * 0.70, HEIGHT * 0.65),
         ],
         "ken_burns_slow": [
-            (0.0, 1.08, WIDTH * 0.42, HEIGHT * 0.44),
-            (1.0, 1.24, WIDTH * 0.58, HEIGHT * 0.56),
+            (0.0, 1.05, WIDTH * 0.45, HEIGHT * 0.48),
+            (1.0, 1.18, WIDTH * 0.55, HEIGHT * 0.52),
         ],
         "static": [
             (0.0, 1.00, WIDTH * 0.50, HEIGHT * 0.50),
@@ -1142,7 +1167,6 @@ def get_motion_keyframes(motion):
     return presets.get(motion, presets["zoom_in_center"])
 
 def interpolate_motion(keyframes, p):
-    """Nội suy scale, cx, cy tại tiến độ p (0..1)."""
     if p <= keyframes[0][0]:
         _, s, cx, cy = keyframes[0]
         return s, cx, cy
@@ -1162,54 +1186,50 @@ def interpolate_motion(keyframes, p):
     _, s, cx, cy = keyframes[-1]
     return s, cx, cy
 
-def crop_with_motion(frame_bgr, scale, cx, cy):
-    """Crop và resize frame theo scale + tâm (cx, cy), có clamp."""
-    crop_w = int(WIDTH / scale)
-    crop_h = int(HEIGHT / scale)
-    x1 = max(0, min(WIDTH - crop_w, int(cx - crop_w / 2)))
-    y1 = max(0, min(HEIGHT - crop_h, int(cy - crop_h / 2)))
-    crop = frame_bgr[y1:y1 + crop_h, x1:x1 + crop_w]
-    return cv2.resize(crop, (WIDTH, HEIGHT), interpolation=cv2.INTER_LINEAR)
-
 # ============================================================
-# 4 HÀM RENDER SCENE (NÂNG CẤP CAMERA MOTION)
+# RENDER SCENES (V4: TITLE BAND + 3-PHASE DRAWING + WIDE START)
 # ============================================================
 def render_scene_kttv_v2(image_path, duration, output_path, hand_path, motion="zoom_in_center"):
+    """Phong cách 1: Vẽ tuần tự 3 phase + Camera motion sau khi vẽ xong."""
     total_frames = max(1, round(duration * FPS))
-    draw_duration = max(2.0, min(duration - 1.5, duration * 0.75))
+    draw_duration = max(1.5, min(duration - 0.8, duration * DRAW_DURATION_RATIO))
     draw_frames = int(draw_duration * FPS)
-    retract_frames = int(0.5 * FPS)
+    retract_frames = int(0.35 * FPS)
 
-    original_bgr = cv2.imread(str(image_path))
-    if original_bgr is None:
+    original_full = cv2.imread(str(image_path))
+    if original_full is None:
         raise RuntimeError(f"Không đọc được file ảnh: {image_path}")
-    original_bgr = cv2.resize(original_bgr, (WIDTH, HEIGHT))
-    white_canvas = np.full_like(original_bgr, 255)
-    reveal_mask = np.zeros((HEIGHT, WIDTH), dtype=np.uint8)
+    original_full = cv2.resize(original_full, (WIDTH, HEIGHT))
+    title_band, content_bgr = split_title_band(original_full)
+
+    white_content = np.full_like(content_bgr, 255)
+    reveal_mask = np.zeros((CONTENT_H, WIDTH), dtype=np.uint8)
 
     zone_trajectories = extract_staggered_trajectories(image_path)
-    all_points = [p for z in zone_trajectories for p in z]
-    if not all_points:
-        all_points = [(WIDTH // 2, HEIGHT // 2)]
+    all_points_full = [p for z in zone_trajectories for p in z]
+    if not all_points_full:
+        all_points_full = [(WIDTH // 2, HEIGHT // 2)]
+    all_points = trajectory_to_content_space(all_points_full)
+    phases = split_trajectory_into_phases(all_points)
+
+    # Tính frame boundary cho từng phase
+    phase_frames = [
+        int(draw_frames * PHASE_RATIOS[0]),
+        int(draw_frames * (PHASE_RATIOS[0] + PHASE_RATIOS[1])),
+        draw_frames,
+    ]
 
     hand_bgr, hand_alpha, tip_x, tip_y = load_hand_asset(hand_path, target_width=320)
 
     cmd = [
-        "ffmpeg", "-y",
-        "-f", "rawvideo",
-        "-vcodec", "rawvideo",
-        "-s", f"{WIDTH}x{HEIGHT}",
-        "-pix_fmt", "bgr24",
-        "-r", str(FPS),
-        "-i", "-",
-        "-an", "-c:v", "libx264", "-preset", "veryfast",
-        "-pix_fmt", "yuv420p",
-        str(output_path),
+        "ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
+        "-s", f"{WIDTH}x{HEIGHT}", "-pix_fmt", "bgr24", "-r", str(FPS),
+        "-i", "-", "-an", "-c:v", "libx264", "-preset", "veryfast",
+        "-pix_fmt", "yuv420p", str(output_path),
     ]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
-    last_tip = all_points[0]
-    smooth_cx = float(last_tip[0])
+    last_tip = all_points[0] if all_points else (WIDTH // 2, CONTENT_H // 2)
     motion_kfs = get_motion_keyframes(motion)
 
     for f_idx in range(total_frames):
@@ -1217,60 +1237,69 @@ def render_scene_kttv_v2(image_path, duration, output_path, hand_path, motion="z
         hand_pos_x, hand_pos_y = 0, 0
 
         if f_idx < draw_frames:
-            curr_idx = int((f_idx + 1) / draw_frames * len(all_points))
-            prev_idx = int(f_idx / draw_frames * len(all_points))
-            step_pts = all_points[prev_idx:curr_idx]
+            # Xác định phase hiện tại
+            if f_idx < phase_frames[0]:
+                current_phase = 0
+                local_p = f_idx / max(1, phase_frames[0])
+            elif f_idx < phase_frames[1]:
+                current_phase = 1
+                local_p = (f_idx - phase_frames[0]) / max(1, phase_frames[1] - phase_frames[0])
+            else:
+                current_phase = 2
+                local_p = (f_idx - phase_frames[1]) / max(1, phase_frames[2] - phase_frames[1])
 
-            for pt in step_pts:
-                cv2.circle(reveal_mask, pt, 24, 255, -1)
+            # Vẽ tất cả phase đã hoàn thành
+            for p_i in range(current_phase):
+                for pt in phases[p_i]:
+                    cv2.circle(reveal_mask, pt, REVEAL_RADIUS, 255, -1)
 
-            target_pt = step_pts[-1] if step_pts else all_points[min(curr_idx, len(all_points) - 1)]
-            jitter_x = int(1.2 * math.sin(f_idx * 1.8))
-            jitter_y = int(1.2 * math.cos(f_idx * 1.8))
-            hand_pos_x = target_pt[0] + jitter_x
-            hand_pos_y = target_pt[1] + jitter_y
+            # Vẽ phase hiện tại theo local_p
+            current_pts = phases[current_phase]
+            if current_pts:
+                count = max(1, int(local_p * len(current_pts)))
+                count = min(count, len(current_pts))
+                for pt in current_pts[:count]:
+                    cv2.circle(reveal_mask, pt, REVEAL_RADIUS, 255, -1)
+                target_pt = current_pts[count - 1]
+            else:
+                target_pt = last_tip
+
+            hand_pos_x = target_pt[0] + int(1.2 * math.sin(f_idx * 1.8))
+            hand_pos_y = target_pt[1] + int(1.2 * math.cos(f_idx * 1.8))
             last_tip = (hand_pos_x, hand_pos_y)
             hand_visible = True
         elif f_idx < draw_frames + retract_frames:
             reveal_mask[:, :] = 255
             prog = (f_idx - draw_frames) / max(1, retract_frames)
             hand_pos_x = int(last_tip[0] + (WIDTH + 180 - last_tip[0]) * prog)
-            hand_pos_y = int(last_tip[1] + (HEIGHT + 180 - last_tip[1]) * prog)
+            hand_pos_y = int(last_tip[1] + (CONTENT_H + 180 - last_tip[1]) * prog)
             hand_visible = True
         else:
             reveal_mask[:, :] = 255
 
         blur = cv2.GaussianBlur(reveal_mask, (13, 13), 0)
         alpha = (blur.astype(np.float32) / 255.0)[:, :, None]
-        frame_world = (original_bgr * alpha + white_canvas * (1.0 - alpha)).astype(np.uint8)
+        frame_content = (content_bgr * alpha + white_content * (1.0 - alpha)).astype(np.uint8)
 
         if hand_visible:
-            paste_hand(frame_world, hand_bgr, hand_alpha, hand_pos_x - tip_x, hand_pos_y - tip_y)
+            paste_hand(frame_content, hand_bgr, hand_alpha, hand_pos_x - tip_x, hand_pos_y - tip_y)
 
-        # Camera motion: áp dụng sau khi vẽ xong
-        if f_idx < draw_frames:
-            # Trong lúc vẽ, giữ camera zoom nhẹ để xem nét vẽ
-            scale = 1.20
-            smooth_cx = smooth_cx * 0.94 + hand_pos_x * 0.06
-            cy_use = HEIGHT * 0.5
-            cx_use = smooth_cx
+        # Camera: wide shot trong lúc vẽ, zoom sau khi vẽ xong
+        if f_idx < draw_frames + retract_frames:
+            scale = 1.0
+            cx_use = WIDTH * 0.5
+            cy_use = CONTENT_H * 0.5
         else:
-            # Sau khi vẽ xong, áp dụng camera motion preset
-            out_prog = (f_idx - draw_frames) / max(1, total_frames - draw_frames)
-            s_target, cx_target, cy_target = interpolate_motion(motion_kfs, out_prog)
-            # Nội suy từ trạng thái vẽ (scale 1.20, cx=smooth_cx) về trạng thái motion
-            blend = ease_in_out(min(1.0, out_prog * 1.5))
-            scale = 1.20 + (s_target - 1.20) * blend
-            cx_use = smooth_cx + (cx_target - smooth_cx) * blend
-            cy_use = HEIGHT * 0.5 + (cy_target - HEIGHT * 0.5) * blend
+            out_prog = (f_idx - draw_frames - retract_frames) / max(1, total_frames - draw_frames - retract_frames)
+            s_target, cx_target, cy_target_full = interpolate_motion(motion_kfs, out_prog)
+            cy_target_content = (cy_target_full / HEIGHT) * CONTENT_H
+            blend = ease_in_out(min(1.0, out_prog * 1.8))
+            scale = 1.0 + (s_target - 1.0) * blend
+            cx_use = WIDTH * 0.5 + (cx_target - WIDTH * 0.5) * blend
+            cy_use = CONTENT_H * 0.5 + (cy_target_content - CONTENT_H * 0.5) * blend
 
-        crop_w = int(WIDTH / scale)
-        crop_h = int(HEIGHT / scale)
-        x1 = max(0, min(WIDTH - crop_w, int(cx_use - crop_w / 2)))
-        y1 = max(0, min(HEIGHT - crop_h, int(cy_use - crop_h / 2)))
-
-        crop = frame_world[y1:y1 + crop_h, x1:x1 + crop_w]
-        frame_out = cv2.resize(crop, (WIDTH, HEIGHT), interpolation=cv2.INTER_LINEAR)
+        frame_content_out = crop_content_with_motion(frame_content, scale, cx_use, cy_use)
+        frame_out = compose_frame(title_band, frame_content_out)
         proc.stdin.write(frame_out.tobytes())
 
     proc.stdin.close()
@@ -1279,37 +1308,42 @@ def render_scene_kttv_v2(image_path, duration, output_path, hand_path, motion="z
         raise RuntimeError("FFmpeg render thất bại (Chế độ 1)")
 
 def render_scene_hybrid(image_path, duration, output_path, hand_path, motion="zoom_in_center"):
+    """Phong cách 2: Tay vẽ bám nét + Camera steadicam + 3 phase."""
     total_frames = max(1, round(duration * FPS))
-    draw_duration = max(2.0, min(duration - 1.5, duration * 0.72))
+    draw_duration = max(1.5, min(duration - 0.8, duration * DRAW_DURATION_RATIO))
     draw_frames = int(draw_duration * FPS)
-    retract_frames = int(0.5 * FPS)
+    retract_frames = int(0.35 * FPS)
 
-    original_bgr = cv2.imread(str(image_path))
-    if original_bgr is None:
+    original_full = cv2.imread(str(image_path))
+    if original_full is None:
         raise RuntimeError(f"Không đọc được file ảnh: {image_path}")
-    original_bgr = cv2.resize(original_bgr, (WIDTH, HEIGHT))
-    white_canvas = np.full_like(original_bgr, 255)
-    reveal_mask = np.zeros((HEIGHT, WIDTH), dtype=np.uint8)
+    original_full = cv2.resize(original_full, (WIDTH, HEIGHT))
+    title_band, content_bgr = split_title_band(original_full)
 
-    trajectory = extract_continuous_trajectory(image_path)
+    white_content = np.full_like(content_bgr, 255)
+    reveal_mask = np.zeros((CONTENT_H, WIDTH), dtype=np.uint8)
+
+    trajectory_full = extract_continuous_trajectory(image_path)
+    trajectory = trajectory_to_content_space(trajectory_full)
+    phases = split_trajectory_into_phases(trajectory)
+
+    phase_frames = [
+        int(draw_frames * PHASE_RATIOS[0]),
+        int(draw_frames * (PHASE_RATIOS[0] + PHASE_RATIOS[1])),
+        draw_frames,
+    ]
+
     hand_bgr, hand_alpha, tip_x, tip_y = load_hand_asset(hand_path, target_width=320)
 
     cmd = [
-        "ffmpeg", "-y",
-        "-f", "rawvideo",
-        "-vcodec", "rawvideo",
-        "-s", f"{WIDTH}x{HEIGHT}",
-        "-pix_fmt", "bgr24",
-        "-r", str(FPS),
-        "-i", "-",
-        "-an", "-c:v", "libx264", "-preset", "veryfast",
-        "-pix_fmt", "yuv420p",
-        str(output_path),
+        "ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
+        "-s", f"{WIDTH}x{HEIGHT}", "-pix_fmt", "bgr24", "-r", str(FPS),
+        "-i", "-", "-an", "-c:v", "libx264", "-preset", "veryfast",
+        "-pix_fmt", "yuv420p", str(output_path),
     ]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
-    last_tip = trajectory[0] if trajectory else (WIDTH // 2, HEIGHT // 2)
-    smooth_cx, smooth_cy = float(last_tip[0]), float(last_tip[1])
+    last_tip = trajectory[0] if trajectory else (WIDTH // 2, CONTENT_H // 2)
     motion_kfs = get_motion_keyframes(motion)
 
     for f_idx in range(total_frames):
@@ -1317,56 +1351,65 @@ def render_scene_hybrid(image_path, duration, output_path, hand_path, motion="zo
         hand_pos_x, hand_pos_y = 0, 0
 
         if f_idx < draw_frames:
-            curr_idx = int((f_idx + 1) / draw_frames * len(trajectory))
-            prev_idx = int(f_idx / draw_frames * len(trajectory))
-            step_pts = trajectory[prev_idx:curr_idx]
+            if f_idx < phase_frames[0]:
+                current_phase = 0
+                local_p = f_idx / max(1, phase_frames[0])
+            elif f_idx < phase_frames[1]:
+                current_phase = 1
+                local_p = (f_idx - phase_frames[0]) / max(1, phase_frames[1] - phase_frames[0])
+            else:
+                current_phase = 2
+                local_p = (f_idx - phase_frames[1]) / max(1, phase_frames[2] - phase_frames[1])
 
-            for pt in step_pts:
-                cv2.circle(reveal_mask, pt, 24, 255, -1)
+            for p_i in range(current_phase):
+                for pt in phases[p_i]:
+                    cv2.circle(reveal_mask, pt, REVEAL_RADIUS, 255, -1)
 
-            target_pt = step_pts[-1] if step_pts else trajectory[min(curr_idx, len(trajectory) - 1)]
-            jitter_x = int(1.2 * math.sin(f_idx * 1.8))
-            jitter_y = int(1.2 * math.cos(f_idx * 1.8))
-            hand_pos_x = target_pt[0] + jitter_x
-            hand_pos_y = target_pt[1] + jitter_y
+            current_pts = phases[current_phase]
+            if current_pts:
+                count = max(1, int(local_p * len(current_pts)))
+                count = min(count, len(current_pts))
+                for pt in current_pts[:count]:
+                    cv2.circle(reveal_mask, pt, REVEAL_RADIUS, 255, -1)
+                target_pt = current_pts[count - 1]
+            else:
+                target_pt = last_tip
+
+            hand_pos_x = target_pt[0] + int(1.2 * math.sin(f_idx * 1.8))
+            hand_pos_y = target_pt[1] + int(1.2 * math.cos(f_idx * 1.8))
             last_tip = (hand_pos_x, hand_pos_y)
             hand_visible = True
         elif f_idx < draw_frames + retract_frames:
             reveal_mask[:, :] = 255
             prog = (f_idx - draw_frames) / max(1, retract_frames)
             hand_pos_x = int(last_tip[0] + (WIDTH + 180 - last_tip[0]) * prog)
-            hand_pos_y = int(last_tip[1] + (HEIGHT + 180 - last_tip[1]) * prog)
+            hand_pos_y = int(last_tip[1] + (CONTENT_H + 180 - last_tip[1]) * prog)
             hand_visible = True
         else:
             reveal_mask[:, :] = 255
 
         blur = cv2.GaussianBlur(reveal_mask, (13, 13), 0)
         alpha = (blur.astype(np.float32) / 255.0)[:, :, None]
-        frame_world = (original_bgr * alpha + white_canvas * (1.0 - alpha)).astype(np.uint8)
+        frame_content = (content_bgr * alpha + white_content * (1.0 - alpha)).astype(np.uint8)
 
         if hand_visible:
-            paste_hand(frame_world, hand_bgr, hand_alpha, hand_pos_x - tip_x, hand_pos_y - tip_y)
+            paste_hand(frame_content, hand_bgr, hand_alpha, hand_pos_x - tip_x, hand_pos_y - tip_y)
 
-        if f_idx < draw_frames:
-            scale = 1.20
-            smooth_cx = smooth_cx * 0.95 + hand_pos_x * 0.05
-            smooth_cy = smooth_cy * 0.95 + hand_pos_y * 0.05
-            cx_use, cy_use = smooth_cx, smooth_cy
+        if f_idx < draw_frames + retract_frames:
+            scale = 1.0
+            cx_use = WIDTH * 0.5
+            cy_use = CONTENT_H * 0.5
         else:
-            out_prog = (f_idx - draw_frames) / max(1, total_frames - draw_frames)
-            s_target, cx_target, cy_target = interpolate_motion(motion_kfs, out_prog)
-            blend = ease_in_out(min(1.0, out_prog * 1.5))
-            scale = 1.20 + (s_target - 1.20) * blend
-            cx_use = smooth_cx + (cx_target - smooth_cx) * blend
-            cy_use = smooth_cy + (cy_target - smooth_cy) * blend
+            out_prog = (f_idx - draw_frames - retract_frames) / max(1, total_frames - draw_frames - retract_frames)
+            s_target, cx_target, cy_target_full = interpolate_motion(motion_kfs, out_prog)
+            cy_target_content = (cy_target_full / HEIGHT) * CONTENT_H
+            blend = ease_in_out(min(1.0, out_prog * 1.8))
+            scale = 1.0 + (s_target - 1.0) * blend
+            cx_use = WIDTH * 0.5 + (cx_target - WIDTH * 0.5) * blend
+            cy_use = CONTENT_H * 0.5 + (cy_target_content - CONTENT_H * 0.5) * blend
 
-        crop_w = int(WIDTH / scale)
-        crop_h = int(HEIGHT / scale)
-        x1 = max(0, min(WIDTH - crop_w, int(cx_use - crop_w / 2)))
-        y1 = max(0, min(HEIGHT - crop_h, int(cy_use - crop_h / 2)))
-
-        crop = frame_world[y1:y1 + crop_h, x1:x1 + crop_w]
-        frame_out = cv2.resize(crop, (WIDTH, HEIGHT), interpolation=cv2.INTER_LINEAR)
+        frame_content_out = crop_content_with_motion(frame_content, scale, cx_use, cy_use)
+        frame_out = compose_frame(title_band, frame_content_out)
         proc.stdin.write(frame_out.tobytes())
 
     proc.stdin.close()
@@ -1375,83 +1418,112 @@ def render_scene_hybrid(image_path, duration, output_path, hand_path, motion="zo
         raise RuntimeError("FFmpeg render thất bại (Chế độ 2)")
 
 def render_scene_kttv_pure(image_path, duration, output_path, motion="zoom_in_center"):
+    """Phong cách 3: Chỉ camera pan/zoom, không vẽ tay."""
     total_frames = max(1, round(duration * FPS))
-    original_bgr = cv2.resize(cv2.imread(str(image_path)), (WIDTH, HEIGHT))
+    original_full = cv2.resize(cv2.imread(str(image_path)), (WIDTH, HEIGHT))
+    title_band, content_bgr = split_title_band(original_full)
 
     cmd = [
         "ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
         "-s", f"{WIDTH}x{HEIGHT}", "-pix_fmt", "bgr24", "-r", str(FPS),
-        "-i", "-", "-an", "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", str(output_path),
+        "-i", "-", "-an", "-c:v", "libx264", "-preset", "veryfast",
+        "-pix_fmt", "yuv420p", str(output_path),
     ]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-
     motion_kfs = get_motion_keyframes(motion)
 
     for f_idx in range(total_frames):
         p = f_idx / max(1, total_frames - 1)
-        scale, cx, cy = interpolate_motion(motion_kfs, p)
-        crop_w = int(WIDTH / scale)
-        crop_h = int(HEIGHT / scale)
-        x1 = max(0, min(WIDTH - crop_w, int(cx - crop_w / 2)))
-        y1 = max(0, min(HEIGHT - crop_h, int(cy - crop_h / 2)))
-        crop = original_bgr[y1:y1 + crop_h, x1:x1 + crop_w]
-        frame = cv2.resize(crop, (WIDTH, HEIGHT), interpolation=cv2.INTER_LINEAR)
-        proc.stdin.write(frame.tobytes())
+        scale, cx, cy_full = interpolate_motion(motion_kfs, p)
+        cy = (cy_full / HEIGHT) * CONTENT_H
+        frame_content_out = crop_content_with_motion(content_bgr, scale, cx, cy)
+        frame_out = compose_frame(title_band, frame_content_out)
+        proc.stdin.write(frame_out.tobytes())
 
     proc.stdin.close()
     proc.wait()
 
 def render_scene_classic_hand(image_path, duration, output_path, hand_path, motion="zoom_in_center"):
+    """Phong cách 4: Bảng trắng cổ điển, góc máy tĩnh + 3 phase."""
     total_frames = max(1, round(duration * FPS))
-    draw_frames = int(max(2.0, min(duration - 1.0, duration * 0.75)) * FPS)
-    retract_frames = int(0.5 * FPS)
-    original_bgr = cv2.resize(cv2.imread(str(image_path)), (WIDTH, HEIGHT))
-    white_canvas = np.full_like(original_bgr, 255)
-    reveal_mask = np.zeros((HEIGHT, WIDTH), dtype=np.uint8)
+    draw_frames = int(max(1.5, min(duration - 0.8, duration * DRAW_DURATION_RATIO)) * FPS)
+    retract_frames = int(0.35 * FPS)
 
-    trajectory = extract_continuous_trajectory(image_path)
+    original_full = cv2.resize(cv2.imread(str(image_path)), (WIDTH, HEIGHT))
+    title_band, content_bgr = split_title_band(original_full)
+    white_content = np.full_like(content_bgr, 255)
+    reveal_mask = np.zeros((CONTENT_H, WIDTH), dtype=np.uint8)
+
+    trajectory_full = extract_continuous_trajectory(image_path)
+    trajectory = trajectory_to_content_space(trajectory_full)
+    phases = split_trajectory_into_phases(trajectory)
+
+    phase_frames = [
+        int(draw_frames * PHASE_RATIOS[0]),
+        int(draw_frames * (PHASE_RATIOS[0] + PHASE_RATIOS[1])),
+        draw_frames,
+    ]
+
     hand_bgr, hand_alpha, tip_x, tip_y = load_hand_asset(hand_path)
 
     cmd = [
         "ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
         "-s", f"{WIDTH}x{HEIGHT}", "-pix_fmt", "bgr24", "-r", str(FPS),
-        "-i", "-", "-an", "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", str(output_path),
+        "-i", "-", "-an", "-c:v", "libx264", "-preset", "veryfast",
+        "-pix_fmt", "yuv420p", str(output_path),
     ]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-    last_tip = trajectory[0] if trajectory else (WIDTH // 2, HEIGHT // 2)
+    last_tip = trajectory[0] if trajectory else (WIDTH // 2, CONTENT_H // 2)
 
     for f_idx in range(total_frames):
         hand_visible = False
         if f_idx < draw_frames:
-            curr_idx = int((f_idx + 1) / draw_frames * len(trajectory))
-            prev_idx = int(f_idx / draw_frames * len(trajectory))
-            step_pts = trajectory[prev_idx:curr_idx]
-            for pt in step_pts:
-                cv2.circle(reveal_mask, pt, 24, 255, -1)
-            target_pt = step_pts[-1] if step_pts else trajectory[min(curr_idx, len(trajectory) - 1)]
-            jitter_x = int(1.2 * math.sin(f_idx * 1.8))
-            jitter_y = int(1.2 * math.cos(f_idx * 1.8))
-            hand_pos_x = target_pt[0] + jitter_x
-            hand_pos_y = target_pt[1] + jitter_y
+            if f_idx < phase_frames[0]:
+                current_phase = 0
+                local_p = f_idx / max(1, phase_frames[0])
+            elif f_idx < phase_frames[1]:
+                current_phase = 1
+                local_p = (f_idx - phase_frames[0]) / max(1, phase_frames[1] - phase_frames[0])
+            else:
+                current_phase = 2
+                local_p = (f_idx - phase_frames[1]) / max(1, phase_frames[2] - phase_frames[1])
+
+            for p_i in range(current_phase):
+                for pt in phases[p_i]:
+                    cv2.circle(reveal_mask, pt, REVEAL_RADIUS, 255, -1)
+
+            current_pts = phases[current_phase]
+            if current_pts:
+                count = max(1, int(local_p * len(current_pts)))
+                count = min(count, len(current_pts))
+                for pt in current_pts[:count]:
+                    cv2.circle(reveal_mask, pt, REVEAL_RADIUS, 255, -1)
+                target_pt = current_pts[count - 1]
+            else:
+                target_pt = last_tip
+
+            hand_pos_x = target_pt[0] + int(1.2 * math.sin(f_idx * 1.8))
+            hand_pos_y = target_pt[1] + int(1.2 * math.cos(f_idx * 1.8))
             last_tip = (hand_pos_x, hand_pos_y)
             hand_visible = True
         elif f_idx < draw_frames + retract_frames:
             reveal_mask[:, :] = 255
             prog = (f_idx - draw_frames) / max(1, retract_frames)
             hand_pos_x = int(last_tip[0] + (WIDTH + 180 - last_tip[0]) * prog)
-            hand_pos_y = int(last_tip[1] + (HEIGHT + 180 - last_tip[1]) * prog)
+            hand_pos_y = int(last_tip[1] + (CONTENT_H + 180 - last_tip[1]) * prog)
             hand_visible = True
         else:
             reveal_mask[:, :] = 255
 
         blur = cv2.GaussianBlur(reveal_mask, (13, 13), 0)
         alpha = (blur.astype(np.float32) / 255.0)[:, :, None]
-        frame = (original_bgr * alpha + white_canvas * (1.0 - alpha)).astype(np.uint8)
+        frame_content = (content_bgr * alpha + white_content * (1.0 - alpha)).astype(np.uint8)
 
         if hand_visible:
-            paste_hand(frame, hand_bgr, hand_alpha, hand_pos_x - tip_x, hand_pos_y - tip_y)
+            paste_hand(frame_content, hand_bgr, hand_alpha, hand_pos_x - tip_x, hand_pos_y - tip_y)
 
-        proc.stdin.write(frame.tobytes())
+        frame_out = compose_frame(title_band, frame_content)
+        proc.stdin.write(frame_out.tobytes())
 
     proc.stdin.close()
     proc.wait()
@@ -1572,7 +1644,7 @@ if audio:
             st.error("Vui lòng nhập Groq API Key.")
             st.stop()
 
-        root = Path(tempfile.mkdtemp(prefix="wb_super_"))
+        root = Path(tempfile.mkdtemp(prefix="wb_v4_"))
         try:
             source = root / audio.name
             source.write_bytes(audio.getbuffer())
@@ -1596,7 +1668,6 @@ if audio:
                 st.error("Không có đoạn âm thanh hợp lệ.")
                 st.stop()
 
-            # Xác định camera mode
             if camera_motion_mode == "Auto (AI chọn cho từng cảnh)":
                 camera_mode = "auto"
             elif camera_motion_mode == "Random (Code chọn ngẫu nhiên)":
