@@ -189,7 +189,8 @@ with st.sidebar:
         scene_max = scene_min
 
     st.header("⚙️ Cài đặt khác")
-    max_scenes = st.slider("Số cảnh tối đa mỗi batch", 5, 25, 20)
+    max_scenes = st.slider("Số cảnh tối đa mỗi batch", 5, 50, 25,
+                           help="Batch 10 phút: 18s/cảnh → tối đa 33 cảnh. Đặt 35-40 nếu muốn giữ hết.")    
     image_timeout = st.slider("Timeout tạo ảnh (giây)", 30, 180, 120)
     flux_steps = st.slider("Số bước FLUX (cao = nét hơn, chậm hơn)", 4, 8, 4)
 
