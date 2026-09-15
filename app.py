@@ -1,16 +1,15 @@
 """
-Xưởng Video Diễn Hoạt Kiến Thức AI — Bản Siêu Cấp V5.5
+Xưởng Video Diễn Hoạt Kiến Thức AI — Bản Siêu Cấp V5.6
 ========================================================
-FIX V5.5 (dựa trên feedback dashboard):
-1. Circuit Breaker: provider fail 3 lần liên tiếp → loại khỏi pool
-2. Sleep 2s sau fail → tránh provider fail nhanh "cuỗm" scene
-3. Scene Attempts Counter: mỗi scene tối đa 3 lần thử (3 provider khác nhau)
-4. Scene fail được đẩy lại queue cho provider khác (không đếm vào fair share)
-5. Chỉ tăng my_count khi THÀNH CÔNG (không tăng khi fail)
-6. Dashboard hiển thị cột "Circuit" và số attempts của scene
+FIX V5.6 (dựa trên feedback dashboard):
+1. Đảo thứ tự provider: Cloudflare → Agnes → Together → FreeTheAi → HF → Nexa → Pollinations
+2. Slow Provider Penalty: provider avg > 10s → sleep 0.5s trước khi lấy scene tiếp
+3. Cột "Tốc độ" trong dashboard (🚀 <5s / ⚡ <15s / 🐢 >15s)
+4. Checkbox "Ưu tiên provider nhanh" (mặc định bật)
 
-Kế thừa V5.4:
-- Fair share cap, Live Dashboard, 4 hàm render riêng, Font fallback 4 lớp
+Kế thừa V5.5:
+- Circuit Breaker, Attempts Counter, Fair share cap, Live Dashboard
+- 4 hàm render riêng, Font fallback 4 lớp
 """
 
 import os
@@ -40,7 +39,7 @@ import numpy as np
 # ============================================================
 # CẤU HÌNH CHUNG
 # ============================================================
-APP_TITLE = "Xưởng Video Diễn Hoạt Kiến Thức AI (Bản Siêu Cấp V5.5)"
+APP_TITLE = "Xưởng Video Diễn Hoạt Kiến Thức AI (Bản Siêu Cấp V5.6)"
 BATCH_SECONDS = 10 * 60
 FPS = 30
 WIDTH = 1280
@@ -52,9 +51,11 @@ DRAW_DURATION_RATIO = 0.55
 PHASE_RATIOS = (0.40, 0.35, 0.25)
 MAX_TOTAL_FALLBACK_TIME = 300
 FAIR_SHARE_MULTIPLIER = 1.5
-MAX_ATTEMPTS_PER_SCENE = 3          # Mỗi scene tối đa 3 lần thử
-CIRCUIT_BREAKER_THRESHOLD = 3       # Provider fail 3 lần liên tiếp → dừng
-FAIL_SLEEP_SECONDS = 2.0            # Nghỉ 2s sau fail
+MAX_ATTEMPTS_PER_SCENE = 3
+CIRCUIT_BREAKER_THRESHOLD = 3
+FAIL_SLEEP_SECONDS = 2.0
+SLOW_PROVIDER_THRESHOLD = 10.0    # giây — provider chậm hơn ngưỡng này sẽ bị penalty
+SLOW_PROVIDER_PENALTY = 0.5       # giây — sleep trước khi lấy scene tiếp
 
 AGNES_API_URL = "https://apihub.agnes-ai.com/v1/images/generations"
 AGNES_MODEL = "agnes-image-2.1-flash"
@@ -73,8 +74,8 @@ POLLINATIONS_BASE = "https://gen.pollinations.ai/image/"
 # GIAO DIỆN
 # ============================================================
 st.set_page_config(page_title=APP_TITLE, page_icon="🎬", layout="wide")
-st.title("🎬 Xưởng Video Diễn Hoạt Kiến Thức AI — Siêu Cấp V5.5")
-st.caption("Circuit Breaker + Sleep sau fail + Attempts Counter + Live Dashboard")
+st.title("🎬 Xưởng Video Diễn Hoạt Kiến Thức AI — Siêu Cấp V5.6")
+st.caption("Provider nhanh ưu tiên + Slow Penalty + Circuit Breaker + Live Dashboard")
 
 with st.sidebar:
     st.header("🔑 API Keys")
@@ -87,7 +88,8 @@ with st.sidebar:
             value=st.secrets.get("POLLINATIONS_API_KEY", os.getenv("POLLINATIONS_API_KEY", "")),
             type="password")
         pollinations_model = st.selectbox("Pollinations Model",
-            ["flux-pro", "flux", "gptimage", "kontext", "flux-realism"], index=0)
+            ["flux-pro", "flux", "gptimage", "kontext", "flux-realism"], index=0,
+            help="gptimage chậm (~30s/ảnh). flux-pro ~15-20s. flux ~10-15s")
         agnes_key = st.text_input("Agnes AI API Key (Miễn phí)",
             value=st.secrets.get("AGNES_API_KEY", os.getenv("AGNES_API_KEY", "")),
             type="password")
@@ -146,8 +148,9 @@ with st.sidebar:
     image_timeout = st.slider("Timeout tạo ảnh (giây)", 20, 90, 45)
     flux_steps = st.slider("Số bước FLUX", 4, 8, 4)
     fair_share_enabled = st.checkbox("Bật fair share cap", value=True)
-    circuit_breaker_enabled = st.checkbox("Bật circuit breaker (loại provider fail 3 lần)", value=True,
-        help="Tránh provider lỗi liên tục cuỗm hết scene")
+    circuit_breaker_enabled = st.checkbox("Bật circuit breaker", value=True)
+    prioritize_fast = st.checkbox("⚡ Ưu tiên provider nhanh", value=True,
+        help="Provider chậm (>10s/ảnh) sẽ sleep 0.5s trước khi lấy scene tiếp, nhường sân cho provider nhanh")
 
 # ============================================================
 # TIỆN ÍCH
@@ -610,26 +613,38 @@ def build_provider_list(cf_account, cf_token, hf_token, freetheai_key,
                          together_key, nexa_key, agnes_key,
                          pollinations_key="", pollinations_model="flux-pro",
                          flux_steps=4):
+    """
+    V5.6: ĐẢO THỨ TỰ — provider nhanh lên đầu, Pollinations xuống cuối.
+    Thứ tự dựa trên đo thực tế:
+    1. Cloudflare (~2s)      ← nhanh nhất
+    2. Agnes AI (~8-10s)     ← ổn định
+    3. Together AI (~5-8s)   ← khá nhanh
+    4. FreeTheAi (~10s)
+    5. Hugging Face (~10s)
+    6. NexaAPI (~8s)
+    7. Pollinations (~25-35s) ← chậm nhất, để cuối
+    """
     providers = []
+    if cf_account and cf_token and cf_account.strip() and cf_token.strip():
+        providers.append({"name": "Cloudflare", "fn": cloudflare_image_request,
+                          "args": [cf_account.strip(), cf_token.strip()],
+                          "kwargs": {"steps": flux_steps}})
+    if agnes_key and agnes_key.strip():
+        providers.append({"name": "Agnes AI", "fn": agnes_image_request, "args": [agnes_key.strip()]})
+    if together_key and together_key.strip():
+        providers.append({"name": "Together AI", "fn": together_image_request, "args": [together_key.strip()]})
+    if freetheai_key and freetheai_key.strip():
+        providers.append({"name": "FreeTheAi", "fn": freetheai_image_request, "args": [freetheai_key.strip()]})
+    if hf_token and hf_token.strip():
+        providers.append({"name": "Hugging Face", "fn": hf_image_request, "args": [hf_token.strip()]})
+    if nexa_key and nexa_key.strip():
+        providers.append({"name": "NexaAPI", "fn": nexa_image_request, "args": [nexa_key.strip()]})
+    # Pollinations để CUỐI vì chậm nhất
     if pollinations_key and pollinations_key.strip():
         providers.append({"name": f"Pollinations ({pollinations_model})",
                           "fn": pollinations_image_request,
                           "args": [pollinations_key.strip(), pollinations_model],
                           "kwargs": {}, "supports_seed": ["seed"]})
-    if agnes_key and agnes_key.strip():
-        providers.append({"name": "Agnes AI", "fn": agnes_image_request, "args": [agnes_key.strip()]})
-    if cf_account and cf_token and cf_account.strip() and cf_token.strip():
-        providers.append({"name": "Cloudflare", "fn": cloudflare_image_request,
-                          "args": [cf_account.strip(), cf_token.strip()],
-                          "kwargs": {"steps": flux_steps}})
-    if hf_token and hf_token.strip():
-        providers.append({"name": "Hugging Face", "fn": hf_image_request, "args": [hf_token.strip()]})
-    if freetheai_key and freetheai_key.strip():
-        providers.append({"name": "FreeTheAi", "fn": freetheai_image_request, "args": [freetheai_key.strip()]})
-    if together_key and together_key.strip():
-        providers.append({"name": "Together AI", "fn": together_image_request, "args": [together_key.strip()]})
-    if nexa_key and nexa_key.strip():
-        providers.append({"name": "NexaAPI", "fn": nexa_image_request, "args": [nexa_key.strip()]})
     return providers
 
 def save_image_from_bytes(data, output_path):
@@ -1111,19 +1126,18 @@ def create_placeholder_image(output_path, title):
     img.save(output_path, quality=95)
 
 # ============================================================
-# PARALLEL GENERATION V5.5 — CIRCUIT BREAKER + ATTEMPTS COUNTER
+# PARALLEL GENERATION V5.6 — SLOW PROVIDER PENALTY
 # ============================================================
 def parallel_generate_images(scenes, batch_dir, providers, image_timeout,
                               progress_state, flux_steps=4,
                               fair_share_enabled=True,
-                              circuit_breaker_enabled=True):
+                              circuit_breaker_enabled=True,
+                              prioritize_fast=True):
     """
-    V5.5 FIX:
-    - Circuit Breaker: provider fail 3 lần liên tiếp → dừng worker
-    - Sleep 2s sau fail → tránh provider fail nhanh cuỗm hết scene
-    - Scene Attempts Counter: mỗi scene tối đa 3 lần thử (3 provider khác nhau)
-    - Scene fail được đẩy lại queue cho provider khác
-    - Chỉ tăng my_count khi THÀNH CÔNG (không tăng khi fail)
+    V5.6 FIX:
+    - Slow Provider Penalty: provider có avg > 10s → sleep 0.5s trước khi lấy scene
+    - Đảo thứ tự provider (nhanh lên đầu) — thực hiện ở build_provider_list
+    - Các fix V5.5 giữ nguyên: Circuit Breaker, Attempts Counter, Fair Share
     """
     if not providers:
         raise RuntimeError("Không có provider nào.")
@@ -1137,7 +1151,9 @@ def parallel_generate_images(scenes, batch_dir, providers, image_timeout,
 
     if circuit_breaker_enabled:
         st.caption(f"🔌 Circuit breaker: provider fail {CIRCUIT_BREAKER_THRESHOLD} lần liên tiếp → tự động loại")
-    st.caption(f"🔁 Mỗi cảnh tối đa **{MAX_ATTEMPTS_PER_SCENE}** lần thử (bởi các provider khác nhau)")
+    if prioritize_fast:
+        st.caption(f"⚡ Slow penalty: provider > {SLOW_PROVIDER_THRESHOLD:.0f}s/ảnh sẽ sleep {SLOW_PROVIDER_PENALTY}s trước khi lấy scene tiếp")
+    st.caption(f"🔁 Mỗi cảnh tối đa **{MAX_ATTEMPTS_PER_SCENE}** lần thử")
 
     scene_queue = Queue()
     scene_attempts = {}
@@ -1166,13 +1182,15 @@ def parallel_generate_images(scenes, batch_dir, providers, image_timeout,
     results_lock = threading.Lock()
     provider_stats = {p["name"]: {"ok": 0, "err": 0, "total_time": 0.0,
                                    "last_scene": None, "errors": [],
-                                   "circuit_broken": False}
+                                   "circuit_broken": False, "avg_time": 0.0}
                       for p in providers}
 
     def worker(provider_cfg):
         name = provider_cfg["name"]
         my_count = 0
         consecutive_fails = 0
+        local_ok = 0
+        local_time = 0.0
 
         while my_count < fair_share_cap:
             # Circuit breaker
@@ -1181,15 +1199,19 @@ def parallel_generate_images(scenes, batch_dir, providers, image_timeout,
                     provider_stats[name]["circuit_broken"] = True
                 return
 
+            # Slow Provider Penalty
+            if prioritize_fast and local_ok >= 2:
+                current_avg = local_time / local_ok
+                if current_avg > SLOW_PROVIDER_THRESHOLD:
+                    time.sleep(SLOW_PROVIDER_PENALTY)
+
             try:
                 idx, scene, img_raw, img = scene_queue.get_nowait()
             except Empty:
                 return
 
-            # Kiểm tra attempts
             current_attempts = scene_attempts.get(idx, 0)
             if current_attempts >= MAX_ATTEMPTS_PER_SCENE:
-                # Đã thử quá nhiều lần → placeholder
                 create_placeholder_image(img, scene["title"])
                 add_comic_overlays(img, scene["title"],
                                    scene.get("callout_type", "speech"),
@@ -1230,11 +1252,14 @@ def parallel_generate_images(scenes, batch_dir, providers, image_timeout,
                                    scene.get("callout_side", "right"), img)
                 elapsed = time.time() - t_start
                 my_count += 1
+                local_ok += 1
+                local_time += elapsed
                 consecutive_fails = 0
                 with results_lock:
                     results[idx] = name
                     provider_stats[name]["ok"] += 1
                     provider_stats[name]["total_time"] += elapsed
+                    provider_stats[name]["avg_time"] = provider_stats[name]["total_time"] / provider_stats[name]["ok"]
                     provider_stats[name]["last_scene"] = idx + 1
                     progress_state["scene_status"][idx] = {
                         "status": "done", "provider": name,
@@ -1246,15 +1271,10 @@ def parallel_generate_images(scenes, batch_dir, providers, image_timeout,
                 elapsed = time.time() - t_start
                 err_msg = str(e)[:150]
                 consecutive_fails += 1
-                # KHÔNG tăng my_count khi fail → provider khác có cơ hội
                 with results_lock:
                     scene_attempts[idx] = current_attempts + 1
                     provider_stats[name]["err"] += 1
                     provider_stats[name]["errors"].append(err_msg)
-                    # Nếu vượt MAX_ATTEMPTS → đánh dấu placeholder
-                    if scene_attempts[idx] >= MAX_ATTEMPTS_PER_SCENE:
-                        # Không đẩy lại queue nữa, sẽ tạo placeholder ở vòng lặp sau
-                        pass
                     progress_state["scene_status"][idx] = {
                         "status": "pending" if scene_attempts[idx] < MAX_ATTEMPTS_PER_SCENE else "failed",
                         "provider": None if scene_attempts[idx] < MAX_ATTEMPTS_PER_SCENE else name,
@@ -1264,12 +1284,10 @@ def parallel_generate_images(scenes, batch_dir, providers, image_timeout,
                         "error": err_msg,
                     }
 
-                # Đẩy lại queue nếu chưa vượt MAX_ATTEMPTS
                 if scene_attempts[idx] < MAX_ATTEMPTS_PER_SCENE:
                     scene_queue.put((idx, scene, img_raw, img))
                     time.sleep(FAIL_SLEEP_SECONDS)
                 else:
-                    # Vượt → tạo placeholder ngay
                     create_placeholder_image(img, scene["title"])
                     add_comic_overlays(img, scene["title"],
                                        scene.get("callout_type", "speech"),
@@ -1288,7 +1306,6 @@ def parallel_generate_images(scenes, batch_dir, providers, image_timeout,
         futures = [ex.submit(worker, p) for p in providers]
         wait(futures, timeout=None)
 
-    # Xử lý scene còn sót trong queue (nếu tất cả worker dừng vì circuit breaker)
     remaining = []
     while not scene_queue.empty():
         try:
@@ -1352,7 +1369,7 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
                  cf_account, cf_token, hf_token, freetheai_key, together_key,
                  nexa_key, agnes_key, pollinations_key, pollinations_model,
                  image_timeout, flux_steps=4, fair_share_enabled=True,
-                 circuit_breaker_enabled=True):
+                 circuit_breaker_enabled=True, prioritize_fast=True):
     total = len(scenes)
     if total == 0:
         raise RuntimeError("Không có cảnh nào để render.")
@@ -1363,7 +1380,7 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
     if not providers:
         raise RuntimeError("Chưa cấu hình provider ảnh nào.")
 
-    st.markdown(f"### 🔗 {len(providers)} Provider tham gia")
+    st.markdown(f"### 🔗 {len(providers)} Provider tham gia (thứ tự ưu tiên nhanh → chậm)")
     provider_cols = st.columns(min(4, len(providers)))
     for i, p in enumerate(providers):
         with provider_cols[i % len(provider_cols)]:
@@ -1376,7 +1393,7 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
         "scene_status": {},
         "provider_stats": {p["name"]: {"ok": 0, "err": 0, "total_time": 0.0,
                                         "last_scene": None, "errors": [],
-                                        "circuit_broken": False}
+                                        "circuit_broken": False, "avg_time": 0.0}
                             for p in providers},
     }
     progress_lock = threading.Lock()
@@ -1385,6 +1402,15 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
     progress_text = st.empty()
     stats_table = st.empty()
     scene_table = st.empty()
+
+    def speed_emoji(avg):
+        if avg <= 0:
+            return "—"
+        if avg < 5:
+            return f"🚀 {avg:.1f}s"
+        if avg < 15:
+            return f"⚡ {avg:.1f}s"
+        return f"🐢 {avg:.1f}s"
 
     def render_dashboard():
         with progress_lock:
@@ -1401,15 +1427,15 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
             name = p["name"]
             s = pstats.get(name, {"ok": 0, "err": 0, "total_time": 0.0,
                                    "last_scene": None, "errors": [],
-                                   "circuit_broken": False})
+                                   "circuit_broken": False, "avg_time": 0.0})
             avg = s["total_time"] / s["ok"] if s["ok"] > 0 else 0
-            last_err = s.get("errors", [])[-1][:35] if s.get("errors") else "—"
+            last_err = s.get("errors", [])[-1][:30] if s.get("errors") else "—"
             circuit = "🔌 BROKEN" if s.get("circuit_broken") else "✅ OK"
             stats_data.append({
                 "Provider": name,
                 "✅ OK": s["ok"],
                 "❌ Lỗi": s["err"],
-                "⏱️ TB (s)": f"{avg:.1f}" if avg > 0 else "—",
+                "Tốc độ": speed_emoji(avg),
                 "🎬 Cảnh cuối": f"#{s['last_scene']}" if s["last_scene"] else "—",
                 "🔌 Circuit": circuit,
                 "🐛 Lỗi gần nhất": last_err,
@@ -1446,7 +1472,7 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
         try:
             r, _ = parallel_generate_images(
                 scenes, batch_dir, providers, image_timeout, progress_state,
-                flux_steps, fair_share_enabled, circuit_breaker_enabled)
+                flux_steps, fair_share_enabled, circuit_breaker_enabled, prioritize_fast)
             result_container["result"] = r
         except Exception as e:
             result_container["error"] = e
@@ -1529,11 +1555,12 @@ if st.sidebar.button("🔎 KIỂM TRA PROVIDER", use_container_width=True):
     if not providers:
         st.error("Chưa có provider nào.")
     else:
-        st.write(f"**{len(providers)} provider:**")
-        for p in providers:
-            st.write(f"• {p['name']}")
-        if st.button("▶️ Test 1 ảnh"):
+        st.write(f"**{len(providers)} provider (thứ tự ưu tiên):**")
+        for i, p in enumerate(providers, 1):
+            st.write(f"{i}. {p['name']}")
+        if st.button("▶️ Test 1 ảnh (đo tốc độ từng provider)"):
             tp = "2D comic doodle: a man standing at the edge of a cliff at sunset, red sunset, blue waves, white background, bold black outlines, no text"
+            results_test = []
             for cfg in providers:
                 try:
                     with st.spinner(f"Test {cfg['name']}..."):
@@ -1542,12 +1569,19 @@ if st.sidebar.button("🔎 KIỂM TRA PROVIDER", use_container_width=True):
                         elapsed = time.time() - t0
                     if data and len(data) > 500:
                         img = Image.open(io.BytesIO(data)).convert("RGB").resize((WIDTH, HEIGHT))
+                        results_test.append((cfg['name'], elapsed, "✅ OK"))
                         st.success(f"✅ {cfg['name']} — {elapsed:.1f}s")
                         st.image(img, use_container_width=True)
-                        break
+                    else:
+                        results_test.append((cfg['name'], elapsed, "❌ Empty"))
+                        st.warning(f"⚠️ {cfg['name']}: response rỗng")
                 except Exception as e:
+                    results_test.append((cfg['name'], 0.0, f"❌ {str(e)[:50]}"))
                     st.warning(f"❌ {cfg['name']}: {str(e)[:150]}")
-                    continue
+            st.markdown("### 📊 Bảng xếp hạng tốc độ")
+            results_test.sort(key=lambda x: x[1] if x[1] > 0 else 9999)
+            for name, t, status in results_test:
+                st.write(f"{status} **{name}**: {t:.1f}s" if t > 0 else f"{status} **{name}**")
 
 audio = st.file_uploader("🎤 Tải lên voice", type=["mp3", "m4a", "wav", "ogg", "webm", "mp4"])
 
@@ -1557,7 +1591,7 @@ if audio:
         if not groq_key:
             st.error("Cần Groq API Key."); st.stop()
 
-        root = Path(tempfile.mkdtemp(prefix="wb_v55_"))
+        root = Path(tempfile.mkdtemp(prefix="wb_v56_"))
         try:
             source = root / audio.name
             source.write_bytes(audio.getbuffer())
@@ -1603,7 +1637,7 @@ if audio:
                                   cf_account, cf_token, hf_token, freetheai_key, together_key,
                                   nexa_key, agnes_key, pollinations_key, pollinations_model,
                                   image_timeout, flux_steps, fair_share_enabled,
-                                  circuit_breaker_enabled)
+                                  circuit_breaker_enabled, prioritize_fast)
                 saved = root / f"batch_final_{idx+1:03d}.mp4"
                 shutil.copy2(bv, saved); batch_videos.append(saved)
                 all_scenes += len(scenes)
