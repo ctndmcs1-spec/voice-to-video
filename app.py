@@ -1,11 +1,17 @@
 """
-Xưởng Video Diễn Hoạt Kiến Thức AI — Bản Siêu Cấp V5.2
+Xưởng Video Diễn Hoạt Kiến Thức AI — Bản Siêu Cấp V5.4
 ========================================================
-FIX SO VỚI V5.1:
-- Khôi phục 4 hàm render riêng (V5.1 gộp sai, Hybrid mất steadicam)
-- Giữ nguyên toàn bộ logic V5, chỉ sửa 2 chỗ gây chậm:
-  1. Provider functions: bỏ retry nội bộ (chỉ 1 lần thử)
-  2. parallel_generate_images: không put lại queue, có timeout tổng
+Tổng hợp tất cả fix và tính năng:
+1. Fix lỗi break fallback (cảnh không bị mất)
+2. Fair share cap (không provider nào chiếm quá nhiều)
+3. Live Dashboard real-time (scene status + provider stats)
+4. Log lỗi chi tiết từng provider
+5. 4 hàm render riêng (kttv_v2, hybrid, pure, classic_hand)
+6. Provider 1-lần-thử (không retry 2 tầng)
+7. Font fallback 4 lớp (system → Pillow → Internet → default)
+8. Title band 95px cố định
+9. 8 camera motion + 3 chế độ chọn (Auto/Random/Cố định)
+10. Ảnh placeholder nếu mọi provider fail
 """
 
 import os
@@ -35,7 +41,7 @@ import numpy as np
 # ============================================================
 # CẤU HÌNH CHUNG
 # ============================================================
-APP_TITLE = "Xưởng Video Diễn Hoạt Kiến Thức AI (Bản Siêu Cấp V5.2)"
+APP_TITLE = "Xưởng Video Diễn Hoạt Kiến Thức AI (Bản Siêu Cấp V5.4)"
 BATCH_SECONDS = 10 * 60
 FPS = 30
 WIDTH = 1280
@@ -46,6 +52,7 @@ REVEAL_RADIUS = 34
 DRAW_DURATION_RATIO = 0.55
 PHASE_RATIOS = (0.40, 0.35, 0.25)
 MAX_TOTAL_FALLBACK_TIME = 300
+FAIR_SHARE_MULTIPLIER = 1.5  # Mỗi provider tối đa 1.5x share trung bình
 
 AGNES_API_URL = "https://apihub.agnes-ai.com/v1/images/generations"
 AGNES_MODEL = "agnes-image-2.1-flash"
@@ -64,8 +71,8 @@ POLLINATIONS_BASE = "https://gen.pollinations.ai/image/"
 # GIAO DIỆN
 # ============================================================
 st.set_page_config(page_title=APP_TITLE, page_icon="🎬", layout="wide")
-st.title("🎬 Xưởng Video Diễn Hoạt Kiến Thức AI — Siêu Cấp V5.2")
-st.caption("4 hàm render riêng biệt + Provider 1-lần-thử + Parallel không loop vô hạn + Font fallback 4 lớp")
+st.title("🎬 Xưởng Video Diễn Hoạt Kiến Thức AI — Siêu Cấp V5.4")
+st.caption("Live Dashboard + Fair Share Cap + 4 hàm render riêng + Font fallback 4 lớp")
 
 with st.sidebar:
     st.header("🔑 API Keys")
@@ -136,6 +143,8 @@ with st.sidebar:
     max_scenes = st.slider("Số cảnh tối đa mỗi batch", 5, 50, 25)
     image_timeout = st.slider("Timeout tạo ảnh (giây)", 20, 90, 45)
     flux_steps = st.slider("Số bước FLUX", 4, 8, 4)
+    fair_share_enabled = st.checkbox("Bật fair share cap", value=True,
+        help="Giới hạn mỗi provider tối đa 1.5x share trung bình để công bằng")
 
 # ============================================================
 # TIỆN ÍCH
@@ -291,7 +300,7 @@ def font_for(size):
     return ImageFont.load_default()
 
 # ============================================================
-# SCENE PLANNER (giữ nguyên V5)
+# SCENE PLANNER
 # ============================================================
 def make_scene_plan(client, transcript_text, batch_start, batch_duration, model,
                     min_s, max_s, max_scenes, camera_mode="auto"):
@@ -425,7 +434,7 @@ JSON FORMAT:
     return final_scenes
 
 # ============================================================
-# IMAGE PROVIDERS (V5.2: 1 LẦN THỬ DUY NHẤT, KHÔNG RETRY)
+# IMAGE PROVIDERS (1 LẦN THỬ)
 # ============================================================
 def _build_full_prompt(prompt):
     safe = sanitize_prompt_text(prompt)
@@ -460,7 +469,9 @@ def agnes_image_request(prompt, api_key, timeout=45):
                "extra_body": {"response_format": "b64_json"}}
     r = requests.post(AGNES_API_URL, headers=headers, json=payload, timeout=timeout)
     if r.status_code == 429:
-        raise RuntimeError("Agnes: rate limit")
+        raise RuntimeError("Agnes: rate limit (429)")
+    if r.status_code == 401:
+        raise RuntimeError("Agnes: key sai (401)")
     if r.status_code >= 400:
         raise RuntimeError(f"Agnes HTTP {r.status_code}")
     data = r.json()
@@ -481,7 +492,7 @@ def cloudflare_image_request(prompt, account_id, api_token, timeout=45, steps=4)
     r = requests.post(url, headers=headers,
                       json={"prompt": _build_full_prompt(prompt), "steps": steps}, timeout=timeout)
     if r.status_code == 429:
-        raise RuntimeError("Cloudflare: hết quota")
+        raise RuntimeError("Cloudflare: hết quota (429)")
     if r.status_code >= 400:
         raise RuntimeError(f"Cloudflare HTTP {r.status_code}")
     data = r.json()
@@ -501,9 +512,9 @@ def hf_image_request(prompt, token, timeout=45):
     r = requests.post(url, headers=headers,
                       json={"inputs": _build_full_prompt(prompt)}, timeout=timeout)
     if r.status_code == 503:
-        raise RuntimeError("HF: model loading")
+        raise RuntimeError("HF: model loading (503)")
     if r.status_code == 429:
-        raise RuntimeError("HF: rate limit")
+        raise RuntimeError("HF: rate limit (429)")
     if r.status_code >= 400:
         raise RuntimeError(f"HF HTTP {r.status_code}")
     return _validate_image_bytes(r.content, "HF")
@@ -516,7 +527,7 @@ def freetheai_image_request(prompt, api_key, timeout=45):
     payload = {"model": "flux", "prompt": _build_full_prompt(prompt), "n": 1, "size": "1280x720"}
     r = requests.post(FREETHEAI_BASE, headers=headers, json=payload, timeout=timeout)
     if r.status_code == 429:
-        raise RuntimeError("FreeTheAi: rate limit")
+        raise RuntimeError("FreeTheAi: rate limit (429)")
     if r.status_code >= 400:
         raise RuntimeError(f"FreeTheAi HTTP {r.status_code}")
     data = r.json()
@@ -537,7 +548,7 @@ def together_image_request(prompt, api_key, timeout=45):
                "width": WIDTH, "height": HEIGHT, "steps": 4, "n": 1, "response_format": "b64_json"}
     r = requests.post(TOGETHER_BASE, headers=headers, json=payload, timeout=timeout)
     if r.status_code == 429:
-        raise RuntimeError("Together: rate limit")
+        raise RuntimeError("Together: rate limit (429)")
     if r.status_code >= 400:
         raise RuntimeError(f"Together HTTP {r.status_code}")
     data = r.json()
@@ -558,7 +569,7 @@ def nexa_image_request(prompt, api_key, timeout=45):
                "width": WIDTH, "height": HEIGHT, "n": 1}
     r = requests.post(NEXA_BASE, headers=headers, json=payload, timeout=timeout)
     if r.status_code == 429:
-        raise RuntimeError("NexaAPI: rate limit")
+        raise RuntimeError("NexaAPI: rate limit (429)")
     if r.status_code >= 400:
         raise RuntimeError(f"NexaAPI HTTP {r.status_code}")
     data = r.json()
@@ -633,7 +644,7 @@ def save_image_from_bytes(data, output_path):
         raise RuntimeError(f"Ảnh không hợp lệ: {e}")
 
 # ============================================================
-# OVERLAY COMIC (giữ nguyên V5)
+# OVERLAY COMIC
 # ============================================================
 def add_comic_overlays(image_path, title, callout_type, callout_text, callout_side, output_path):
     img = Image.open(image_path).convert("RGB").resize((WIDTH, HEIGHT))
@@ -684,7 +695,7 @@ def add_comic_overlays(image_path, title, callout_type, callout_text, callout_si
     img.save(output_path, quality=95)
 
 # ============================================================
-# HAND ASSET (giữ nguyên V5)
+# HAND ASSET
 # ============================================================
 def generate_fallback_hand():
     S = 320
@@ -830,15 +841,13 @@ def interpolate_motion(keyframes, p):
     _, s, cx, cy = keyframes[-1]; return s, cx, cy
 
 # ============================================================
-# 4 HÀM RENDER RIÊNG BIỆT (KHÔI PHỤC TỪ V5)
+# 4 HÀM RENDER RIÊNG BIỆT
 # ============================================================
 def render_scene_kttv_v2(image_path, duration, output_path, hand_path, motion="zoom_in_center"):
-    """Phong cách 1: Vẽ tuần tự 3 phase (staggered zones) + camera motion."""
     total_frames = max(1, round(duration * FPS))
     draw_duration = max(1.5, min(duration - 0.8, duration * DRAW_DURATION_RATIO))
     draw_frames = int(draw_duration * FPS)
     retract_frames = int(0.35 * FPS)
-
     original_full = cv2.imread(str(image_path))
     if original_full is None:
         raise RuntimeError(f"Không đọc được ảnh: {image_path}")
@@ -846,7 +855,6 @@ def render_scene_kttv_v2(image_path, duration, output_path, hand_path, motion="z
     title_band, content_bgr = split_title_band(original_full)
     white_content = np.full_like(content_bgr, 255)
     reveal_mask = np.zeros((CONTENT_H, WIDTH), dtype=np.uint8)
-
     zone_trajectories = extract_staggered_trajectories(image_path)
     all_pts_full = [p for z in zone_trajectories for p in z]
     if not all_pts_full:
@@ -856,21 +864,18 @@ def render_scene_kttv_v2(image_path, duration, output_path, hand_path, motion="z
     phase_frames = [int(draw_frames * PHASE_RATIOS[0]),
                     int(draw_frames * (PHASE_RATIOS[0] + PHASE_RATIOS[1])),
                     draw_frames]
-
     hand_bgr, hand_alpha, tip_x, tip_y = load_hand_asset(hand_path, 320)
     cmd = ["ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
            "-s", f"{WIDTH}x{HEIGHT}", "-pix_fmt", "bgr24", "-r", str(FPS),
            "-i", "-", "-an", "-c:v", "libx264", "-preset", "veryfast",
            "-pix_fmt", "yuv420p", str(output_path)]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-
     last_tip = all_points[0] if all_points else (WIDTH // 2, CONTENT_H // 2)
     motion_kfs = get_motion_keyframes(motion)
 
     for f_idx in range(total_frames):
         hand_visible = False
         hand_pos_x = hand_pos_y = 0
-
         if f_idx < draw_frames:
             if f_idx < phase_frames[0]:
                 cp = 0; lp = f_idx / max(1, phase_frames[0])
@@ -901,12 +906,10 @@ def render_scene_kttv_v2(image_path, duration, output_path, hand_path, motion="z
             hand_visible = True
         else:
             reveal_mask[:, :] = 255
-
         alpha = (cv2.GaussianBlur(reveal_mask, (13, 13), 0).astype(np.float32) / 255.0)[:, :, None]
         frame_content = (content_bgr * alpha + white_content * (1.0 - alpha)).astype(np.uint8)
         if hand_visible:
             paste_hand(frame_content, hand_bgr, hand_alpha, hand_pos_x - tip_x, hand_pos_y - tip_y)
-
         if f_idx < draw_frames + retract_frames:
             scale, cx_use, cy_use = 1.0, WIDTH * 0.5, CONTENT_H * 0.5
         else:
@@ -917,22 +920,17 @@ def render_scene_kttv_v2(image_path, duration, output_path, hand_path, motion="z
             scale = 1.0 + (st_ - 1.0) * blend
             cx_use = WIDTH * 0.5 + (cxt - WIDTH * 0.5) * blend
             cy_use = CONTENT_H * 0.5 + (cyc - CONTENT_H * 0.5) * blend
-
         frame_out = compose_frame(title_band, crop_content_with_motion(frame_content, scale, cx_use, cy_use))
         proc.stdin.write(frame_out.tobytes())
-
     proc.stdin.close(); proc.wait()
     if proc.returncode != 0:
         raise RuntimeError("FFmpeg render thất bại (Chế độ 1)")
 
-
 def render_scene_hybrid(image_path, duration, output_path, hand_path, motion="zoom_in_center"):
-    """Phong cách 2: Vẽ continuous + camera Steadicam bám theo tay + 3 phase."""
     total_frames = max(1, round(duration * FPS))
     draw_duration = max(1.5, min(duration - 0.8, duration * DRAW_DURATION_RATIO))
     draw_frames = int(draw_duration * FPS)
     retract_frames = int(0.35 * FPS)
-
     original_full = cv2.imread(str(image_path))
     if original_full is None:
         raise RuntimeError(f"Không đọc được ảnh: {image_path}")
@@ -940,21 +938,18 @@ def render_scene_hybrid(image_path, duration, output_path, hand_path, motion="zo
     title_band, content_bgr = split_title_band(original_full)
     white_content = np.full_like(content_bgr, 255)
     reveal_mask = np.zeros((CONTENT_H, WIDTH), dtype=np.uint8)
-
     trajectory_full = extract_continuous_trajectory(image_path)
     trajectory = trajectory_to_content_space(trajectory_full)
     phases = split_trajectory_into_phases(trajectory)
     phase_frames = [int(draw_frames * PHASE_RATIOS[0]),
                     int(draw_frames * (PHASE_RATIOS[0] + PHASE_RATIOS[1])),
                     draw_frames]
-
     hand_bgr, hand_alpha, tip_x, tip_y = load_hand_asset(hand_path, 320)
     cmd = ["ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
            "-s", f"{WIDTH}x{HEIGHT}", "-pix_fmt", "bgr24", "-r", str(FPS),
            "-i", "-", "-an", "-c:v", "libx264", "-preset", "veryfast",
            "-pix_fmt", "yuv420p", str(output_path)]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-
     last_tip = trajectory[0] if trajectory else (WIDTH // 2, CONTENT_H // 2)
     smooth_cx, smooth_cy = float(last_tip[0]), float(last_tip[1])
     motion_kfs = get_motion_keyframes(motion)
@@ -962,7 +957,6 @@ def render_scene_hybrid(image_path, duration, output_path, hand_path, motion="zo
     for f_idx in range(total_frames):
         hand_visible = False
         hand_pos_x = hand_pos_y = 0
-
         if f_idx < draw_frames:
             if f_idx < phase_frames[0]:
                 cp = 0; lp = f_idx / max(1, phase_frames[0])
@@ -993,13 +987,10 @@ def render_scene_hybrid(image_path, duration, output_path, hand_path, motion="zo
             hand_visible = True
         else:
             reveal_mask[:, :] = 255
-
         alpha = (cv2.GaussianBlur(reveal_mask, (13, 13), 0).astype(np.float32) / 255.0)[:, :, None]
         frame_content = (content_bgr * alpha + white_content * (1.0 - alpha)).astype(np.uint8)
         if hand_visible:
             paste_hand(frame_content, hand_bgr, hand_alpha, hand_pos_x - tip_x, hand_pos_y - tip_y)
-
-        # Steadicam: camera bám theo tay khi vẽ, sau đó chuyển sang camera motion
         if f_idx < draw_frames:
             scale = 1.0
             smooth_cx = smooth_cx * 0.95 + hand_pos_x * 0.05
@@ -1015,22 +1006,16 @@ def render_scene_hybrid(image_path, duration, output_path, hand_path, motion="zo
             scale = 1.0 + (st_ - 1.0) * blend
             cx_use = smooth_cx + (cxt - smooth_cx) * blend
             cy_use = smooth_cy + (cyc - smooth_cy) * blend
-
-        # Clamp trong vùng content
-        crop_w = int(WIDTH / scale)
-        crop_h = int(CONTENT_H / scale)
+        crop_w = int(WIDTH / scale); crop_h = int(CONTENT_H / scale)
         cx_clamped = max(crop_w // 2, min(WIDTH - crop_w // 2, int(cx_use)))
         cy_clamped = max(crop_h // 2, min(CONTENT_H - crop_h // 2, int(cy_use)))
         frame_out = compose_frame(title_band, crop_content_with_motion(frame_content, scale, cx_clamped, cy_clamped))
         proc.stdin.write(frame_out.tobytes())
-
     proc.stdin.close(); proc.wait()
     if proc.returncode != 0:
         raise RuntimeError("FFmpeg render thất bại (Chế độ 2)")
 
-
 def render_scene_kttv_pure(image_path, duration, output_path, motion="zoom_in_center"):
-    """Phong cách 3: Chỉ camera pan/zoom, không vẽ tay."""
     total_frames = max(1, round(duration * FPS))
     original_full = cv2.resize(cv2.imread(str(image_path)), (WIDTH, HEIGHT))
     title_band, content_bgr = split_title_band(original_full)
@@ -1048,25 +1033,20 @@ def render_scene_kttv_pure(image_path, duration, output_path, motion="zoom_in_ce
         proc.stdin.write(frame_out.tobytes())
     proc.stdin.close(); proc.wait()
 
-
 def render_scene_classic_hand(image_path, duration, output_path, hand_path, motion="zoom_in_center"):
-    """Phong cách 4: Continuous trajectory + camera TĨNH (không motion)."""
     total_frames = max(1, round(duration * FPS))
     draw_frames = int(max(1.5, min(duration - 0.8, duration * DRAW_DURATION_RATIO)) * FPS)
     retract_frames = int(0.35 * FPS)
-
     original_full = cv2.resize(cv2.imread(str(image_path)), (WIDTH, HEIGHT))
     title_band, content_bgr = split_title_band(original_full)
     white_content = np.full_like(content_bgr, 255)
     reveal_mask = np.zeros((CONTENT_H, WIDTH), dtype=np.uint8)
-
     trajectory_full = extract_continuous_trajectory(image_path)
     trajectory = trajectory_to_content_space(trajectory_full)
     phases = split_trajectory_into_phases(trajectory)
     phase_frames = [int(draw_frames * PHASE_RATIOS[0]),
                     int(draw_frames * (PHASE_RATIOS[0] + PHASE_RATIOS[1])),
                     draw_frames]
-
     hand_bgr, hand_alpha, tip_x, tip_y = load_hand_asset(hand_path)
     cmd = ["ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
            "-s", f"{WIDTH}x{HEIGHT}", "-pix_fmt", "bgr24", "-r", str(FPS),
@@ -1074,7 +1054,6 @@ def render_scene_classic_hand(image_path, duration, output_path, hand_path, moti
            "-pix_fmt", "yuv420p", str(output_path)]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
     last_tip = trajectory[0] if trajectory else (WIDTH // 2, CONTENT_H // 2)
-
     for f_idx in range(total_frames):
         hand_visible = False
         if f_idx < draw_frames:
@@ -1107,15 +1086,12 @@ def render_scene_classic_hand(image_path, duration, output_path, hand_path, moti
             hand_visible = True
         else:
             reveal_mask[:, :] = 255
-
         alpha = (cv2.GaussianBlur(reveal_mask, (13, 13), 0).astype(np.float32) / 255.0)[:, :, None]
         frame_content = (content_bgr * alpha + white_content * (1.0 - alpha)).astype(np.uint8)
         if hand_visible:
             paste_hand(frame_content, hand_bgr, hand_alpha, hand_pos_x - tip_x, hand_pos_y - tip_y)
-
         frame_out = compose_frame(title_band, frame_content)
         proc.stdin.write(frame_out.tobytes())
-
     proc.stdin.close(); proc.wait()
 
 # ============================================================
@@ -1132,18 +1108,28 @@ def create_placeholder_image(output_path, title):
     img.save(output_path, quality=95)
 
 # ============================================================
-# PARALLEL GENERATION (V5.2 FIX)
+# PARALLEL GENERATION V5.4 — FAIR SHARE CAP + LIVE STATUS
 # ============================================================
 def parallel_generate_images(scenes, batch_dir, providers, image_timeout,
-                              progress_state, flux_steps=4):
+                              progress_state, flux_steps=4,
+                              fair_share_enabled=True):
     """
-    V5.2: KHÔNG còn put lại queue khi fail, KHÔNG retry 2 tầng.
-    - Worker lấy scene, thử 1 lần với provider của mình
-    - Fail → đánh dấu failed_scenes, KHÔNG put lại queue
-    - Sau khi tất cả worker xong → fallback tuần tự (có timeout tổng 5 phút)
+    V5.4: 
+    - Fair share cap: mỗi provider tối đa 1.5x share trung bình
+    - Worker 1-lần-thử (không retry 2 tầng)
+    - Không put lại queue khi fail
+    - Fallback tuần tự có timeout, KHÔNG break (chuyển sang placeholder)
     """
     if not providers:
         raise RuntimeError("Không có provider nào.")
+
+    total_scenes = len(scenes)
+    if fair_share_enabled:
+        fair_share_cap = max(3, int((total_scenes / len(providers)) * FAIR_SHARE_MULTIPLIER))
+        st.caption(f"⚖️ Fair share cap: mỗi provider tối đa **{fair_share_cap}** cảnh "
+                   f"({total_scenes} cảnh / {len(providers)} provider × {FAIR_SHARE_MULTIPLIER})")
+    else:
+        fair_share_cap = 999999  # Không giới hạn
 
     scene_queue = Queue()
     for i, s in enumerate(scenes):
@@ -1151,6 +1137,13 @@ def parallel_generate_images(scenes, batch_dir, providers, image_timeout,
         img = batch_dir / f"scene_{i+1:03d}.jpg"
         if not img.exists():
             scene_queue.put((i, s, img_raw, img))
+            progress_state["scene_status"][i] = {
+                "status": "pending", "provider": None, "started": None, "elapsed": 0.0
+            }
+        else:
+            progress_state["scene_status"][i] = {
+                "status": "done", "provider": "(cached)", "started": None, "elapsed": 0.0
+            }
 
     total = scene_queue.qsize()
     if total == 0:
@@ -1159,15 +1152,26 @@ def parallel_generate_images(scenes, batch_dir, providers, image_timeout,
     results = {}
     failed_scenes = {}
     results_lock = threading.Lock()
-    provider_stats = {p["name"]: {"ok": 0, "err": 0} for p in providers}
+    provider_stats = {p["name"]: {"ok": 0, "err": 0, "total_time": 0.0,
+                                   "last_scene": None, "errors": []}
+                      for p in providers}
 
     def worker(provider_cfg):
         name = provider_cfg["name"]
-        while True:
+        my_count = 0
+        while my_count < fair_share_cap:
             try:
                 idx, scene, img_raw, img = scene_queue.get_nowait()
             except Empty:
                 return
+
+            t_start = time.time()
+            with results_lock:
+                progress_state["scene_status"][idx] = {
+                    "status": "working", "provider": name,
+                    "started": t_start, "elapsed": 0.0,
+                }
+
             try:
                 seed = hash(f"{scene['visual_prompt']}_{idx}") % (2**31)
                 kwargs = provider_cfg.get("kwargs", {}).copy()
@@ -1183,28 +1187,57 @@ def parallel_generate_images(scenes, batch_dir, providers, image_timeout,
                                    scene.get("callout_type", "speech"),
                                    scene.get("callout_text", ""),
                                    scene.get("callout_side", "right"), img)
+                elapsed = time.time() - t_start
+                my_count += 1
                 with results_lock:
                     results[idx] = name
                     provider_stats[name]["ok"] += 1
+                    provider_stats[name]["total_time"] += elapsed
+                    provider_stats[name]["last_scene"] = idx + 1
+                    progress_state["scene_status"][idx] = {
+                        "status": "done", "provider": name,
+                        "started": t_start, "elapsed": elapsed,
+                    }
                     progress_state["done"] += 1
             except Exception as e:
+                elapsed = time.time() - t_start
+                err_msg = str(e)[:150]
+                my_count += 1
                 with results_lock:
-                    failed_scenes[idx] = (scene, img_raw, img, f"{name}: {str(e)[:80]}")
+                    failed_scenes[idx] = (scene, img_raw, img, f"{name}: {err_msg}")
                     provider_stats[name]["err"] += 1
+                    provider_stats[name]["errors"].append(err_msg)
+                    progress_state["scene_status"][idx] = {
+                        "status": "failed", "provider": name,
+                        "started": t_start, "elapsed": elapsed,
+                        "error": err_msg,
+                    }
 
     with ThreadPoolExecutor(max_workers=len(providers)) as ex:
         futures = [ex.submit(worker, p) for p in providers]
         wait(futures, timeout=None)
 
-    # Fallback tuần tự có timeout tổng
+    # Fallback tuần tự — V5.4: KHÔNG break, tạo placeholder khi timeout
     if failed_scenes:
         start_fb = time.time()
+        timed_out_count = 0
         st.warning(f"⚠️ {len(failed_scenes)} cảnh fail, fallback tuần tự (tối đa 5 phút)...")
         for idx in sorted(failed_scenes.keys()):
-            if time.time() - start_fb > MAX_TOTAL_FALLBACK_TIME:
-                st.error(f"⏱️ Fallback timeout, tạo placeholder cho các cảnh còn lại")
-                break
             scene, img_raw, img, _ = failed_scenes[idx]
+
+            # Nếu đã vượt timeout → tạo placeholder NGAY, KHÔNG break
+            if time.time() - start_fb > MAX_TOTAL_FALLBACK_TIME:
+                create_placeholder_image(img, scene["title"])
+                with results_lock:
+                    results[idx] = "placeholder"
+                    progress_state["done"] += 1
+                    progress_state["scene_status"][idx] = {
+                        "status": "placeholder", "provider": "placeholder",
+                        "started": None, "elapsed": 0.0,
+                    }
+                timed_out_count += 1
+                continue
+
             success = False
             for cfg in providers:
                 try:
@@ -1222,7 +1255,12 @@ def parallel_generate_images(scenes, batch_dir, providers, image_timeout,
                                            scene.get("callout_side", "right"), img)
                         with results_lock:
                             results[idx] = cfg["name"]
+                            provider_stats[cfg["name"]]["ok"] += 1
                             progress_state["done"] += 1
+                            progress_state["scene_status"][idx] = {
+                                "status": "done", "provider": cfg["name"] + " (fallback)",
+                                "started": None, "elapsed": 0.0,
+                            }
                         success = True
                         break
                 except Exception:
@@ -1232,16 +1270,24 @@ def parallel_generate_images(scenes, batch_dir, providers, image_timeout,
                 with results_lock:
                     results[idx] = "placeholder"
                     progress_state["done"] += 1
+                    progress_state["scene_status"][idx] = {
+                        "status": "placeholder", "provider": "placeholder",
+                        "started": None, "elapsed": 0.0,
+                    }
 
+        if timed_out_count > 0:
+            st.warning(f"⚠️ {timed_out_count} cảnh timeout, đã dùng placeholder để video vẫn render được")
+
+    progress_state["provider_stats"] = provider_stats
     return results, len(failed_scenes)
 
 # ============================================================
-# RENDER BATCH
+# RENDER BATCH VỚI LIVE DASHBOARD
 # ============================================================
 def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
                  cf_account, cf_token, hf_token, freetheai_key, together_key,
                  nexa_key, agnes_key, pollinations_key, pollinations_model,
-                 image_timeout, flux_steps=4):
+                 image_timeout, flux_steps=4, fair_share_enabled=True):
     total = len(scenes)
     if total == 0:
         raise RuntimeError("Không có cảnh nào để render.")
@@ -1251,26 +1297,87 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
         nexa_key, agnes_key, pollinations_key, pollinations_model, flux_steps)
     if not providers:
         raise RuntimeError("Chưa cấu hình provider ảnh nào.")
-    st.caption(f"🔗 {len(providers)} provider SONG SONG: {' | '.join(p['name'] for p in providers)}")
 
-    # Progress state
-    progress_state = {"done": 0}
+    st.markdown(f"### 🔗 {len(providers)} Provider tham gia")
+    provider_cols = st.columns(min(4, len(providers)))
+    for i, p in enumerate(providers):
+        with provider_cols[i % len(provider_cols)]:
+            st.markdown(f"**{i+1}.** {p['name']}")
+
+    # ============================================
+    # PHASE 1: Tạo ảnh song song — Live Dashboard
+    # ============================================
+    st.markdown("### 🎨 Tạo ảnh song song")
+
+    progress_state = {
+        "done": 0,
+        "scene_status": {},
+        "provider_stats": {p["name"]: {"ok": 0, "err": 0, "total_time": 0.0,
+                                        "last_scene": None, "errors": []}
+                            for p in providers},
+    }
     progress_lock = threading.Lock()
-    progress_placeholder = st.empty()
-    progress_bar = st.progress(0)
 
-    def update_progress():
+    progress_bar = st.progress(0)
+    progress_text = st.empty()
+    stats_table = st.empty()
+    scene_table = st.empty()
+
+    def render_dashboard():
         with progress_lock:
             done = progress_state["done"]
+            scene_status = dict(progress_state["scene_status"])
+            pstats = dict(progress_state["provider_stats"])
+
         pct = min(1.0, done / total) * 0.6
         progress_bar.progress(pct)
-        progress_placeholder.write(f"🎨 Tạo ảnh: {done}/{total}")
+        progress_text.markdown(f"**🎨 Tạo ảnh: {done}/{total}** ({pct/0.6*100:.0f}%)")
+
+        stats_data = []
+        for p in providers:
+            name = p["name"]
+            s = pstats.get(name, {"ok": 0, "err": 0, "total_time": 0.0,
+                                   "last_scene": None, "errors": []})
+            avg = s["total_time"] / s["ok"] if s["ok"] > 0 else 0
+            last_err = s.get("errors", [])[-1][:40] if s.get("errors") else "—"
+            stats_data.append({
+                "Provider": name,
+                "✅ OK": s["ok"],
+                "❌ Lỗi": s["err"],
+                "⏱️ TB (s)": f"{avg:.1f}" if avg > 0 else "—",
+                "🎬 Cảnh cuối": f"#{s['last_scene']}" if s["last_scene"] else "—",
+                "🐛 Lỗi gần nhất": last_err,
+            })
+        if stats_data:
+            stats_table.dataframe(stats_data, use_container_width=True, hide_index=True)
+
+        rows = []
+        for i in range(total):
+            st_info = scene_status.get(i, {"status": "pending", "provider": None, "elapsed": 0.0})
+            status_icon = {
+                "pending": "⏳ Chờ",
+                "working": "🔄 Đang vẽ",
+                "done": "✅ Xong",
+                "failed": "❌ Lỗi",
+                "placeholder": "⚠️ Placeholder",
+            }.get(st_info["status"], "?")
+            prov = st_info["provider"] or "—"
+            elapsed = f"{st_info['elapsed']:.1f}s" if st_info.get("elapsed", 0) > 0 else "—"
+            rows.append({
+                "Cảnh": f"#{i+1:02d}",
+                "Trạng thái": status_icon,
+                "Provider": prov,
+                "Thời gian": elapsed,
+            })
+        scene_table.dataframe(rows, use_container_width=True, hide_index=True,
+                              height=min(400, 35 * total + 40))
 
     result_container = {"result": None, "error": None}
     def run_parallel():
         try:
             r, _ = parallel_generate_images(
-                scenes, batch_dir, providers, image_timeout, progress_state, flux_steps)
+                scenes, batch_dir, providers, image_timeout, progress_state,
+                flux_steps, fair_share_enabled)
             result_container["result"] = r
         except Exception as e:
             result_container["error"] = e
@@ -1278,10 +1385,10 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
     t = threading.Thread(target=run_parallel, daemon=True)
     t.start()
     while t.is_alive():
-        update_progress()
-        time.sleep(0.5)
+        render_dashboard()
+        time.sleep(0.8)
     t.join()
-    update_progress()
+    render_dashboard()
 
     if result_container["error"]:
         raise result_container["error"]
@@ -1290,8 +1397,13 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
     stats = Counter(used.values())
     st.success(f"✅ Đã tạo {len(used)}/{total} ảnh — {dict(stats)}")
 
-    # PHASE 2: Render video TUẦN TỰ
-    st.write(f"🎬 Đang render {total} video scene...")
+    # ============================================
+    # PHASE 2: Render video
+    # ============================================
+    st.markdown("### 🎬 Render video")
+    render_bar = st.progress(0)
+    render_text = st.empty()
+
     scene_videos = []
     for i, s in enumerate(scenes, 1):
         img = batch_dir / f"scene_{i:03d}.jpg"
@@ -1301,7 +1413,6 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
         duration = max(1.0, float(s["end"]) - float(s["start"]))
         motion = s.get("camera_motion", "zoom_in_center")
 
-        # Gọi đúng hàm render theo style (KHÔI PHỤC 4 HÀM RIÊNG)
         if "1." in style or "Kiến Thức Thú Vị V2" in style:
             render_scene_kttv_v2(img, duration, vid, hand_path, motion)
         elif "2." in style or "Độc bản" in style or "Hybrid" in style:
@@ -1312,7 +1423,8 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
             render_scene_classic_hand(img, duration, vid, hand_path, motion)
 
         scene_videos.append(vid)
-        progress_bar.progress(0.6 + (i / total) * 0.4)
+        render_bar.progress(i / total)
+        render_text.markdown(f"**🎬 Render: {i}/{total}** — {s['title']}")
 
     concat_file = batch_dir / "concat.txt"
     concat_file.write_text("\n".join(f"file '{p.resolve()}'" for p in scene_videos), encoding="utf-8")
@@ -1379,7 +1491,7 @@ if audio:
         if not groq_key:
             st.error("Cần Groq API Key."); st.stop()
 
-        root = Path(tempfile.mkdtemp(prefix="wb_v52_"))
+        root = Path(tempfile.mkdtemp(prefix="wb_v54_"))
         try:
             source = root / audio.name
             source.write_bytes(audio.getbuffer())
@@ -1405,31 +1517,32 @@ if audio:
 
             for idx, (bi, chunk, bdur) in enumerate(valid_chunks):
                 bstart = bi * BATCH_SECONDS
-                status.write(f"🧠 Đợt {idx+1}/{len(valid_chunks)} — STT...")
+                status.markdown(f"### 🧠 Đợt {idx+1}/{len(valid_chunks)} — Nhận diện giọng nói...")
                 tr = transcribe_file(client, chunk, stt_model)
                 segs = normalize_segments(tr, bstart)
                 batch_text = "\n".join(f"[{x['start']:.2f}-{x['end']:.2f}] {x['text']}" for x in segs)
 
-                status.write(f"✂️ Đợt {idx+1}/{len(valid_chunks)} — Lên kịch bản...")
+                status.markdown(f"### ✂️ Đợt {idx+1}/{len(valid_chunks)} — Lên kịch bản...")
                 scenes = make_scene_plan(client, batch_text, bstart, bdur, planner_model,
                                          scene_min, scene_max, max_scenes, camera_mode)
-                st.write(f"**Đợt {idx+1}: {bdur:.1f}s → {len(scenes)} cảnh**")
-                for si, s in enumerate(scenes, 1):
-                    ci = f" | [{s.get('callout_type','').upper()}]: \"{s.get('callout_text','')}\"" if s.get('callout_text') else ""
-                    st.caption(f"{si:02d}. {s['start']:.1f}s–{s['end']:.1f}s — {s['title']}{ci} | 🎥 {s.get('camera_motion','zoom_in_center')}")
+                st.markdown(f"#### 📝 Đợt {idx+1}: {bdur:.1f}s → **{len(scenes)} cảnh**")
+                with st.expander("Xem chi tiết các cảnh", expanded=False):
+                    for si, s in enumerate(scenes, 1):
+                        ci = f" | [{s.get('callout_type','').upper()}]: \"{s.get('callout_text','')}\"" if s.get('callout_text') else ""
+                        st.caption(f"{si:02d}. {s['start']:.1f}s–{s['end']:.1f}s — {s['title']}{ci} | 🎥 {s.get('camera_motion','zoom_in_center')}")
 
                 batch_work = root / f"work_{idx+1:03d}"; batch_work.mkdir()
-                status.write(f"🎨 Đợt {idx+1}/{len(valid_chunks)} — Tạo ảnh + render...")
+                status.markdown(f"### 🎨 Đợt {idx+1}/{len(valid_chunks)} — Tạo ảnh + render...")
                 bv = render_batch(chunk, scenes, batch_work, hand_path, draw_style,
                                   cf_account, cf_token, hf_token, freetheai_key, together_key,
                                   nexa_key, agnes_key, pollinations_key, pollinations_model,
-                                  image_timeout, flux_steps)
+                                  image_timeout, flux_steps, fair_share_enabled)
                 saved = root / f"batch_final_{idx+1:03d}.mp4"
                 shutil.copy2(bv, saved); batch_videos.append(saved)
                 all_scenes += len(scenes)
                 shutil.rmtree(batch_work, ignore_errors=True)
 
-            status.write("🎬 Ghép video...")
+            status.markdown("### 🎬 Ghép video cuối...")
             final = root / "video_hoan_thien_final.mp4"
             concat_batches(batch_videos, final)
             st.success(f"Hoàn thành! {all_scenes} cảnh.")
