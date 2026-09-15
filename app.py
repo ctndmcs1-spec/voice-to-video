@@ -1,13 +1,19 @@
 """
-Xưởng Video Diễn Hoạt Kiến Thức AI — Bản Siêu Cấp V4
+Xưởng Video Diễn Hoạt Kiến Thức AI — Bản Siêu Cấp V5
 =====================================================
-Nâng cấp V4 so với V3:
-- Tách title band 95px khỏi vùng camera (không bao giờ cắt tiêu đề)
-- Wide shot 100% ở đầu cảnh, zoom/pan chỉ sau khi vẽ xong
-- Vẽ tuần tự 3 phase theo nhịp: chính → phụ → nền
-- Vẽ nhanh hơn: bán kính 34px, 55% thời gian cảnh
-- 8 camera motion + 3 chế độ chọn (Auto/Random/Cố định)
-- 7 nhà cung cấp ảnh fallback tự động
+Tính năng V5:
+- 7 provider + Pollinations API chạy SONG SONG qua ThreadPoolExecutor
+- Auto load balancing: provider nào nhanh nhận nhiều scene hơn
+- Provider chết 3 lần liên tiếp → tự động loại khỏi pool
+- Fallback tuần tự nếu tất cả provider đều fail
+- Font fallback 4 lớp (hệ thống → Pillow → Internet → default)
+- Cleanup file trung gian tự động
+
+Kế thừa từ V4:
+- Title band 95px cố định (không cắt tiêu đề)
+- Vẽ tuần tự 3 phase: chính (40%) → phụ (35%) → nền (25%)
+- Wide shot đầu cảnh, zoom/pan sau khi vẽ xong
+- 8 camera motion + 3 chế độ chọn
 """
 
 import os
@@ -21,7 +27,11 @@ import random
 import shutil
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
+from queue import Queue
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 import streamlit as st
@@ -33,16 +43,17 @@ import numpy as np
 # ============================================================
 # CẤU HÌNH CHUNG
 # ============================================================
-APP_TITLE = "Xưởng Video Diễn Hoạt Kiến Thức AI (Bản Siêu Cấp V4)"
-BATCH_SECONDS = 5 * 60
+APP_TITLE = "Xưởng Video Diễn Hoạt Kiến Thức AI (Bản Siêu Cấp V5)"
+BATCH_SECONDS = 10 * 60  # 10 phút/batch cho voice 15 phút = 2 batch
 FPS = 30
 WIDTH = 1280
 HEIGHT = 720
 TITLE_BAND_H = 95
 CONTENT_H = HEIGHT - TITLE_BAND_H  # 625
-REVEAL_RADIUS = 34  # Bán kính vẽ (tăng để vẽ nhanh hơn)
-DRAW_DURATION_RATIO = 0.55  # Vẽ trong 55% thời gian cảnh
-PHASE_RATIOS = (0.40, 0.35, 0.25)  # Phase 1: 40%, Phase 2: 35%, Phase 3: 25%
+REVEAL_RADIUS = 34
+DRAW_DURATION_RATIO = 0.55
+PHASE_RATIOS = (0.40, 0.35, 0.25)
+MAX_CONSECUTIVE_ERRORS = 3  # Provider chết 3 lần → loại khỏi pool
 
 # --- Agnes AI ---
 AGNES_API_URL = "https://apihub.agnes-ai.com/v1/images/generations"
@@ -67,15 +78,15 @@ TOGETHER_MODEL = "black-forest-labs/FLUX.1-schnell-Free"
 NEXA_BASE = "https://api.nexa-api.com/v1/images/generations"
 NEXA_MODEL = "flux-schnell"
 
-# --- Pollinations (anonymous fallback) ---
-POLLINATIONS_BASE = "https://image.pollinations.ai/prompt/"
+# --- Pollinations API (có key) ---
+POLLINATIONS_BASE = "https://gen.pollinations.ai/image/"
 
 # ============================================================
 # GIAO DIỆN / CẤU HÌNH
 # ============================================================
 st.set_page_config(page_title=APP_TITLE, page_icon="🎬", layout="wide")
-st.title("🎬 Xưởng Video Diễn Hoạt Kiến Thức AI — Siêu Cấp V4")
-st.caption("Vẽ tuần tự 3 phase + Title band cố định + Wide shot đầu cảnh + 7 nhà cung cấp ảnh fallback")
+st.title("🎬 Xưởng Video Diễn Hoạt Kiến Thức AI — Siêu Cấp V5")
+st.caption("Vẽ 3 phase + Title band cố định + 8 camera motion + 7 provider SONG SONG + Font fallback 4 lớp")
 
 with st.sidebar:
     st.header("🔑 API Keys")
@@ -86,6 +97,18 @@ with st.sidebar:
     )
 
     with st.expander("🎨 Nhà cung cấp ảnh AI", expanded=True):
+        pollinations_key = st.text_input(
+            "Pollinations API Key",
+            value=st.secrets.get("POLLINATIONS_API_KEY", os.getenv("POLLINATIONS_API_KEY", "")),
+            type="password",
+            help="Lấy tại pollinations.ai — dùng model xịn (flux-pro, gptimage, kontext)",
+        )
+        pollinations_model = st.selectbox(
+            "Pollinations Model",
+            ["flux-pro", "flux", "gptimage", "kontext", "flux-realism"],
+            index=0,
+            help="flux-pro: chất lượng cao | kontext: giữ nhân vật nhất quán",
+        )
         agnes_key = st.text_input(
             "Agnes AI API Key (Miễn phí)",
             value=st.secrets.get("AGNES_API_KEY", os.getenv("AGNES_API_KEY", "")),
@@ -166,7 +189,7 @@ with st.sidebar:
         scene_max = scene_min
 
     st.header("⚙️ Cài đặt khác")
-    max_scenes = st.slider("Số cảnh tối đa mỗi batch", 5, 20, 14)
+    max_scenes = st.slider("Số cảnh tối đa mỗi batch", 5, 25, 20)
     image_timeout = st.slider("Timeout tạo ảnh (giây)", 30, 180, 120)
     flux_steps = st.slider("Số bước FLUX (cao = nét hơn, chậm hơn)", 4, 8, 4)
 
@@ -270,23 +293,20 @@ def sanitize_prompt_text(prompt):
     return cleaned
 
 # ============================================================
-# TITLE BAND HELPERS (MỚI V4)
+# TITLE BAND HELPERS
 # ============================================================
 def split_title_band(image_bgr):
-    """Tách band tiêu đề (y=0..95) và vùng nội dung (y=95..720)."""
     title_band = image_bgr[:TITLE_BAND_H, :].copy()
     content = image_bgr[TITLE_BAND_H:, :].copy()
     return title_band, content
 
 def compose_frame(title_band_bgr, content_bgr):
-    """Ghép band tiêu đề + vùng nội dung đã crop thành frame 1280x720."""
     canvas = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
     canvas[:TITLE_BAND_H] = title_band_bgr
     canvas[TITLE_BAND_H:] = content_bgr
     return canvas
 
 def crop_content_with_motion(content_bgr, scale, cx, cy):
-    """Crop vùng nội dung (1280x625) theo scale + tâm. Không cắt title."""
     ch, cw = content_bgr.shape[:2]
     crop_w = max(1, min(cw, int(cw / max(0.5, scale))))
     crop_h = max(1, min(ch, int(ch / max(0.5, scale))))
@@ -296,7 +316,6 @@ def crop_content_with_motion(content_bgr, scale, cx, cy):
     return cv2.resize(crop, (cw, ch), interpolation=cv2.INTER_LINEAR)
 
 def trajectory_to_content_space(trajectory_full):
-    """Chuyển tọa độ trajectory từ 1280x720 sang 1280x625 (bỏ 95px title)."""
     out = []
     for (px, py) in trajectory_full:
         if py >= TITLE_BAND_H:
@@ -306,28 +325,72 @@ def trajectory_to_content_space(trajectory_full):
     return out
 
 def split_trajectory_into_phases(trajectory, ratios=PHASE_RATIOS):
-    """Chia trajectory thành 3 phase theo tỉ lệ thời gian."""
     n = len(trajectory)
     if n < 3:
         return [trajectory, [], []]
     b1 = max(1, int(n * ratios[0]))
     b2 = max(b1 + 1, int(n * (ratios[0] + ratios[1])))
     b2 = min(b2, n - 1)
-    return [
-        trajectory[:b1],
-        trajectory[b1:b2],
-        trajectory[b2:],
-    ]
+    return [trajectory[:b1], trajectory[b1:b2], trajectory[b2:]]
 
-def reveal_phase(reveal_mask, phase_pts, progress, radius=REVEAL_RADIUS):
-    """Vẽ các điểm của phase vào reveal_mask theo tiến độ 0..1."""
-    if not phase_pts:
-        return
-    count = max(1, int(progress * len(phase_pts)))
-    count = min(count, len(phase_pts))
-    for pt in phase_pts[:count]:
-        cv2.circle(reveal_mask, pt, radius, 255, -1)
-    return phase_pts[count - 1] if count > 0 else phase_pts[0]
+# ============================================================
+# FONT FALLBACK 4 LỚP
+# ============================================================
+@st.cache_resource(show_spinner=False)
+def _download_fallback_font():
+    """Tải font DejaVu từ Internet nếu hệ thống không có."""
+    cache_path = Path("/tmp/DejaVuSans-Bold.ttf")
+    if cache_path.exists():
+        return str(cache_path)
+    urls = [
+        "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans-Bold.ttf",
+        "https://cdn.jsdelivr.net/gh/dejavu-fonts/dejavu-fonts/ttf/DejaVuSans-Bold.ttf",
+    ]
+    for url in urls:
+        try:
+            r = requests.get(url, timeout=30)
+            if r.status_code == 200 and len(r.content) > 100000:
+                cache_path.write_bytes(r.content)
+                return str(cache_path)
+        except Exception:
+            continue
+    return None
+
+def font_for(size):
+    """Tìm font hỗ trợ tiếng Việt với 4 lớp fallback."""
+    # Lớp 1: Font hệ thống
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+        "C:/Windows/Fonts/arialbd.ttf",
+        "C:/Windows/Fonts/segoeui.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            try:
+                return ImageFont.truetype(p, size)
+            except Exception:
+                continue
+
+    # Lớp 2: Font hệ thống có sẵn của Pillow
+    for fallback in ["arial.ttf", "Arial.ttf", "DejaVuSans.ttf"]:
+        try:
+            return ImageFont.truetype(fallback, size)
+        except Exception:
+            continue
+
+    # Lớp 3: Tải font từ Internet (cache)
+    try:
+        cached = _download_fallback_font()
+        if cached:
+            return ImageFont.truetype(cached, size)
+    except Exception:
+        pass
+
+    # Lớp 4: Chịu thua
+    return ImageFont.load_default()
 
 # ============================================================
 # BỘ ĐIỀU PHỐI KỊCH BẢN
@@ -445,8 +508,7 @@ TRANSCRIPT:
             if cm not in valid_motions:
                 cm = "zoom_in_center"
             clean.append({
-                "start": a,
-                "end": b,
+                "start": a, "end": b,
                 "title": str(s.get("title", "BÀI HỌC KIẾN THỨC")).strip().upper(),
                 "callout_type": ct,
                 "callout_text": str(s.get("callout_text", "")).strip(),
@@ -459,17 +521,14 @@ TRANSCRIPT:
 
     if not clean:
         clean = [{
-            "start": 0.0,
-            "end": batch_duration,
+            "start": 0.0, "end": batch_duration,
             "title": "BÀI HỌC QUAN TRỌNG",
-            "callout_type": "speech",
-            "callout_text": "RẤT SAI LẦM!",
-            "callout_side": "right",
-            "camera_motion": "zoom_in_center",
+            "callout_type": "speech", "callout_text": "RẤT SAI LẦM!",
+            "callout_side": "right", "camera_motion": "zoom_in_center",
             "visual_prompt": "2D comic doodle: a man standing at the edge of a cliff at sunset, looking down at a vast ocean of papers below, red sunset, blue waves, white background, bold black outlines, no text",
         }]
 
-    # Gộp cảnh ngắn (< 17s)
+    # Gộp cảnh ngắn
     merged = []
     for s in clean:
         if not merged:
@@ -491,7 +550,7 @@ TRANSCRIPT:
         clean[i]["end"] = clean[i + 1]["start"]
     clean[-1]["end"] = batch_duration
 
-    # Chia cảnh dài > 35s
+    # Chia cảnh dài
     final_scenes = []
     for s in clean:
         dur = s["end"] - s["start"]
@@ -514,7 +573,6 @@ TRANSCRIPT:
         else:
             final_scenes.append(s)
 
-    # Override camera_motion nếu user chọn
     if camera_mode == "random":
         motions_list = list(valid_motions - {"static"})
         for s in final_scenes:
@@ -531,7 +589,6 @@ TRANSCRIPT:
 # MULTI-PROVIDER IMAGE ENGINES
 # ============================================================
 def _build_full_prompt(prompt):
-    """Chỉ giữ style constraints, KHÔNG áp bố cục."""
     safe = sanitize_prompt_text(prompt)
     return f"""{safe}.
 
@@ -562,41 +619,39 @@ def agnes_image_request(prompt, api_key, timeout=120):
         raise RuntimeError("Agnes AI: chưa có API key")
     full_prompt = _build_full_prompt(prompt)
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {
-        "model": AGNES_MODEL, "prompt": full_prompt, "size": "1280x720",
-        "extra_body": {"response_format": "b64_json"},
-    }
-    for attempt in range(1, 4):
+    payload = {"model": AGNES_MODEL, "prompt": full_prompt, "size": "1280x720",
+               "extra_body": {"response_format": "b64_json"}}
+    for attempt in range(1, 3):
         try:
             r = requests.post(AGNES_API_URL, headers=headers, json=payload, timeout=timeout)
             if r.status_code == 429:
-                if attempt < 3:
-                    time.sleep(5 * attempt); continue
-                raise RuntimeError("Agnes AI: rate limit sau 3 lần thử")
+                if attempt < 2:
+                    time.sleep(3); continue
+                raise RuntimeError("Agnes AI: rate limit")
             if r.status_code >= 400:
-                raise RuntimeError(f"Agnes AI HTTP {r.status_code}: {r.text[:300]}")
+                raise RuntimeError(f"Agnes AI HTTP {r.status_code}")
             data = r.json()
             item = data.get("data", [{}])[0]
             if item.get("b64_json"):
                 return _validate_image_bytes(base64.b64decode(item["b64_json"]), "Agnes AI")
             if item.get("url"):
                 img = requests.get(item["url"], timeout=timeout)
-                return _validate_image_bytes(img.content, "Agnes AI (URL)")
-            raise RuntimeError(f"Agnes AI: response không có ảnh: {str(data)[:300]}")
+                return _validate_image_bytes(img.content, "Agnes AI")
+            raise RuntimeError("Agnes AI: no image in response")
         except requests.exceptions.Timeout:
-            if attempt < 3:
-                time.sleep(3 * attempt)
+            if attempt < 2:
+                time.sleep(2)
             else:
-                raise RuntimeError(f"Agnes AI timeout sau {timeout}s")
+                raise RuntimeError(f"Agnes AI timeout")
         except RuntimeError:
             raise
         except Exception as e:
-            if attempt < 3:
-                time.sleep(2 * attempt)
+            if attempt < 2:
+                time.sleep(1)
             else:
-                raise RuntimeError(f"Agnes AI lỗi: {e}")
+                raise RuntimeError(f"Agnes AI: {e}")
 
-# --- 2. CLOUDFLARE WORKERS AI ---
+# --- 2. CLOUDFLARE ---
 def cloudflare_image_request(prompt, account_id, api_token, timeout=120, steps=4):
     account_id = (account_id or "").strip()
     api_token = (api_token or "").strip()
@@ -606,34 +661,34 @@ def cloudflare_image_request(prompt, account_id, api_token, timeout=120, steps=4
     full_prompt = _build_full_prompt(prompt)
     payload = {"prompt": full_prompt, "steps": steps}
     headers = {"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"}
-    for attempt in range(1, 4):
+    for attempt in range(1, 3):
         try:
             r = requests.post(url, headers=headers, json=payload, timeout=timeout)
             if r.status_code == 429:
-                if attempt < 3:
-                    time.sleep(3 * attempt); continue
-                raise RuntimeError("Cloudflare: hết quota 10k neurons/ngày")
+                if attempt < 2:
+                    time.sleep(3); continue
+                raise RuntimeError("Cloudflare: hết quota")
             if r.status_code >= 400:
-                raise RuntimeError(f"Cloudflare HTTP {r.status_code}: {r.text[:300]}")
+                raise RuntimeError(f"Cloudflare HTTP {r.status_code}")
             data = r.json()
             if not data.get("success", True):
-                raise RuntimeError(f"Cloudflare lỗi: {str(data)[:300]}")
+                raise RuntimeError("Cloudflare: response fail")
             b64 = data.get("result", {}).get("image")
             if not b64:
-                raise RuntimeError("Cloudflare: không có trường image trong response")
+                raise RuntimeError("Cloudflare: no image")
             return _validate_image_bytes(base64.b64decode(b64), "Cloudflare")
         except requests.exceptions.Timeout:
-            if attempt < 3:
-                time.sleep(3 * attempt)
+            if attempt < 2:
+                time.sleep(2)
             else:
-                raise RuntimeError(f"Cloudflare timeout sau {timeout}s")
+                raise RuntimeError("Cloudflare timeout")
         except RuntimeError:
             raise
         except Exception as e:
-            if attempt < 3:
-                time.sleep(2 * attempt)
+            if attempt < 2:
+                time.sleep(1)
             else:
-                raise RuntimeError(f"Cloudflare lỗi: {e}")
+                raise RuntimeError(f"Cloudflare: {e}")
 
 # --- 3. HUGGING FACE ---
 def hf_image_request(prompt, token, timeout=120):
@@ -643,230 +698,391 @@ def hf_image_request(prompt, token, timeout=120):
     url = f"{HF_API_URL}{HF_MODEL}"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     full_prompt = _build_full_prompt(prompt)
-    for attempt in range(1, 4):
+    for attempt in range(1, 3):
         try:
             r = requests.post(url, headers=headers, json={"inputs": full_prompt}, timeout=timeout)
             if r.status_code == 503:
-                if attempt < 3:
-                    time.sleep(10 * attempt); continue
-                raise RuntimeError("Hugging Face: model đang load, thử lại sau")
+                if attempt < 2:
+                    time.sleep(5); continue
+                raise RuntimeError("HF: model loading")
             if r.status_code == 429:
-                if attempt < 3:
-                    time.sleep(5 * attempt); continue
-                raise RuntimeError("Hugging Face: hết quota miễn phí")
+                if attempt < 2:
+                    time.sleep(3); continue
+                raise RuntimeError("HF: rate limit")
             if r.status_code >= 400:
-                raise RuntimeError(f"Hugging Face HTTP {r.status_code}: {r.text[:300]}")
+                raise RuntimeError(f"HF HTTP {r.status_code}")
             return _validate_image_bytes(r.content, "Hugging Face")
         except requests.exceptions.Timeout:
-            if attempt < 3:
-                time.sleep(3 * attempt)
+            if attempt < 2:
+                time.sleep(2)
             else:
-                raise RuntimeError(f"Hugging Face timeout sau {timeout}s")
+                raise RuntimeError("HF timeout")
         except RuntimeError:
             raise
         except Exception as e:
-            if attempt < 3:
-                time.sleep(2 * attempt)
+            if attempt < 2:
+                time.sleep(1)
             else:
-                raise RuntimeError(f"Hugging Face lỗi: {e}")
+                raise RuntimeError(f"HF: {e}")
 
 # --- 4. FREETHEAI ---
 def freetheai_image_request(prompt, api_key, timeout=120):
     api_key = (api_key or "").strip()
     if not api_key:
-        raise RuntimeError("FreeTheAi: chưa có API key")
+        raise RuntimeError("FreeTheAi: chưa có key")
     full_prompt = _build_full_prompt(prompt)
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {"model": "flux", "prompt": full_prompt, "n": 1, "size": "1280x720"}
-    for attempt in range(1, 4):
+    for attempt in range(1, 3):
         try:
             r = requests.post(FREETHEAI_BASE, headers=headers, json=payload, timeout=timeout)
             if r.status_code == 429:
-                if attempt < 3:
-                    time.sleep(5 * attempt); continue
+                if attempt < 2:
+                    time.sleep(3); continue
                 raise RuntimeError("FreeTheAi: rate limit")
             if r.status_code >= 400:
-                raise RuntimeError(f"FreeTheAi HTTP {r.status_code}: {r.text[:300]}")
+                raise RuntimeError(f"FreeTheAi HTTP {r.status_code}")
             data = r.json()
             item = data.get("data", [{}])[0]
             if item.get("b64_json"):
                 return _validate_image_bytes(base64.b64decode(item["b64_json"]), "FreeTheAi")
             if item.get("url"):
                 img = requests.get(item["url"], timeout=timeout)
-                return _validate_image_bytes(img.content, "FreeTheAi (URL)")
-            raise RuntimeError(f"FreeTheAi: response không có ảnh: {str(data)[:300]}")
+                return _validate_image_bytes(img.content, "FreeTheAi")
+            raise RuntimeError("FreeTheAi: no image")
         except requests.exceptions.Timeout:
-            if attempt < 3:
-                time.sleep(3 * attempt)
+            if attempt < 2:
+                time.sleep(2)
             else:
-                raise RuntimeError(f"FreeTheAi timeout sau {timeout}s")
+                raise RuntimeError("FreeTheAi timeout")
         except RuntimeError:
             raise
         except Exception as e:
-            if attempt < 3:
-                time.sleep(2 * attempt)
+            if attempt < 2:
+                time.sleep(1)
             else:
-                raise RuntimeError(f"FreeTheAi lỗi: {e}")
+                raise RuntimeError(f"FreeTheAi: {e}")
 
 # --- 5. TOGETHER AI ---
 def together_image_request(prompt, api_key, timeout=120):
     api_key = (api_key or "").strip()
     if not api_key:
-        raise RuntimeError("Together AI: chưa có API key")
+        raise RuntimeError("Together AI: chưa có key")
     full_prompt = _build_full_prompt(prompt)
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {
-        "model": TOGETHER_MODEL, "prompt": full_prompt,
-        "width": WIDTH, "height": HEIGHT, "steps": 4, "n": 1,
-        "response_format": "b64_json",
-    }
-    for attempt in range(1, 4):
+    payload = {"model": TOGETHER_MODEL, "prompt": full_prompt,
+               "width": WIDTH, "height": HEIGHT, "steps": 4, "n": 1,
+               "response_format": "b64_json"}
+    for attempt in range(1, 3):
         try:
             r = requests.post(TOGETHER_BASE, headers=headers, json=payload, timeout=timeout)
             if r.status_code == 429:
-                if attempt < 3:
-                    time.sleep(5 * attempt); continue
-                raise RuntimeError("Together AI: rate limit")
+                if attempt < 2:
+                    time.sleep(3); continue
+                raise RuntimeError("Together: rate limit")
             if r.status_code >= 400:
-                raise RuntimeError(f"Together AI HTTP {r.status_code}: {r.text[:300]}")
+                raise RuntimeError(f"Together HTTP {r.status_code}")
             data = r.json()
             item = data.get("data", [{}])[0]
             if item.get("b64_json"):
                 return _validate_image_bytes(base64.b64decode(item["b64_json"]), "Together AI")
             if item.get("url"):
                 img = requests.get(item["url"], timeout=timeout)
-                return _validate_image_bytes(img.content, "Together AI (URL)")
-            raise RuntimeError(f"Together AI: response không có ảnh: {str(data)[:300]}")
+                return _validate_image_bytes(img.content, "Together AI")
+            raise RuntimeError("Together: no image")
         except requests.exceptions.Timeout:
-            if attempt < 3:
-                time.sleep(3 * attempt)
+            if attempt < 2:
+                time.sleep(2)
             else:
-                raise RuntimeError(f"Together AI timeout sau {timeout}s")
+                raise RuntimeError("Together timeout")
         except RuntimeError:
             raise
         except Exception as e:
-            if attempt < 3:
-                time.sleep(2 * attempt)
+            if attempt < 2:
+                time.sleep(1)
             else:
-                raise RuntimeError(f"Together AI lỗi: {e}")
+                raise RuntimeError(f"Together: {e}")
 
 # --- 6. NEXAAPI ---
 def nexa_image_request(prompt, api_key, timeout=120):
     api_key = (api_key or "").strip()
     if not api_key:
-        raise RuntimeError("NexaAPI: chưa có API key")
+        raise RuntimeError("NexaAPI: chưa có key")
     full_prompt = _build_full_prompt(prompt)
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {"model": NEXA_MODEL, "prompt": full_prompt, "width": WIDTH, "height": HEIGHT, "n": 1}
-    for attempt in range(1, 4):
+    for attempt in range(1, 3):
         try:
             r = requests.post(NEXA_BASE, headers=headers, json=payload, timeout=timeout)
             if r.status_code == 429:
-                if attempt < 3:
-                    time.sleep(5 * attempt); continue
+                if attempt < 2:
+                    time.sleep(3); continue
                 raise RuntimeError("NexaAPI: rate limit")
             if r.status_code >= 400:
-                raise RuntimeError(f"NexaAPI HTTP {r.status_code}: {r.text[:300]}")
+                raise RuntimeError(f"NexaAPI HTTP {r.status_code}")
             data = r.json()
             item = data.get("data", [{}])[0]
             if item.get("b64_json"):
                 return _validate_image_bytes(base64.b64decode(item["b64_json"]), "NexaAPI")
             if item.get("url"):
                 img = requests.get(item["url"], timeout=timeout)
-                return _validate_image_bytes(img.content, "NexaAPI (URL)")
-            raise RuntimeError(f"NexaAPI: response không có ảnh: {str(data)[:300]}")
+                return _validate_image_bytes(img.content, "NexaAPI")
+            raise RuntimeError("NexaAPI: no image")
         except requests.exceptions.Timeout:
-            if attempt < 3:
-                time.sleep(3 * attempt)
+            if attempt < 2:
+                time.sleep(2)
             else:
-                raise RuntimeError(f"NexaAPI timeout sau {timeout}s")
+                raise RuntimeError("NexaAPI timeout")
         except RuntimeError:
             raise
         except Exception as e:
-            if attempt < 3:
-                time.sleep(2 * attempt)
+            if attempt < 2:
+                time.sleep(1)
             else:
-                raise RuntimeError(f"NexaAPI lỗi: {e}")
+                raise RuntimeError(f"NexaAPI: {e}")
 
-# --- 7. POLLINATIONS ---
-def pollinations_image_request(prompt, timeout=120, seed=None):
+# --- 7. POLLINATIONS API (có key) ---
+def pollinations_image_request(prompt, api_key, model="flux-pro", timeout=120, seed=None):
+    api_key = (api_key or "").strip()
+    if not api_key:
+        raise RuntimeError("Pollinations: chưa có API key")
     full_prompt = _build_full_prompt(prompt)
     encoded = requests.utils.quote(full_prompt, safe="")
     url = f"{POLLINATIONS_BASE}{encoded}"
-    params = {"width": WIDTH, "height": HEIGHT, "model": "flux", "nologo": "true"}
+    params = {
+        "width": WIDTH, "height": HEIGHT, "model": model,
+        "nologo": "true", "enhance": "true", "safe": "false",
+    }
     if seed is not None:
         params["seed"] = seed
+    headers = {"Authorization": f"Bearer {api_key}", "Accept": "image/*"}
     for attempt in range(1, 3):
         try:
-            r = requests.get(url, params=params, timeout=timeout, headers={"Accept": "image/*"})
+            r = requests.get(url, params=params, headers=headers, timeout=timeout, allow_redirects=True)
+            if r.status_code == 401:
+                raise RuntimeError("Pollinations 401: key sai")
+            if r.status_code == 402:
+                raise RuntimeError("Pollinations 402: hết credit")
             if r.status_code == 429:
                 if attempt < 2:
-                    time.sleep(15); continue
-                raise RuntimeError("Pollinations: rate limit 15s")
+                    time.sleep(3); continue
+                raise RuntimeError("Pollinations 429: rate limit")
+            if r.status_code >= 500:
+                if attempt < 2:
+                    time.sleep(2); continue
+                raise RuntimeError(f"Pollinations {r.status_code}")
             if r.status_code >= 400:
-                raise RuntimeError(f"Pollinations HTTP {r.status_code}: {r.text[:200]}")
+                raise RuntimeError(f"Pollinations HTTP {r.status_code}")
             return _validate_image_bytes(r.content, "Pollinations")
         except requests.exceptions.Timeout:
             if attempt < 2:
-                time.sleep(5)
+                time.sleep(2)
             else:
-                raise RuntimeError(f"Pollinations timeout sau {timeout}s")
+                raise RuntimeError("Pollinations timeout")
         except RuntimeError:
             raise
         except Exception as e:
             if attempt < 2:
-                time.sleep(5)
+                time.sleep(1)
             else:
-                raise RuntimeError(f"Pollinations lỗi: {e}")
+                raise RuntimeError(f"Pollinations: {e}")
 
 # ============================================================
-# FALLBACK ORCHESTRATOR
+# PARALLEL IMAGE GENERATION (V5 - ĐIỂM NHẤN CHÍNH)
 # ============================================================
-def generate_image_with_fallback(prompt, provider_configs, timeout=120, seed=None):
-    errors = []
-    for cfg in provider_configs:
-        name = cfg["name"]
+def parallel_generate_images(scenes, batch_dir, providers, image_timeout,
+                              flux_steps=4, progress_callback=None):
+    """
+    Tạo ảnh SONG SONG với nhiều provider.
+    - Mỗi provider = 1 worker thread, lấy scene từ queue chung
+    - Ai xong trước thì lấy scene tiếp theo (auto load balancing)
+    - Provider chết 3 lần liên tiếp → tự động dừng
+    - Provider chết hết → fallback tuần tự
+    - Trả về dict {scene_index: provider_name}
+    """
+    if not providers:
+        raise RuntimeError("Không có provider nào được cấu hình.")
+
+    scene_queue = Queue()
+    for i, s in enumerate(scenes):
+        img_raw = batch_dir / f"scene_{i+1:03d}_raw.png"
+        img = batch_dir / f"scene_{i+1:03d}.jpg"
+        if not img.exists():
+            scene_queue.put((i, s, img_raw, img))
+
+    total = scene_queue.qsize()
+    if total == 0:
+        return {}
+
+    results = {}
+    results_lock = threading.Lock()
+    progress_lock = threading.Lock()
+    completed = [0]
+    provider_error_log = {p["name"]: 0 for p in providers}
+    provider_success_log = {p["name"]: 0 for p in providers}
+
+    def worker(provider_cfg):
+        provider_name = provider_cfg["name"]
+        consecutive_errors = 0
+
+        while consecutive_errors < MAX_CONSECUTIVE_ERRORS:
+            try:
+                idx, scene, img_raw, img = scene_queue.get_nowait()
+            except Exception:
+                return  # Queue rỗng → dừng
+
+            try:
+                seed = hash(f"{scene['visual_prompt']}_{idx}") % (2**31)
+                kwargs = provider_cfg.get("kwargs", {}).copy()
+                if "seed" in provider_cfg.get("supports_seed", []):
+                    kwargs["seed"] = seed
+
+                data = provider_cfg["fn"](
+                    scene["visual_prompt"],
+                    *provider_cfg.get("args", []),
+                    timeout=image_timeout,
+                    **kwargs,
+                )
+                if not data or len(data) < 500:
+                    raise RuntimeError(f"{provider_name}: dữ liệu rỗng")
+
+                save_image_from_bytes(data, img_raw)
+                add_comic_overlays(
+                    img_raw, scene["title"],
+                    scene.get("callout_type", "speech"),
+                    scene.get("callout_text", ""),
+                    scene.get("callout_side", "right"),
+                    img,
+                )
+
+                with results_lock:
+                    results[idx] = provider_name
+                    provider_success_log[provider_name] += 1
+                consecutive_errors = 0
+
+                with progress_lock:
+                    completed[0] += 1
+                    if progress_callback:
+                        progress_callback(completed[0] / total)
+
+            except Exception as e:
+                consecutive_errors += 1
+                with results_lock:
+                    provider_error_log[provider_name] += 1
+                # Đẩy scene lại queue
+                scene_queue.put((idx, scene, img_raw, img))
+                time.sleep(0.2)
+
+    # Chạy song song
+    with ThreadPoolExecutor(max_workers=len(providers)) as executor:
+        futures = [executor.submit(worker, p) for p in providers]
+        for f in as_completed(futures):
+            try:
+                f.result()
+            except Exception:
+                pass
+
+    # Fallback tuần tự cho scene còn lại
+    remaining = []
+    while not scene_queue.empty():
         try:
-            kwargs = cfg.get("kwargs", {}).copy()
-            if "seed" in cfg.get("supports_seed", []):
-                kwargs["seed"] = seed
-            data = cfg["fn"](prompt, *cfg.get("args", []), timeout=timeout, **kwargs)
-            if data and len(data) > 500:
-                return data, name
-        except Exception as e:
-            errors.append(f"{name}: {str(e)[:200]}")
-            continue
-    error_summary = "\n".join(f"• {e}" for e in errors) if errors else "Không có nhà cung cấp nào"
-    raise RuntimeError(f"Tất cả nhà cung cấp đều thất bại:\n{error_summary}")
+            remaining.append(scene_queue.get_nowait())
+        except Exception:
+            break
+
+    if remaining:
+        st.warning(f"⚠️ Còn {len(remaining)} cảnh chưa xử lý, chuyển sang tuần tự...")
+        for idx, scene, img_raw, img in remaining:
+            success = False
+            for cfg in providers:
+                try:
+                    seed = hash(f"{scene['visual_prompt']}_{idx}") % (2**31)
+                    kwargs = cfg.get("kwargs", {}).copy()
+                    if "seed" in cfg.get("supports_seed", []):
+                        kwargs["seed"] = seed
+                    data = cfg["fn"](
+                        scene["visual_prompt"], *cfg.get("args", []),
+                        timeout=image_timeout, **kwargs,
+                    )
+                    if data and len(data) > 500:
+                        save_image_from_bytes(data, img_raw)
+                        add_comic_overlays(
+                            img_raw, scene["title"],
+                            scene.get("callout_type", "speech"),
+                            scene.get("callout_text", ""),
+                            scene.get("callout_side", "right"),
+                            img,
+                        )
+                        with results_lock:
+                            results[idx] = cfg["name"]
+                        success = True
+                        break
+                except Exception:
+                    continue
+            if not success:
+                raise RuntimeError(f"Không tạo được ảnh cho cảnh {idx+1}")
+
+    # In thống kê
+    st.write("**📊 Phân bổ provider:**")
+    cols = st.columns(min(4, len(providers)))
+    for i, p in enumerate(providers):
+        name = p["name"]
+        ok = provider_success_log.get(name, 0)
+        err = provider_error_log.get(name, 0)
+        with cols[i % len(cols)]:
+            if ok > 0:
+                st.success(f"✅ {name}: {ok} ảnh")
+            elif err > 0:
+                st.error(f"❌ {name}: 0/{err} lỗi")
+            else:
+                st.info(f"⚪ {name}: không dùng")
+
+    return results
 
 def build_provider_list(cf_account, cf_token, hf_token, freetheai_key,
-                         together_key, nexa_key, agnes_key, flux_steps=4):
+                         together_key, nexa_key, agnes_key,
+                         pollinations_key="", pollinations_model="flux-pro",
+                         flux_steps=4):
+    """Xây dựng list provider. Pollinations API đặt đầu tiên vì có key xịn."""
     providers = []
+
+    # Pollinations API có key — ưu tiên số 1
+    if pollinations_key and pollinations_key.strip():
+        providers.append({
+            "name": f"Pollinations ({pollinations_model})",
+            "fn": pollinations_image_request,
+            "args": [pollinations_key.strip(), pollinations_model],
+            "kwargs": {},
+            "supports_seed": ["seed"],
+        })
+
     if agnes_key and agnes_key.strip():
         providers.append({"name": "Agnes AI", "fn": agnes_image_request, "args": [agnes_key.strip()]})
+
     if cf_account and cf_token and cf_account.strip() and cf_token.strip():
         providers.append({
             "name": "Cloudflare", "fn": cloudflare_image_request,
             "args": [cf_account.strip(), cf_token.strip()],
             "kwargs": {"steps": flux_steps},
         })
+
     if hf_token and hf_token.strip():
         providers.append({"name": "Hugging Face", "fn": hf_image_request, "args": [hf_token.strip()]})
+
     if freetheai_key and freetheai_key.strip():
         providers.append({"name": "FreeTheAi", "fn": freetheai_image_request, "args": [freetheai_key.strip()]})
+
     if together_key and together_key.strip():
         providers.append({"name": "Together AI", "fn": together_image_request, "args": [together_key.strip()]})
+
     if nexa_key and nexa_key.strip():
         providers.append({"name": "NexaAPI", "fn": nexa_image_request, "args": [nexa_key.strip()]})
-    providers.append({
-        "name": "Pollinations (anonymous)", "fn": pollinations_image_request,
-        "args": [], "kwargs": {"seed": None}, "supports_seed": ["seed"],
-    })
+
     return providers
 
 def save_image_from_bytes(data, output_path):
     if not data:
-        raise RuntimeError("Dữ liệu ảnh rỗng (None/empty)")
+        raise RuntimeError("Dữ liệu ảnh rỗng")
     Path(output_path).write_bytes(data)
     try:
         with Image.open(output_path) as im:
@@ -879,26 +1095,12 @@ def save_image_from_bytes(data, output_path):
         raise RuntimeError(f"Ảnh không hợp lệ: {e}")
 
 # ============================================================
-# FONT & OVERLAY COMIC
+# OVERLAY COMIC
 # ============================================================
-def font_for(size):
-    candidates = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
-    ]
-    for p in candidates:
-        if os.path.exists(p):
-            try:
-                return ImageFont.truetype(p, size)
-            except Exception:
-                continue
-    return ImageFont.load_default()
-
 def add_comic_overlays(image_path, title, callout_type, callout_text, callout_side, output_path):
     img = Image.open(image_path).convert("RGB").resize((WIDTH, HEIGHT))
     draw = ImageDraw.Draw(img)
 
-    # Vẽ title vào band 95px (sẽ được tách ra và giữ cố định khi render)
     if title:
         draw.rectangle([0, 0, WIDTH, TITLE_BAND_H], fill="white")
         SAFE_TITLE_WIDTH = 850
@@ -950,7 +1152,7 @@ def add_comic_overlays(image_path, title, callout_type, callout_text, callout_si
     img.save(output_path, quality=95)
 
 # ============================================================
-# BÀN TAY & TRIỆT TIÊU BÓNG MỜ
+# BÀN TAY
 # ============================================================
 def generate_fallback_hand():
     S = 320
@@ -997,7 +1199,6 @@ def load_hand_asset(hand_path, target_width=320):
 
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     alpha = cv2.erode(alpha, kernel, iterations=1)
-
     blurred_alpha = cv2.GaussianBlur(alpha, (3, 3), 0)
     alpha = np.minimum(alpha, blurred_alpha)
 
@@ -1041,7 +1242,6 @@ def extract_continuous_trajectory(image_path):
 
     title_mask = np.zeros_like(binary)
     title_mask[:TITLE_BAND_H, :] = binary[:TITLE_BAND_H, :]
-
     body_mask = np.zeros_like(binary)
     body_mask[TITLE_BAND_H:, :] = binary[TITLE_BAND_H:, :]
 
@@ -1070,13 +1270,10 @@ def extract_staggered_trajectories(image_path):
 
     m_title = np.zeros_like(binary)
     m_title[:TITLE_BAND_H, :] = binary[:TITLE_BAND_H, :]
-
     m_left = np.zeros_like(binary)
     m_left[TITLE_BAND_H:HEIGHT, :int(WIDTH * 0.48)] = binary[TITLE_BAND_H:HEIGHT, :int(WIDTH * 0.48)]
-
     m_right_char = np.zeros_like(binary)
     m_right_char[TITLE_BAND_H:int(HEIGHT * 0.72), int(WIDTH * 0.48):] = binary[TITLE_BAND_H:int(HEIGHT * 0.72), int(WIDTH * 0.48):]
-
     m_bottom_badge = np.zeros_like(binary)
     m_bottom_badge[int(HEIGHT * 0.72):, int(WIDTH * 0.48):] = binary[int(HEIGHT * 0.72):, int(WIDTH * 0.48):]
 
@@ -1097,12 +1294,7 @@ def extract_staggered_trajectories(image_path):
                 pts.append((int(p[0]), int(p[1])))
         return pts
 
-    zones = [
-        to_points(t_sorted),
-        to_points(l_sorted),
-        to_points(r_sorted),
-        to_points(b_sorted),
-    ]
+    zones = [to_points(t_sorted), to_points(l_sorted), to_points(r_sorted), to_points(b_sorted)]
     return [z for z in zones if len(z) > 10]
 
 def paste_hand(frame_bgr, hand_bgr, hand_alpha, x, y):
@@ -1114,7 +1306,6 @@ def paste_hand(frame_bgr, hand_bgr, hand_alpha, x, y):
         return
     hx1, hy1 = x1 - x, y1 - y
     hx2, hy2 = hx1 + (x2 - x1), hy1 + (y2 - y1)
-
     sub_hand = hand_bgr[hy1:hy2, hx1:hx2]
     sub_alpha = (hand_alpha[hy1:hy2, hx1:hx2].astype(np.float32) / 255.0)[:, :, None]
     roi = frame_bgr[y1:y2, x1:x2].astype(np.float32)
@@ -1125,44 +1316,18 @@ def ease_in_out(t):
     return 0.5 * (1.0 - math.cos(math.pi * t))
 
 # ============================================================
-# CAMERA MOTION PRESETS
+# CAMERA MOTION
 # ============================================================
 def get_motion_keyframes(motion):
-    """Trả về list keyframes: (t, scale, cx, cy). t từ 0.0 → 1.0.
-    cx, cy trong hệ tọa độ 1280x720, sẽ được scale về CONTENT_H khi dùng."""
     presets = {
-        "zoom_in_center": [
-            (0.0, 1.00, WIDTH * 0.50, HEIGHT * 0.50),
-            (1.0, 1.22, WIDTH * 0.50, HEIGHT * 0.50),
-        ],
-        "zoom_out_center": [
-            (0.0, 1.22, WIDTH * 0.50, HEIGHT * 0.50),
-            (1.0, 1.00, WIDTH * 0.50, HEIGHT * 0.50),
-        ],
-        "pan_left_to_right": [
-            (0.0, 1.12, WIDTH * 0.35, HEIGHT * 0.50),
-            (1.0, 1.12, WIDTH * 0.65, HEIGHT * 0.50),
-        ],
-        "pan_right_to_left": [
-            (0.0, 1.12, WIDTH * 0.65, HEIGHT * 0.50),
-            (1.0, 1.12, WIDTH * 0.35, HEIGHT * 0.50),
-        ],
-        "zoom_in_top_left": [
-            (0.0, 1.00, WIDTH * 0.50, HEIGHT * 0.50),
-            (1.0, 1.24, WIDTH * 0.30, HEIGHT * 0.35),
-        ],
-        "zoom_in_bottom_right": [
-            (0.0, 1.00, WIDTH * 0.50, HEIGHT * 0.50),
-            (1.0, 1.24, WIDTH * 0.70, HEIGHT * 0.65),
-        ],
-        "ken_burns_slow": [
-            (0.0, 1.05, WIDTH * 0.45, HEIGHT * 0.48),
-            (1.0, 1.18, WIDTH * 0.55, HEIGHT * 0.52),
-        ],
-        "static": [
-            (0.0, 1.00, WIDTH * 0.50, HEIGHT * 0.50),
-            (1.0, 1.00, WIDTH * 0.50, HEIGHT * 0.50),
-        ],
+        "zoom_in_center": [(0.0, 1.00, WIDTH*0.50, HEIGHT*0.50), (1.0, 1.22, WIDTH*0.50, HEIGHT*0.50)],
+        "zoom_out_center": [(0.0, 1.22, WIDTH*0.50, HEIGHT*0.50), (1.0, 1.00, WIDTH*0.50, HEIGHT*0.50)],
+        "pan_left_to_right": [(0.0, 1.12, WIDTH*0.35, HEIGHT*0.50), (1.0, 1.12, WIDTH*0.65, HEIGHT*0.50)],
+        "pan_right_to_left": [(0.0, 1.12, WIDTH*0.65, HEIGHT*0.50), (1.0, 1.12, WIDTH*0.35, HEIGHT*0.50)],
+        "zoom_in_top_left": [(0.0, 1.00, WIDTH*0.50, HEIGHT*0.50), (1.0, 1.24, WIDTH*0.30, HEIGHT*0.35)],
+        "zoom_in_bottom_right": [(0.0, 1.00, WIDTH*0.50, HEIGHT*0.50), (1.0, 1.24, WIDTH*0.70, HEIGHT*0.65)],
+        "ken_burns_slow": [(0.0, 1.05, WIDTH*0.45, HEIGHT*0.48), (1.0, 1.18, WIDTH*0.55, HEIGHT*0.52)],
+        "static": [(0.0, 1.00, WIDTH*0.50, HEIGHT*0.50), (1.0, 1.00, WIDTH*0.50, HEIGHT*0.50)],
     }
     return presets.get(motion, presets["zoom_in_center"])
 
@@ -1187,10 +1352,9 @@ def interpolate_motion(keyframes, p):
     return s, cx, cy
 
 # ============================================================
-# RENDER SCENES (V4: TITLE BAND + 3-PHASE DRAWING + WIDE START)
+# RENDER SCENES
 # ============================================================
 def render_scene_kttv_v2(image_path, duration, output_path, hand_path, motion="zoom_in_center"):
-    """Phong cách 1: Vẽ tuần tự 3 phase + Camera motion sau khi vẽ xong."""
     total_frames = max(1, round(duration * FPS))
     draw_duration = max(1.5, min(duration - 0.8, duration * DRAW_DURATION_RATIO))
     draw_frames = int(draw_duration * FPS)
@@ -1212,7 +1376,6 @@ def render_scene_kttv_v2(image_path, duration, output_path, hand_path, motion="z
     all_points = trajectory_to_content_space(all_points_full)
     phases = split_trajectory_into_phases(all_points)
 
-    # Tính frame boundary cho từng phase
     phase_frames = [
         int(draw_frames * PHASE_RATIOS[0]),
         int(draw_frames * (PHASE_RATIOS[0] + PHASE_RATIOS[1])),
@@ -1221,12 +1384,10 @@ def render_scene_kttv_v2(image_path, duration, output_path, hand_path, motion="z
 
     hand_bgr, hand_alpha, tip_x, tip_y = load_hand_asset(hand_path, target_width=320)
 
-    cmd = [
-        "ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
-        "-s", f"{WIDTH}x{HEIGHT}", "-pix_fmt", "bgr24", "-r", str(FPS),
-        "-i", "-", "-an", "-c:v", "libx264", "-preset", "veryfast",
-        "-pix_fmt", "yuv420p", str(output_path),
-    ]
+    cmd = ["ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
+           "-s", f"{WIDTH}x{HEIGHT}", "-pix_fmt", "bgr24", "-r", str(FPS),
+           "-i", "-", "-an", "-c:v", "libx264", "-preset", "veryfast",
+           "-pix_fmt", "yuv420p", str(output_path)]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
     last_tip = all_points[0] if all_points else (WIDTH // 2, CONTENT_H // 2)
@@ -1237,24 +1398,21 @@ def render_scene_kttv_v2(image_path, duration, output_path, hand_path, motion="z
         hand_pos_x, hand_pos_y = 0, 0
 
         if f_idx < draw_frames:
-            # Xác định phase hiện tại
             if f_idx < phase_frames[0]:
-                current_phase = 0
+                cur_phase = 0
                 local_p = f_idx / max(1, phase_frames[0])
             elif f_idx < phase_frames[1]:
-                current_phase = 1
+                cur_phase = 1
                 local_p = (f_idx - phase_frames[0]) / max(1, phase_frames[1] - phase_frames[0])
             else:
-                current_phase = 2
+                cur_phase = 2
                 local_p = (f_idx - phase_frames[1]) / max(1, phase_frames[2] - phase_frames[1])
 
-            # Vẽ tất cả phase đã hoàn thành
-            for p_i in range(current_phase):
+            for p_i in range(cur_phase):
                 for pt in phases[p_i]:
                     cv2.circle(reveal_mask, pt, REVEAL_RADIUS, 255, -1)
 
-            # Vẽ phase hiện tại theo local_p
-            current_pts = phases[current_phase]
+            current_pts = phases[cur_phase]
             if current_pts:
                 count = max(1, int(local_p * len(current_pts)))
                 count = min(count, len(current_pts))
@@ -1284,7 +1442,6 @@ def render_scene_kttv_v2(image_path, duration, output_path, hand_path, motion="z
         if hand_visible:
             paste_hand(frame_content, hand_bgr, hand_alpha, hand_pos_x - tip_x, hand_pos_y - tip_y)
 
-        # Camera: wide shot trong lúc vẽ, zoom sau khi vẽ xong
         if f_idx < draw_frames + retract_frames:
             scale = 1.0
             cx_use = WIDTH * 0.5
@@ -1308,7 +1465,6 @@ def render_scene_kttv_v2(image_path, duration, output_path, hand_path, motion="z
         raise RuntimeError("FFmpeg render thất bại (Chế độ 1)")
 
 def render_scene_hybrid(image_path, duration, output_path, hand_path, motion="zoom_in_center"):
-    """Phong cách 2: Tay vẽ bám nét + Camera steadicam + 3 phase."""
     total_frames = max(1, round(duration * FPS))
     draw_duration = max(1.5, min(duration - 0.8, duration * DRAW_DURATION_RATIO))
     draw_frames = int(draw_duration * FPS)
@@ -1335,12 +1491,10 @@ def render_scene_hybrid(image_path, duration, output_path, hand_path, motion="zo
 
     hand_bgr, hand_alpha, tip_x, tip_y = load_hand_asset(hand_path, target_width=320)
 
-    cmd = [
-        "ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
-        "-s", f"{WIDTH}x{HEIGHT}", "-pix_fmt", "bgr24", "-r", str(FPS),
-        "-i", "-", "-an", "-c:v", "libx264", "-preset", "veryfast",
-        "-pix_fmt", "yuv420p", str(output_path),
-    ]
+    cmd = ["ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
+           "-s", f"{WIDTH}x{HEIGHT}", "-pix_fmt", "bgr24", "-r", str(FPS),
+           "-i", "-", "-an", "-c:v", "libx264", "-preset", "veryfast",
+           "-pix_fmt", "yuv420p", str(output_path)]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
     last_tip = trajectory[0] if trajectory else (WIDTH // 2, CONTENT_H // 2)
@@ -1352,20 +1506,20 @@ def render_scene_hybrid(image_path, duration, output_path, hand_path, motion="zo
 
         if f_idx < draw_frames:
             if f_idx < phase_frames[0]:
-                current_phase = 0
+                cur_phase = 0
                 local_p = f_idx / max(1, phase_frames[0])
             elif f_idx < phase_frames[1]:
-                current_phase = 1
+                cur_phase = 1
                 local_p = (f_idx - phase_frames[0]) / max(1, phase_frames[1] - phase_frames[0])
             else:
-                current_phase = 2
+                cur_phase = 2
                 local_p = (f_idx - phase_frames[1]) / max(1, phase_frames[2] - phase_frames[1])
 
-            for p_i in range(current_phase):
+            for p_i in range(cur_phase):
                 for pt in phases[p_i]:
                     cv2.circle(reveal_mask, pt, REVEAL_RADIUS, 255, -1)
 
-            current_pts = phases[current_phase]
+            current_pts = phases[cur_phase]
             if current_pts:
                 count = max(1, int(local_p * len(current_pts)))
                 count = min(count, len(current_pts))
@@ -1418,17 +1572,14 @@ def render_scene_hybrid(image_path, duration, output_path, hand_path, motion="zo
         raise RuntimeError("FFmpeg render thất bại (Chế độ 2)")
 
 def render_scene_kttv_pure(image_path, duration, output_path, motion="zoom_in_center"):
-    """Phong cách 3: Chỉ camera pan/zoom, không vẽ tay."""
     total_frames = max(1, round(duration * FPS))
     original_full = cv2.resize(cv2.imread(str(image_path)), (WIDTH, HEIGHT))
     title_band, content_bgr = split_title_band(original_full)
 
-    cmd = [
-        "ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
-        "-s", f"{WIDTH}x{HEIGHT}", "-pix_fmt", "bgr24", "-r", str(FPS),
-        "-i", "-", "-an", "-c:v", "libx264", "-preset", "veryfast",
-        "-pix_fmt", "yuv420p", str(output_path),
-    ]
+    cmd = ["ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
+           "-s", f"{WIDTH}x{HEIGHT}", "-pix_fmt", "bgr24", "-r", str(FPS),
+           "-i", "-", "-an", "-c:v", "libx264", "-preset", "veryfast",
+           "-pix_fmt", "yuv420p", str(output_path)]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
     motion_kfs = get_motion_keyframes(motion)
 
@@ -1444,7 +1595,6 @@ def render_scene_kttv_pure(image_path, duration, output_path, motion="zoom_in_ce
     proc.wait()
 
 def render_scene_classic_hand(image_path, duration, output_path, hand_path, motion="zoom_in_center"):
-    """Phong cách 4: Bảng trắng cổ điển, góc máy tĩnh + 3 phase."""
     total_frames = max(1, round(duration * FPS))
     draw_frames = int(max(1.5, min(duration - 0.8, duration * DRAW_DURATION_RATIO)) * FPS)
     retract_frames = int(0.35 * FPS)
@@ -1466,12 +1616,10 @@ def render_scene_classic_hand(image_path, duration, output_path, hand_path, moti
 
     hand_bgr, hand_alpha, tip_x, tip_y = load_hand_asset(hand_path)
 
-    cmd = [
-        "ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
-        "-s", f"{WIDTH}x{HEIGHT}", "-pix_fmt", "bgr24", "-r", str(FPS),
-        "-i", "-", "-an", "-c:v", "libx264", "-preset", "veryfast",
-        "-pix_fmt", "yuv420p", str(output_path),
-    ]
+    cmd = ["ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
+           "-s", f"{WIDTH}x{HEIGHT}", "-pix_fmt", "bgr24", "-r", str(FPS),
+           "-i", "-", "-an", "-c:v", "libx264", "-preset", "veryfast",
+           "-pix_fmt", "yuv420p", str(output_path)]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
     last_tip = trajectory[0] if trajectory else (WIDTH // 2, CONTENT_H // 2)
 
@@ -1479,20 +1627,20 @@ def render_scene_classic_hand(image_path, duration, output_path, hand_path, moti
         hand_visible = False
         if f_idx < draw_frames:
             if f_idx < phase_frames[0]:
-                current_phase = 0
+                cur_phase = 0
                 local_p = f_idx / max(1, phase_frames[0])
             elif f_idx < phase_frames[1]:
-                current_phase = 1
+                cur_phase = 1
                 local_p = (f_idx - phase_frames[0]) / max(1, phase_frames[1] - phase_frames[0])
             else:
-                current_phase = 2
+                cur_phase = 2
                 local_p = (f_idx - phase_frames[1]) / max(1, phase_frames[2] - phase_frames[1])
 
-            for p_i in range(current_phase):
+            for p_i in range(cur_phase):
                 for pt in phases[p_i]:
                     cv2.circle(reveal_mask, pt, REVEAL_RADIUS, 255, -1)
 
-            current_pts = phases[current_phase]
+            current_pts = phases[cur_phase]
             if current_pts:
                 count = max(1, int(local_p * len(current_pts)))
                 count = min(count, len(current_pts))
@@ -1529,35 +1677,50 @@ def render_scene_classic_hand(image_path, duration, output_path, hand_path, moti
     proc.wait()
 
 # ============================================================
-# RENDER BATCH
+# RENDER BATCH (V5: PARALLEL IMAGE GEN)
 # ============================================================
 def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
                  cf_account, cf_token, hf_token, freetheai_key, together_key,
-                 nexa_key, agnes_key, image_timeout, flux_steps=4, progress_callback=None):
+                 nexa_key, agnes_key, pollinations_key, pollinations_model,
+                 image_timeout, flux_steps=4, progress_callback=None):
     scene_videos = []
     total = len(scenes)
     if total == 0:
         raise RuntimeError("Không có cảnh nào để render trong batch này.")
 
-    providers = build_provider_list(cf_account, cf_token, hf_token, freetheai_key,
-                                     together_key, nexa_key, agnes_key, flux_steps)
+    providers = build_provider_list(
+        cf_account, cf_token, hf_token, freetheai_key,
+        together_key, nexa_key, agnes_key,
+        pollinations_key, pollinations_model, flux_steps,
+    )
+    if not providers:
+        raise RuntimeError("Chưa cấu hình nhà cung cấp ảnh nào.")
     provider_names = [p["name"] for p in providers]
-    st.caption(f"🔗 Thứ tự fallback: {' → '.join(provider_names)}")
+    st.caption(f"🔗 {len(providers)} provider SONG SONG: {' | '.join(provider_names)}")
 
+    # ============================================
+    # PHASE 1: Tạo ảnh SONG SONG (60% thời gian)
+    # ============================================
+    st.write(f"🎨 Đang tạo {total} ảnh song song qua {len(providers)} nhà cung cấp...")
+
+    def img_progress(frac):
+        if progress_callback:
+            progress_callback(frac * 0.6)
+
+    _ = parallel_generate_images(
+        scenes, batch_dir, providers, image_timeout, flux_steps, img_progress,
+    )
+
+    # ============================================
+    # PHASE 2: Render video tuần tự (40% thời gian)
+    # ============================================
+    st.write(f"🎬 Đang render {total} video scene...")
     for i, s in enumerate(scenes, 1):
-        img_raw = batch_dir / f"scene_{i:03d}_raw.png"
         img = batch_dir / f"scene_{i:03d}.jpg"
         vid = batch_dir / f"scene_{i:03d}.mp4"
 
         if not img.exists():
-            seed = hash(f"{s['visual_prompt']}_{i}") % (2**31)
-            st.write(f"🖼️ Cảnh {i}/{total}: đang tạo ảnh...")
-            data, used_provider = generate_image_with_fallback(
-                s["visual_prompt"], providers, timeout=image_timeout, seed=seed)
-            st.caption(f"   → Tạo bởi: **{used_provider}**")
-            save_image_from_bytes(data, img_raw)
-            add_comic_overlays(img_raw, s["title"], s.get("callout_type", "speech"),
-                               s.get("callout_text", ""), s.get("callout_side", "right"), img)
+            raise RuntimeError(f"Thiếu ảnh scene {i}")
 
         duration = max(1.0, float(s["end"]) - float(s["start"]))
         motion = s.get("camera_motion", "zoom_in_center")
@@ -1573,28 +1736,33 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
 
         scene_videos.append(vid)
         if progress_callback:
-            progress_callback(i / total)
+            progress_callback(0.6 + (i / total) * 0.4)
 
     concat_file = batch_dir / "concat.txt"
     concat_file.write_text("\n".join(f"file '{p.resolve()}'" for p in scene_videos), encoding="utf-8")
     batch_video = batch_dir / "batch_video.mp4"
     run_cmd([
         "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-        "-i", str(concat_file),
-        "-c", "copy", "-movflags", "+faststart",
+        "-i", str(concat_file), "-c", "copy", "-movflags", "+faststart",
         str(batch_video),
     ], timeout=900)
 
     final_batch = batch_dir / "batch_final.mp4"
     run_cmd([
-        "ffmpeg", "-y",
-        "-i", str(batch_video),
-        "-i", str(batch_audio),
+        "ffmpeg", "-y", "-i", str(batch_video), "-i", str(batch_audio),
         "-map", "0:v:0", "-map", "1:a:0",
         "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
-        "-movflags", "+faststart",
-        str(final_batch),
+        "-movflags", "+faststart", str(final_batch),
     ], timeout=900)
+
+    # Cleanup file trung gian
+    for f in batch_dir.glob("scene_*_raw.png"):
+        f.unlink(missing_ok=True)
+    for f in batch_dir.glob("scene_*.mp4"):
+        f.unlink(missing_ok=True)
+    concat_file.unlink(missing_ok=True)
+    batch_video.unlink(missing_ok=True)
+
     return final_batch
 
 def concat_batches(batch_videos, output_path):
@@ -1602,8 +1770,7 @@ def concat_batches(batch_videos, output_path):
     concat.write_text("\n".join(f"file '{p.resolve()}'" for p in batch_videos), encoding="utf-8")
     run_cmd([
         "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-        "-i", str(concat),
-        "-c", "copy", "-movflags", "+faststart",
+        "-i", str(concat), "-c", "copy", "-movflags", "+faststart",
         str(output_path),
     ], timeout=1800)
 
@@ -1613,23 +1780,41 @@ def concat_batches(batch_videos, output_path):
 st.sidebar.divider()
 
 if st.sidebar.button("🔎 KIỂM TRA NHÀ CUNG CẤP ẢNH", use_container_width=True):
-    providers = build_provider_list(cf_account, cf_token, hf_token, freetheai_key,
-                                     together_key, nexa_key, agnes_key, flux_steps)
-    st.write(f"**Phát hiện {len(providers)} nhà cung cấp:**")
-    for p in providers:
-        st.write(f"• {p['name']}")
-    try:
-        with st.spinner("Đang test tạo ảnh qua waterfall..."):
-            data, used = generate_image_with_fallback(
-                "2D comic doodle: a man standing at the edge of a cliff at sunset, "
-                "looking down at a vast ocean of papers below, red sunset, blue waves, "
-                "white background, bold black outlines, no text",
-                providers, timeout=120)
-            img = Image.open(io.BytesIO(data)).convert("RGB").resize((WIDTH, HEIGHT))
-        st.success(f"✅ Ảnh tạo thành công qua **{used}**!")
-        st.image(img, caption=f"Nhà cung cấp: {used}", use_container_width=True)
-    except Exception as e:
-        st.error(f"❌ {e}")
+    providers = build_provider_list(
+        cf_account, cf_token, hf_token, freetheai_key,
+        together_key, nexa_key, agnes_key,
+        pollinations_key, pollinations_model, flux_steps,
+    )
+    if not providers:
+        st.error("Chưa cấu hình nhà cung cấp nào. Nhập ít nhất 1 API key.")
+    else:
+        st.write(f"**Phát hiện {len(providers)} nhà cung cấp:**")
+        for p in providers:
+            st.write(f"• {p['name']}")
+        try:
+            with st.spinner("Đang test tạo ảnh..."):
+                data, used = generate_image_with_fallback_test(
+                    "2D comic doodle: a man standing at the edge of a cliff at sunset, "
+                    "looking down at a vast ocean of papers below, red sunset, blue waves, "
+                    "white background, bold black outlines, no text",
+                    providers, timeout=120)
+                img = Image.open(io.BytesIO(data)).convert("RGB").resize((WIDTH, HEIGHT))
+            st.success(f"✅ Ảnh tạo thành công qua **{used}**!")
+            st.image(img, caption=f"Provider: {used}", use_container_width=True)
+        except Exception as e:
+            st.error(f"❌ {e}")
+
+def generate_image_with_fallback_test(prompt, providers, timeout=120):
+    """Test waterfall tuần tự cho nút kiểm tra."""
+    errors = []
+    for cfg in providers:
+        try:
+            data = cfg["fn"](prompt, *cfg.get("args", []), timeout=timeout, **cfg.get("kwargs", {}))
+            if data and len(data) > 500:
+                return data, cfg["name"]
+        except Exception as e:
+            errors.append(f"{cfg['name']}: {str(e)[:100]}")
+    raise RuntimeError("Tất cả provider fail:\n" + "\n".join(f"• {e}" for e in errors))
 
 audio = st.file_uploader(
     "🎤 Tải lên tệp ghi âm giọng nói",
@@ -1644,12 +1829,12 @@ if audio:
             st.error("Vui lòng nhập Groq API Key.")
             st.stop()
 
-        root = Path(tempfile.mkdtemp(prefix="wb_v4_"))
+        root = Path(tempfile.mkdtemp(prefix="wb_v5_"))
         try:
             source = root / audio.name
             source.write_bytes(audio.getbuffer())
             duration = ffprobe_duration(source)
-            st.info(f"Thời lượng: {duration/60:.2f} phút. Chia batch 5 phút.")
+            st.info(f"Thời lượng: {duration/60:.2f} phút. Chia batch 10 phút.")
 
             client = groq_client(groq_key)
             batch_dir = root / "batches"
@@ -1690,22 +1875,23 @@ if audio:
                 )
                 st.write(f"**Đợt {idx+1}: {bdur:.1f}s → {len(scenes)} cảnh**")
                 for si, s in enumerate(scenes, 1):
-                    ci = f" | [{s.get('callout_type', '').upper()}]: \"{s.get('callout_text', '')}\"" if s.get('callout_text') else " | [Chỉ hình ảnh]"
+                    ci = f" | [{s.get('callout_type', '').upper()}]: \"{s.get('callout_text', '')}\"" if s.get('callout_text') else ""
                     cm = s.get("camera_motion", "zoom_in_center")
                     st.caption(f"{si:02d}. {s['start']:.1f}s–{s['end']:.1f}s — {s['title']}{ci} | 🎥 {cm}")
 
                 batch_work = root / f"work_{idx+1:03d}"
                 batch_work.mkdir()
 
-                status.write(f"🎨 Đợt {idx+1}/{len(valid_chunks)} — Vẽ tranh + render...")
+                status.write(f"🎨 Đợt {idx+1}/{len(valid_chunks)} — Tạo ảnh + render SONG SONG...")
                 def cb(frac, idx=idx):
                     progress.progress(min(1.0, (idx + frac) / len(valid_chunks)))
 
                 bv = render_batch(
                     chunk, scenes, batch_work, hand_path, draw_style,
                     cf_account, cf_token, hf_token, freetheai_key,
-                    together_key, nexa_key, agnes_key, image_timeout,
-                    flux_steps, cb,
+                    together_key, nexa_key, agnes_key,
+                    pollinations_key, pollinations_model,
+                    image_timeout, flux_steps, cb,
                 )
                 saved = root / f"batch_final_{idx+1:03d}.mp4"
                 shutil.copy2(bv, saved)
