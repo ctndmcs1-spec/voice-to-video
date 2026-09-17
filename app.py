@@ -1,16 +1,15 @@
 """
-Xưởng Video Diễn Hoạt Kiến Thức AI — Bản Siêu Cấp V7.2
-========================================================
-FIX V7.2:
-1. BATCH_SECONDS = 5 phút (giảm lệch hình khi dùng GPT-OSS-120B)
-2. Font Noto fallback (fix lỗi dấu tiếng Việt trên Termux)
-3. Chặn chữ tiếng Việt do AI vẽ (fix lỗi dấu tùm lum trong ảnh)
-4. Checkbox "Cố định Seed" (tăng đồng nhất nhân vật)
-5. Provider rotate khi Cloudflare hết quota
-
-Kế thừa V7:
-- Nhân vật đồng nhất + Song ngữ + Sound effects + Overlay infographic
-- 4 hàm render riêng + 8 camera motion + Live Dashboard
+Xưởng Video Diễn Hoạt Kiến Thức AI — Bản Siêu Cấp V8
+=====================================================
+Tất cả tính năng:
+- Voice + Text combined analysis (AI dùng timestamp voice + nội dung text)
+- Nhạc nền procedural theo cảm xúc (không bản quyền, không cần file)
+- Sound effects tự động
+- Nhân vật đồng nhất (character lock + seed)
+- Song ngữ Việt/Anh
+- Overlay infographic nhiều text box + mũi tên
+- Provider đảo thứ tự + circuit breaker + fair share + parallel
+- Live Dashboard real-time
 """
 
 import os, re, io, json, math, time, base64, random, shutil, subprocess, tempfile, threading, wave
@@ -29,15 +28,15 @@ import numpy as np
 # ============================================================
 # CẤU HÌNH
 # ============================================================
-APP_TITLE = "Xưởng Video Diễn Hoạt Kiến Thức AI (Bản Siêu Cấp V7.2)"
-BATCH_SECONDS = 5 * 60  # V7.2: 5 phút (giảm lệch hình)
-FPS = 30
+APP_TITLE = "Xưởng Video Diễn Hoạt Kiến Thức AI (Bản Siêu Cấp V8)"
+BATCH_SECONDS = 5 * 60
+FPS = 24
 WIDTH = 1280
 HEIGHT = 720
 TITLE_BAND_H = 95
 CONTENT_H = HEIGHT - TITLE_BAND_H
 REVEAL_RADIUS = 34
-DRAW_DURATION_RATIO = 0.55
+DRAW_DURATION_RATIO = 0.45
 PHASE_RATIOS = (0.40, 0.35, 0.25)
 MAX_TOTAL_FALLBACK_TIME = 300
 FAIR_SHARE_MULTIPLIER = 1.5
@@ -67,19 +66,37 @@ COLOR_MAP = {"red": "#d32f2f", "green": "#2e7d32", "blue": "#1565c0",
 SIZE_MAP = {"small": 22, "medium": 30, "large": 44, "huge": 58}
 VALID_SFX = {"none", "whoosh", "pop", "ding", "impact", "sad", "bell", "typing", "sparkle", "swoosh"}
 
+# --- Music ---
+NOTE_FREQ = {
+    'C3':130.81,'D3':146.83,'E3':164.81,'F3':174.61,'G3':196.00,'A3':220.00,'B3':246.94,
+    'C4':261.63,'D4':293.66,'E4':329.63,'F4':349.23,'G4':392.00,'A4':440.00,'B4':493.88,
+    'C5':523.25,'D5':587.33,'E5':659.25,'F5':698.46,'G5':783.99,'A5':880.00,
+    'Eb4':311.13,'Ab4':415.30,'Db4':277.18,'Bb3':233.08,'Eb3':155.56,'Bb4':466.16,
+}
+EMOTION_CHORDS = {
+    "happy":         [('C4','E4','G4'),('F4','A4','C5'),('G4','B4','D5'),('C5','E5','G5')],
+    "sad":           [('A3','C4','E4'),('F3','A3','C4'),('D4','F4','A4'),('E4','G4','B4')],
+    "epic":          [('C3','G3','C4'),('G3','D4','G4'),('A3','E4','A4'),('F3','C4','F4')],
+    "calm":          [('C4','E4','G4'),('A3','C4','E4'),('F3','A3','C4'),('G3','B3','D4')],
+    "tense":         [('C4','Eb4','G4'),('Db4','F4','Ab4'),('C4','Eb4','G4'),('Bb3','D4','F4')],
+    "inspirational": [('C4','E4','G4'),('A3','C4','E4'),('F3','A3','C4'),('G3','B3','D4')],
+    "neutral":       [('C4','E4','G4'),('C4','E4','G4'),('F4','A4','C5'),('G4','B4','D5')],
+}
+VALID_EMOTIONS = set(EMOTION_CHORDS.keys()) | {"none"}
+
 # ============================================================
 # UI
 # ============================================================
 st.set_page_config(page_title=APP_TITLE, page_icon="🎬", layout="wide")
-st.title("🎬 Xưởng Video Diễn Hoạt Kiến Thức AI — Siêu Cấp V7.2")
-st.caption("Fix lệch hình + Font Noto + Chặn chữ VN + Seed Lock + Rotate Provider")
+st.title("🎬 Xưởng Video Diễn Hoạt Kiến Thức AI — Siêu Cấp V8")
+st.caption("Voice+Text combined + Nhạc nền theo cảm xúc + SFX + Nhân vật đồng nhất + Song ngữ")
 
 with st.sidebar:
     st.header("🔑 API Keys")
     groq_key = st.text_input("Groq API Key",
         value=os.getenv("GROQ_API_KEY", ""), type="password")
 
-    with st.expander("🎨 Nhà cung cấp ảnh AI", expanded=True):
+    with st.expander("🎨 Nhà cung cấp ảnh AI", expanded=False):
         pollinations_key = st.text_input("Pollinations API Key",
             value=os.getenv("POLLINATIONS_API_KEY", ""), type="password")
         pollinations_model = st.selectbox("Pollinations Model",
@@ -99,72 +116,78 @@ with st.sidebar:
         nexa_key = st.text_input("NexaAPI Key",
             value=os.getenv("NEXA_API_KEY", ""), type="password")
 
+    st.header("📝 Văn bản kịch bản (tùy chọn)")
+    script_text = st.text_area(
+        "Dán kịch bản để AI phân tích chính xác hơn",
+        value="", height=120,
+        help="Nếu có: AI dùng cả voice + text. Nếu trống: chỉ dùng voice.")
+    use_script_mode = st.radio(
+        "Chế độ phân tích",
+        ["Chỉ dùng voice", "Kết hợp voice + text", "Chỉ dùng text"],
+        index=0,
+        help="Kết hợp: timestamp từ voice + nội dung từ text = chia cảnh chuẩn nhất")
+
     st.header("🌐 Ngôn ngữ")
     language_mode = st.selectbox("Ngôn ngữ video",
-        ["Auto Detect (khuyên dùng)", "Tiếng Việt", "English"], index=0)
+        ["Auto Detect", "Tiếng Việt", "English"], index=0)
 
-    st.header("👥 Nhân vật đồng nhất")
+    st.header("👥 Nhân vật")
     char_main_name = st.text_input("Tên nhân vật chính", value="Tôi")
-    char_main_desc = st.text_area(
-        "Mô tả ngoại hình nhân vật chính (English)",
-        value="a young person, short black hair, wearing a blue hoodie and dark jeans",
-        height=70)
-    char_second_name = st.text_input("Tên nhân vật phụ (để trống nếu không có)", value="")
-    char_second_desc = st.text_area(
-        "Mô tả ngoại hình nhân vật phụ (English)",
-        value="", height=70)
+    char_main_desc = st.text_area("Mô tả ngoại hình (English)",
+        value="a young Vietnamese man, short black hair, brown eyes, wearing a blue hoodie and dark jeans",
+        height=60)
+    char_second_name = st.text_input("Tên nhân vật phụ", value="Linh")
+    char_second_desc = st.text_area("Mô tả ngoại hình (English)",
+        value="a young Vietnamese woman, long black hair tied in ponytail, wearing an orange hoodie",
+        height=60)
     enable_char_lock = st.checkbox("🔒 Khóa ngoại hình nhân vật", value=True)
+    enable_seed_lock = st.checkbox("🎲 Cố định Seed (nhân vật giống hệt)", value=False,
+        help="Bật khi cần nhân vật giống hệt nhau. Chỉ hoạt động với Cloudflare/HF/Pollinations.")
 
-    # V7.2 MỚI: Seed Lock
-    st.header("🎲 Cố định Seed (V7.2 MỚI)")
-    enable_seed_lock = st.checkbox("Bật cố định seed", value=False,
-        help="Bật: mọi cảnh dùng cùng seed → nhân vật đồng nhất hơn (~80-90%), nhưng bối cảnh có thể lặp. CHỈ hoạt động với Cloudflare, HF, Pollinations. Agnes KHÔNG hỗ trợ seed.")
-    seed_value = st.number_input("Giá trị seed", min_value=0, max_value=2**31-1, value=42,
-        help="Mỗi video có thể đổi seed khác để tránh lặp bối cảnh giữa các video")
-
-    st.header("🔊 Sound Effects")
-    enable_sfx = st.checkbox("Bật sound effects tự động", value=True)
+    st.header("🔊 Âm thanh")
+    enable_sfx = st.checkbox("Bật sound effects", value=True)
     sfx_volume = st.slider("Âm lượng SFX (dB)", -30, 0, -12)
+    enable_music = st.checkbox("🎵 Bật nhạc nền theo cảm xúc", value=True,
+        help="Nhạc procedural không bản quyền, tự chọn theo cảm xúc từng cảnh")
+    music_volume = st.slider("Âm lượng nhạc nền (dB)", -35, -10, -22)
 
-    st.header("🧠 Mô hình Groq")
-    stt_model = st.selectbox("STT Model",
-        ["whisper-large-v3", "whisper-large-v3-turbo"], index=0)
+    st.header("🧠 Groq Model")
+    stt_model = st.selectbox("STT Model", ["whisper-large-v3", "whisper-large-v3-turbo"], index=0)
     planner_model = st.selectbox("Biên kịch Model",
         ["qwen/qwen3.8-27b", "openai/gpt-oss-120b", "openai/gpt-oss-20b"], index=0)
 
-    st.header("🎬 Phong cách diễn hoạt")
-    draw_style = st.selectbox("Chọn phong cách", [
-        "1. Kiến Thức Thú Vị V2 (Vẽ tuần tự 3 phase + Camera Pan/Zoom)",
-        "2. Độc bản Hybrid (Tay vẽ bám nét + Camera Steadicam)",
-        "3. Chỉ Camera Pan & Zoom (ẩn bàn tay)",
-        "4. Bảng trắng cổ điển (Tay vẽ góc máy tĩnh)",
+    st.header("🎬 Phong cách")
+    draw_style = st.selectbox("Phong cách", [
+        "1. Kiến Thức Thú Vị V2 (Vẽ 3 phase + Pan/Zoom)",
+        "2. Độc bản Hybrid (Tay vẽ + Steadicam)",
+        "3. Chỉ Camera Pan & Zoom",
+        "4. Bảng trắng cổ điển",
     ], index=0)
 
-    st.header("🎨 Overlay Infographic")
-    enable_rich_overlay = st.checkbox("Bật overlay nhiều text box", value=True)
-    enable_arrows = st.checkbox("Vẽ mũi tên giữa các box", value=True)
+    st.header("🎨 Overlay")
+    enable_rich_overlay = st.checkbox("Overlay nhiều text box", value=True)
+    enable_arrows = st.checkbox("Vẽ mũi tên", value=True)
 
-    st.header("🎥 Camera Motion")
-    camera_motion_mode = st.selectbox("Chế độ chuyển động camera", [
-        "Auto (AI chọn cho từng cảnh)",
-        "Random (Code chọn ngẫu nhiên)",
+    st.header("🎥 Camera")
+    camera_motion_mode = st.selectbox("Camera motion", [
+        "Auto (AI chọn)", "Random",
         "Cố định: zoom_in_center", "Cố định: zoom_out_center",
         "Cố định: pan_left_to_right", "Cố định: pan_right_to_left",
         "Cố định: ken_burns_slow", "Cố định: static",
     ], index=0)
 
-    st.header("⏱️ Khóa nhịp cảnh")
+    st.header("⏱️ Nhịp cảnh")
     scene_min = st.slider("Tối thiểu (giây)", 18, 25, 19)
     scene_max = st.slider("Tối đa (giây)", 22, 35, 27)
     if scene_max < scene_min:
         scene_max = scene_min
 
-    st.header("⚙️ Cài đặt khác")
-    max_scenes = st.slider("Số cảnh tối đa mỗi batch", 5, 50, 25)
-    image_timeout = st.slider("Timeout tạo ảnh (giây)", 20, 90, 45)
+    st.header("⚙️ Khác")
+    max_scenes = st.slider("Số cảnh tối đa/batch", 5, 50, 25)
+    image_timeout = st.slider("Timeout ảnh (giây)", 20, 90, 45)
     flux_steps = st.slider("Số bước FLUX", 4, 8, 4)
-    fair_share_enabled = st.checkbox("Bật fair share cap", value=True)
-    circuit_breaker_enabled = st.checkbox("Bật circuit breaker", value=True)
+    fair_share_enabled = st.checkbox("Fair share cap", value=True)
+    circuit_breaker_enabled = st.checkbox("Circuit breaker", value=True)
     prioritize_fast = st.checkbox("⚡ Ưu tiên provider nhanh", value=True)
 
 # ============================================================
@@ -203,25 +226,19 @@ def extract_json(text):
                     candidate = text[start:i+1]
                     if len(candidate) > best_len:
                         try:
-                            obj = json.loads(candidate)
-                            best_obj = obj; best_len = len(candidate)
+                            obj = json.loads(candidate); best_obj = obj; best_len = len(candidate)
                         except Exception: pass
     if best_obj is not None: return best_obj
-    raise ValueError(f"AI không phản hồi JSON hợp lệ (len={len(text)})")
+    raise ValueError(f"AI không phản hồi JSON hợp lệ (preview={text[:200]})")
 
 def groq_client(key):
     return Groq(api_key=key)
 
 def transcribe_file(client, path, model, language=None):
-    """language=None → Whisper auto-detect."""
     with open(path, "rb") as f:
-        kwargs = {
-            "file": (Path(path).name, f.read()),
-            "model": model,
-            "response_format": "verbose_json",
-            "timestamp_granularities": ["segment"],
-            "temperature": 0.0,
-        }
+        kwargs = {"file": (Path(path).name, f.read()), "model": model,
+                  "response_format": "verbose_json", "timestamp_granularities": ["segment"],
+                  "temperature": 0.0}
         if language: kwargs["language"] = language
         return client.audio.transcriptions.create(**kwargs)
 
@@ -232,11 +249,11 @@ def detect_language_from_result(result):
         return getattr(result, "language", "unknown")
     except Exception: return "unknown"
 
-def chunk_audio(src, out_dir):
+def chunk_audio(src, out_dir, batch_seconds):
     pattern = str(Path(out_dir) / "batch_%03d.m4a")
     run_cmd(["ffmpeg", "-y", "-i", str(src), "-map", "0:a:0",
              "-c:a", "aac", "-b:a", "96k", "-f", "segment",
-             "-segment_time", str(BATCH_SECONDS), "-reset_timestamps", "1", pattern], timeout=900)
+             "-segment_time", str(batch_seconds), "-reset_timestamps", "1", pattern], timeout=900)
     return sorted(Path(out_dir).glob("batch_*.m4a"))
 
 def normalize_segments(result, offset):
@@ -262,7 +279,7 @@ def sanitize_prompt_text(prompt):
     return prompt
 
 # ============================================================
-# CHARACTER LOCK
+# CHARACTER
 # ============================================================
 def build_character_lock(main_name, main_desc, second_name, second_desc, enabled=True):
     if not enabled: return {}
@@ -315,41 +332,36 @@ def split_trajectory_into_phases(trajectory, ratios=PHASE_RATIOS):
     return [trajectory[:b1], trajectory[b1:b2], trajectory[b2:]]
 
 # ============================================================
-# FONT FALLBACK (V7.2: THÊM NOTO)
+# FONT
 # ============================================================
 @st.cache_resource(show_spinner=False)
 def _download_fallback_font():
-    cache_path = Path("/tmp/NotoSans-Bold.ttf")
+    cache_path = Path("/tmp/DejaVuSans-Bold.ttf")
     if cache_path.exists(): return str(cache_path)
-    urls = [
-        "https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSans/NotoSans-Bold.ttf",
-        "https://cdn.jsdelivr.net/gh/googlefonts/noto-fonts@main/hinted/ttf/NotoSans/NotoSans-Bold.ttf",
-    ]
-    for url in urls:
+    for url in [
+        "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans-Bold.ttf",
+        "https://cdn.jsdelivr.net/gh/dejavu-fonts/dejavu-fonts/ttf/DejaVuSans-Bold.ttf",
+    ]:
         try:
             r = requests.get(url, timeout=30)
             if r.status_code == 200 and len(r.content) > 100000:
-                cache_path.write_bytes(r.content)
-                return str(cache_path)
+                cache_path.write_bytes(r.content); return str(cache_path)
         except Exception: continue
     return None
 
 def font_for(size):
-    # V7.2: Ưu tiên font Noto (hỗ trợ tiếng Việt tốt nhất)
     for p in [
-        os.path.expanduser("~/.fonts/NotoSans-Bold.ttf"),  # Termux user font
-        "/data/data/com.termux/files/usr/share/fonts/TTF/NotoSans-Bold.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
-        "/usr/share/fonts/opentype/noto/NotoSans-Bold.ttf",
+        os.path.expanduser("~/.fonts/NotoSans-Bold.ttf"),
+        "/data/data/com.termux/files/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
         "C:/Windows/Fonts/arialbd.ttf",
-        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
     ]:
         if os.path.exists(p):
             try: return ImageFont.truetype(p, size)
             except Exception: continue
-    for fb in ["NotoSans-Bold.ttf", "arial.ttf", "DejaVuSans.ttf"]:
+    for fb in ["arial.ttf", "DejaVuSans.ttf"]:
         try: return ImageFont.truetype(fb, size)
         except Exception: continue
     try:
@@ -359,14 +371,12 @@ def font_for(size):
     return ImageFont.load_default()
 
 # ============================================================
-# SFX GENERATOR + MIXER
+# SFX + MUSIC GENERATORS
 # ============================================================
 def generate_sfx_wav(sfx_type, duration=0.5, sample_rate=SFX_SAMPLE_RATE):
     t = np.linspace(0, duration, int(sample_rate * duration), False)
     if sfx_type == "whoosh":
-        noise = np.random.randn(len(t))
-        envelope = np.exp(-t * 4) * np.sin(np.pi * t / duration)
-        data = noise * envelope * 0.4
+        data = np.random.randn(len(t)) * np.exp(-t * 4) * np.sin(np.pi * t / duration) * 0.4
     elif sfx_type == "pop":
         data = np.sin(2 * np.pi * 800 * t) * np.exp(-t * 20) * 0.6
     elif sfx_type == "ding":
@@ -374,8 +384,7 @@ def generate_sfx_wav(sfx_type, duration=0.5, sample_rate=SFX_SAMPLE_RATE):
     elif sfx_type == "impact":
         data = np.sin(2 * np.pi * 80 * t) * np.exp(-t * 8) * 0.8
     elif sfx_type == "sad":
-        freq = 400 - 250 * (t / duration)
-        data = np.sin(2 * np.pi * freq * t) * np.exp(-t * 2) * 0.5
+        data = np.sin(2 * np.pi * (400 - 250 * (t / duration)) * t) * np.exp(-t * 2) * 0.5
     elif sfx_type == "bell":
         data = (np.sin(2 * np.pi * 1000 * t) + 0.5 * np.sin(2 * np.pi * 1500 * t)) * np.exp(-t * 4) * 0.5
     elif sfx_type == "typing":
@@ -386,64 +395,145 @@ def generate_sfx_wav(sfx_type, duration=0.5, sample_rate=SFX_SAMPLE_RATE):
                 data[idx:idx+80] += np.random.randn(80) * 0.4
     elif sfx_type == "sparkle":
         freqs = [1500, 2000, 2500, 3000]
-        data = sum(np.sin(2 * np.pi * f * t) for f in freqs) / len(freqs)
-        data *= np.exp(-t * 2.5) * 0.4
+        data = sum(np.sin(2 * np.pi * f * t) for f in freqs) / len(freqs) * np.exp(-t * 2.5) * 0.4
     elif sfx_type == "swoosh":
-        noise = np.random.randn(len(t))
-        envelope = (t / duration) * np.exp(-t * 3)
-        data = noise * envelope * 0.4
+        data = np.random.randn(len(t)) * (t / duration) * np.exp(-t * 3) * 0.4
     else: return None
     max_val = np.max(np.abs(data))
     if max_val > 0: data = data / max_val * 0.5
     return data.astype(np.float32)
 
-def write_sfx_wav(data, path, sample_rate=SFX_SAMPLE_RATE):
-    data_int = (data * 32767).astype(np.int16)
+def write_wav(data, path, sample_rate=SFX_SAMPLE_RATE):
+    data_int = np.clip(data * 32767, -32768, 32767).astype(np.int16)
     with wave.open(str(path), 'w') as w:
         w.setnchannels(1); w.setsampwidth(2); w.setframerate(sample_rate)
         w.writeframes(data_int.tobytes())
+
+def generate_music_track(emotion, duration, sample_rate=SFX_SAMPLE_RATE):
+    """Generate procedural ambient music for given emotion."""
+    chords = EMOTION_CHORDS.get(emotion, EMOTION_CHORDS["neutral"])
+    total_samples = int(duration * sample_rate)
+    if total_samples <= 0: return np.zeros(0, dtype=np.float32)
+    track = np.zeros(total_samples, dtype=np.float32)
+
+    chord_dur = 2.5
+    samples_per_chord = int(chord_dur * sample_rate)
+    n_chords = max(1, int(np.ceil(duration / chord_dur)))
+
+    t_env = np.linspace(0, 1, samples_per_chord)
+    attack = np.minimum(t_env * 8, 1.0)
+    decay = np.exp(-t_env * 1.2)
+    release = np.minimum((1 - t_env) * 8, 1.0)
+    envelope = (attack * decay * release * 0.6).astype(np.float32)
+
+    for i in range(n_chords):
+        chord = chords[i % len(chords)]
+        start = i * samples_per_chord
+        end = min(start + samples_per_chord, total_samples)
+        length = end - start
+        if length <= 0: break
+        t = np.linspace(0, length / sample_rate, length, False)
+        wave = np.zeros(length, dtype=np.float32)
+        for note in chord:
+            freq = NOTE_FREQ.get(note, 261.63)
+            vibrato = 1 + 0.003 * np.sin(2 * np.pi * 5 * t)
+            wave += np.sin(2 * np.pi * freq * vibrato * t).astype(np.float32)
+        wave /= len(chord)
+        wave *= envelope[:length]
+        track[start:end] += wave
+
+    delay_samples = int(0.15 * sample_rate)
+    reverb = np.zeros_like(track)
+    for i in range(delay_samples, len(track)):
+        reverb[i] = track[i] + 0.3 * reverb[i - delay_samples]
+    track = track * 0.7 + reverb * 0.3
+
+    max_val = np.max(np.abs(track))
+    if max_val > 0: track = track / max_val * 0.4
+    return track.astype(np.float32)
 
 def build_sfx_track(scenes, output_path, sample_rate=SFX_SAMPLE_RATE, volume_db=-12):
     total_duration = max((s["end"] for s in scenes), default=0) + 1.0
     total_samples = int(total_duration * sample_rate)
     track = np.zeros(total_samples, dtype=np.float32)
-    sfx_cache = {}; has_any = False
+    cache = {}; has_any = False
     for s in scenes:
         sfx_type = s.get("sfx", "none")
         if sfx_type not in VALID_SFX or sfx_type == "none": continue
-        if sfx_type not in sfx_cache:
-            sfx_cache[sfx_type] = generate_sfx_wav(sfx_type, duration=0.6, sample_rate=sample_rate)
-        data = sfx_cache[sfx_type]
+        if sfx_type not in cache:
+            cache[sfx_type] = generate_sfx_wav(sfx_type, 0.6, sample_rate)
+        data = cache[sfx_type]
         if data is None: continue
-        start_sample = int(s["start"] * sample_rate)
-        end_sample = min(start_sample + len(data), total_samples)
-        if start_sample >= total_samples: continue
-        length = end_sample - start_sample
-        track[start_sample:end_sample] += data[:length]
-        has_any = True
+        start = int(s["start"] * sample_rate)
+        end = min(start + len(data), total_samples)
+        if start >= total_samples: continue
+        track[start:end] += data[:end - start]; has_any = True
     if not has_any: return None
     max_val = np.max(np.abs(track))
     if max_val > 1.0: track = track / max_val
-    volume_factor = 10 ** (volume_db / 20.0)
-    track = track * volume_factor
-    write_sfx_wav(track, output_path, sample_rate)
+    track *= 10 ** (volume_db / 20.0)
+    write_wav(track, output_path, sample_rate)
     return output_path
 
-def mix_sfx_into_audio(voice_audio_path, sfx_track_path, output_path):
-    if not sfx_track_path or not Path(sfx_track_path).exists():
-        shutil.copy2(voice_audio_path, output_path)
-        return output_path
-    run_cmd(["ffmpeg", "-y", "-i", str(voice_audio_path), "-i", str(sfx_track_path),
-             "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=2[aout]",
-             "-map", "[aout]", "-c:a", "aac", "-b:a", "128k", str(output_path)], timeout=600)
+def build_music_track(scenes, output_path, sample_rate=SFX_SAMPLE_RATE, volume_db=-22):
+    if not scenes: return None
+    total_duration = max(s["end"] for s in scenes) + 0.5
+    total_samples = int(total_duration * sample_rate)
+    full_track = np.zeros(total_samples, dtype=np.float32)
+    cache = {}; has_any = False
+
+    for s in scenes:
+        emotion = s.get("music_emotion", "neutral")
+        if emotion not in VALID_EMOTIONS or emotion == "none": continue
+        start = s["start"]; dur = s["end"] - s["start"]
+        key = f"{emotion}_{int(dur)}"
+        if key not in cache:
+            cache[key] = generate_music_track(emotion, dur, sample_rate)
+        music = cache[key]
+        if len(music) == 0: continue
+        s_start = int(start * sample_rate)
+        s_end = min(s_start + len(music), total_samples)
+        if s_start >= total_samples: continue
+        length = s_end - s_start
+        fade_samples = int(0.5 * sample_rate)
+        fade_in = np.minimum(np.arange(length) / fade_samples, 1.0)
+        fade_out = np.minimum((length - np.arange(length)) / fade_samples, 1.0)
+        env = np.minimum(fade_in, fade_out).astype(np.float32)
+        full_track[s_start:s_end] += music[:length] * env
+        has_any = True
+
+    if not has_any or np.max(np.abs(full_track)) == 0:
+        return None
+    full_track *= 10 ** (volume_db / 20.0)
+    write_wav(full_track, output_path, sample_rate)
+    return output_path
+
+def mix_audio_tracks(voice_path, sfx_path, music_path, output_path):
+    """Mix voice + sfx + music."""
+    inputs = ["-i", str(voice_path)]
+    filters = ["[0:a]"]
+    n = 1
+    if sfx_path and Path(sfx_path).exists():
+        inputs += ["-i", str(sfx_path)]; filters.append(f"[{n}:a]"); n += 1
+    if music_path and Path(music_path).exists():
+        inputs += ["-i", str(music_path)]; filters.append(f"[{n}:a]"); n += 1
+
+    if n == 1:
+        shutil.copy2(voice_path, output_path); return output_path
+
+    mix = "".join(filters) + f"amix=inputs={n}:duration=first:dropout_transition=2[aout]"
+    run_cmd(["ffmpeg", "-y"] + inputs + ["-filter_complex", mix, "-map", "[aout]",
+             "-c:a", "aac", "-b:a", "128k", str(output_path)], timeout=600)
     return output_path
 
 # ============================================================
-# SCENE PLANNER
+# SCENE PLANNER (with script + emotion)
 # ============================================================
 def make_scene_plan(client, transcript_text, batch_start, batch_duration, model,
                     min_s, max_s, max_scenes, camera_mode="auto",
-                    language="vi", enable_rich=True, char_lock=None, enable_sfx=True):
+                    language="vi", enable_rich=True, char_lock=None,
+                    enable_sfx=True, enable_music=True,
+                    user_script="", use_script_mode="voice_only"):
     expected_scenes = max(1, round(batch_duration / 23.0))
     is_english = (language == "en")
     lang_name = "English" if is_english else "Tiếng Việt"
@@ -451,52 +541,69 @@ def make_scene_plan(client, transcript_text, batch_start, batch_duration, model,
     char_note = ""
     if char_lock:
         char_lines = [f"  - {name}: {desc}" for name, desc in char_lock.items()]
-        char_note = "DANH SÁCH NHÂN VẬT CỐ ĐỊNH:\n" + "\n".join(char_lines) + "\n"
+        char_note = "DANH SÁCH NHÂN VẬT CỐ ĐỊNH (mọi cảnh có nhân vật đều phải mô tả y hệt):\n" + "\n".join(char_lines) + "\n"
 
     rich_note = ""
     if enable_rich:
         rich_note = """
-QUY TẮC OVERLAY INFOGRAPHIC ("text_boxes"):
-Tạo thêm 2-4 text_boxes chú thích rải rác:
-{"text": "...", "x": 0.15, "y": 0.20, "color": "red", "size": "large", "style": "outlined", "arrow": null}
-- x,y tương đối 0.0-1.0; color red/green/blue/orange/purple/black; size small/medium/large
+QUY TẮC OVERLAY ("text_boxes"): Tạo 2-4 text_boxes chú thích infographic:
+{"text":"...","x":0.15,"y":0.20,"color":"red","size":"large","style":"outlined","arrow":null}
+- x,y tương đối 0.0-1.0, color: red/green/blue/orange/purple/black/yellow/pink
+- size: small/medium/large, style: plain/outlined/highlighted
+- arrow: null hoặc {"to_x":0.5,"to_y":0.6}
 - KHÔNG đè khuôn mặt nhân vật (tránh x 0.35-0.65, y 0.3-0.7)
 """ if enable_rich else ""
 
     sfx_note = ""
     if enable_sfx:
         sfx_note = """
-QUY TẮC SOUND EFFECTS ("sfx"):
-Chọn 1: "whoosh"/"pop"/"ding"/"impact"/"sad"/"bell"/"typing"/"sparkle"/"swoosh"/"none". LUÂN PHIÊN.
+QUY TẮC SFX ("sfx"): Chọn 1 hiệu ứng phù hợp:
+- "whoosh": chuyển cảnh | "pop": bong bóng | "ding": phát hiện
+- "impact": gay cấn | "sad": buồn | "bell": quan trọng
+- "typing": gõ phím | "sparkle": kỳ diệu | "swoosh": trượt
+- "none": không cần SFX
+LUÂN PHIÊN, tránh lặp liên tiếp.
 """ if enable_sfx else ""
 
+    music_note = ""
+    if enable_music:
+        music_note = """
+QUY TẮC NHẠC NỀN ("music_emotion"): Chọn 1 cảm xúc cho nhạc nền của cảnh:
+- "happy": vui vẻ, tích cực | "sad": buồn, thất vọng
+- "epic": hào hùng, mạnh mẽ | "calm": bình yên, nhẹ nhàng
+- "tense": căng thẳng, hồi hộp | "inspirational": truyền cảm hứng
+- "neutral": trung tính | "none": không nhạc
+LUÂN PHIÊN theo nội dung. Tránh lặp cùng 1 cảm xúc cho nhiều cảnh liên tiếp.
+""" if enable_music else ""
+
     system = f"""
-Bạn là giám đốc sáng tạo kịch bản cho kênh hoạt họa kiến thức "Kiến Thức Thú Vị".
-NGÔN NGỮ OUTPUT: {lang_name}. TẤT CẢ text phải viết bằng {lang_name}.
-Nhiệm vụ: Chia {batch_duration:.0f}s thành khoảng {expected_scenes} cảnh ({min_s}-{max_s}s/cảnh).
+Bạn là giám đốc sáng tạo kịch bản cho kênh hoạt họa kiến thức phong cách "Kiến Thức Thú Vị".
+NGÔN NGỮ OUTPUT: {lang_name}. TẤT CẢ title, callout_text, text_boxes phải viết bằng {lang_name}.
+Nhiệm vụ: Chia đoạn âm thanh {batch_duration:.0f}s thành khoảng {expected_scenes} cảnh lớn ({min_s}-{max_s}s/cảnh).
 
 {char_note}
-QUY TẮC TIÊU ĐỀ ("title"):
-- {"English: 3-6 words, UPPERCASE" if is_english else "Tiếng Việt tự nhiên, 3-6 từ, VIẾT HOA"}.
-- KHÔNG dùng từ ghép kiểu dịch máy.
+QUY TẮC VỀ TIÊU ĐỀ ("title"):
+- {"English: natural, 3-6 words, UPPERCASE" if is_english else "Tiếng Việt tự nhiên, 3-6 từ, VIẾT HOA"}
 
-QUY TẮC CHỮ TRÊN TRANH:
-- "speech"/"thought"/"sticker"/"none". LUÂN PHIÊN.
+QUY TẮC VỀ CHỮ TRÊN TRANH ("callout_type", "callout_text"):
+- "speech": bong bóng thoại. "thought": đám mây suy nghĩ. "sticker": nhãn dán. "none": không chữ.
+- LUÂN PHIÊN.
 
-QUY TẮC SÁNG TẠO "visual_prompt":
-MỖI CẢNH LÀ SÂN KHẤU KHÁC NHAU. Không lặp bố cục.
+QUY TẮC QUAN TRỌNG NHẤT — MÔ TẢ TRANH ("visual_prompt") PHẢI SÁNG TẠO:
+MỖI CẢNH LÀ MỘT "SÂN KHẤU" KHÁC NHAU. TUYỆT ĐỐI KHÔNG lặp bố cục.
 Bao gồm: nhân vật + tư thế, hành động, bối cảnh, đồ vật ẩn dụ, cảm xúc, màu nhấn.
+VÍ DỤ TỐT: "2D comic doodle: a young man standing at the edge of a cliff at sunset, red sunset, blue waves, white background, bold black outlines, no text"
+VÍ DỤ XẤU: "a man sitting at a desk with papers on the left"
 
-QUY TẮC NHÂN VẬT:
-- Dùng mô tả y hệt danh sách nhân vật cố định (nếu có).
-- Ghi rõ giới tính "male character"/"female character".
-- KHÔNG dùng "two friends"/"two people" chung chung.
+QUY TẮC NHÂN VẬT: Ghi rõ "male character"/"female character". KHÔNG dùng "two friends" chung chung.
 
-RÀNG BUỘC PHONG CÁCH: 2D comic doodle, nét mực đen dày, nền TRẮNG TINH, KHÔNG chữ/số trong ảnh AI vẽ.
+RÀNG BUỘC PHONG CÁCH: 2D comic doodle, nét mực đen dày, nền TRẮNG TINH, KHÔNG chữ/số trong ảnh AI vẽ (tool sẽ overlay chữ sau).
 {rich_note}
 {sfx_note}
-QUY TẮC CAMERA MOTION:
-Chọn 1: "zoom_in_center"/"zoom_out_center"/"pan_left_to_right"/"pan_right_to_left"/"zoom_in_top_left"/"zoom_in_bottom_right"/"ken_burns_slow"/"static". LUÂN PHIÊN.
+{music_note}
+QUY TẮC CAMERA ("camera_motion"): Chọn 1 trong: "zoom_in_center", "zoom_out_center",
+"pan_left_to_right", "pan_right_to_left", "zoom_in_top_left", "zoom_in_bottom_right",
+"ken_burns_slow", "static". LUÂN PHIÊN.
 
 JSON FORMAT:
 {{
@@ -504,34 +611,50 @@ JSON FORMAT:
     {{
       "start": 0.0, "end": 22.0,
       "title": "{'FEAR OF JUDGMENT' if is_english else 'NỖI SỢ BỊ PHÁN XÉT'}",
-      "callout_type": "thought", "callout_text": "{'WHAT?' if is_english else 'TỚ ĐANG NGHĨ GÌ?'}", "callout_side": "right",
-      "camera_motion": "zoom_in_center", "sfx": "sparkle",
+      "callout_type": "thought", "callout_text": "{'WHAT ARE THEY THINKING?' if is_english else 'TỚ ĐANG NGHĨ GÌ?'}", "callout_side": "right",
+      "camera_motion": "zoom_in_center",
+      "sfx": "sparkle",
+      "music_emotion": "inspirational",
       "visual_prompt": "2D comic doodle: ...",
-      "text_boxes": [{{"text": "...", "x": 0.2, "y": 0.15, "color": "red", "size": "large", "style": "outlined", "arrow": null}}]
+      "text_boxes": [{{"text":"...","x":0.2,"y":0.15,"color":"red","size":"large","style":"outlined","arrow":null}}]
     }}
   ]
 }}
 """
-    user = f"Audio length: {batch_duration:.2f}s.\nMAX {expected_scenes} SCENES ({min_s}-{max_s}s each).\n\nTRANSCRIPT:\n{transcript_text}"
+
+    # User prompt with combined mode
+    if use_script_mode == "combined" and user_script.strip():
+        user = (f"Audio length: {batch_duration:.2f}s.\n"
+                f"MAX {expected_scenes} SCENES ({min_s}-{max_s}s each).\n\n"
+                f"USER SCRIPT (accurate content, use THIS for scene meaning):\n{user_script}\n\n"
+                f"WHISPER TRANSCRIPT (accurate timing, use THIS for timestamps):\n{transcript_text}\n\n"
+                f"CRITICAL: Match script sentences to whisper timestamps by semantic similarity. "
+                f"Scene start/end MUST align with actual audio timing from whisper. "
+                f"If whisper has STT errors, ignore them and use script content.")
+    elif use_script_mode == "text_only" and user_script.strip():
+        user = (f"Audio length: {batch_duration:.2f}s.\n"
+                f"MAX {expected_scenes} SCENES ({min_s}-{max_s}s each).\n\n"
+                f"SCRIPT:\n{user_script}\n\n"
+                f"Divide script into scenes by semantic meaning. Distribute {batch_duration:.2f}s evenly.")
+    else:
+        user = (f"Audio length: {batch_duration:.2f}s.\n"
+                f"MAX {expected_scenes} SCENES ({min_s}-{max_s}s each).\n\n"
+                f"TRANSCRIPT:\n{transcript_text}")
 
     raw_response = ""
     try:
         r = client.chat.completions.create(
-            model=model, temperature=0.15, max_tokens=12000,
+            model=model, temperature=0.15, max_tokens=18000,
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}])
         raw_response = r.choices[0].message.content or ""
-        try:
-            debug_dir = Path(tempfile.gettempdir()) / "wb_debug"
-            debug_dir.mkdir(exist_ok=True)
-            (debug_dir / f"qwen_response_{int(time.time())}.txt").write_text(raw_response, encoding="utf-8")
-        except Exception: pass
         obj = extract_json(raw_response)
         raw_scenes = obj.get("scenes", [])
         if not raw_scenes:
             st.warning(f"⚠️ Qwen trả JSON nhưng không có scenes. Preview: {raw_response[:200]}")
     except Exception as e:
         st.error(f"❌ Qwen/Parse fail: {str(e)[:200]}")
-        if raw_response: st.code(raw_response[:1500], language="text")
+        if raw_response:
+            st.code(raw_response[:1000], language="text")
         raw_scenes = []
 
     valid_motions = {"zoom_in_center", "zoom_out_center", "pan_left_to_right", "pan_right_to_left",
@@ -554,8 +677,7 @@ JSON FORMAT:
                 if size not in valid_sizes: size = "medium"
                 style = str(tb.get("style", "outlined")).lower()
                 if style not in valid_styles: style = "outlined"
-                arrow = tb.get("arrow")
-                arrow_clean = None
+                arrow = tb.get("arrow"); arrow_clean = None
                 if isinstance(arrow, dict):
                     try:
                         arrow_clean = {"to_x": max(0.0, min(1.0, float(arrow.get("to_x", x)))),
@@ -579,19 +701,23 @@ JSON FORMAT:
             if cm not in valid_motions: cm = "zoom_in_center"
             sfx = str(s.get("sfx", "none")).strip().lower()
             if sfx not in VALID_SFX: sfx = "none"
-            clean.append({"start": a, "end": b,
+            emo = str(s.get("music_emotion", "neutral")).strip().lower()
+            if emo not in VALID_EMOTIONS: emo = "neutral"
+            clean.append({
+                "start": a, "end": b,
                 "title": str(s.get("title", "BÀI HỌC")).strip().upper(),
-                "callout_type": ct, "callout_text": str(s.get("callout_text", "")).strip(),
+                "callout_type": ct,
+                "callout_text": str(s.get("callout_text", "")).strip(),
                 "callout_side": str(s.get("callout_side", "right")).strip().lower(),
-                "camera_motion": cm, "sfx": sfx,
+                "camera_motion": cm, "sfx": sfx, "music_emotion": emo,
                 "visual_prompt": vp,
-                "text_boxes": clean_text_boxes(s.get("text_boxes", []))})
+                "text_boxes": clean_text_boxes(s.get("text_boxes", [])),
+            })
         except Exception: continue
 
     if not clean:
-        # FALLBACK V7.2: chia nhiều scene + đa ngôn ngữ
-        n_fallback = max(3, int(batch_duration / 23.0))
-        scene_dur = batch_duration / n_fallback
+        n_fb = max(3, int(batch_duration / 23.0))
+        scene_dur = batch_duration / n_fb
         fb_title = "LESSON" if is_english else "BÀI HỌC"
         fb_prompts = [
             "2D comic doodle: a person standing at the edge of a cliff at sunset, red sunset, blue waves, white background, bold black outlines, no text",
@@ -605,19 +731,22 @@ JSON FORMAT:
             "2D comic doodle: a person surrounded by floating books, learning concept, blue accents, white background, no text",
             "2D comic doodle: a person opening a mysterious door with light coming through, orange glow, white background, no text",
         ]
+        emotions_pool = ["neutral", "calm", "inspirational", "tense", "epic"]
         clean = []
-        for i in range(n_fallback):
+        for i in range(n_fb):
             clean.append({
                 "start": i * scene_dur, "end": (i + 1) * scene_dur,
                 "title": f"{fb_title} {i+1:02d}",
                 "callout_type": "none", "callout_text": "", "callout_side": "right",
-                "camera_motion": random.choice(["zoom_in_center", "zoom_out_center",
-                                                 "pan_left_to_right", "ken_burns_slow"]),
+                "camera_motion": random.choice(list(valid_motions - {"static"})),
                 "sfx": random.choice(["whoosh", "pop", "ding", "sparkle", "swoosh"]),
+                "music_emotion": random.choice(emotions_pool),
                 "visual_prompt": fb_prompts[i % len(fb_prompts)],
-                "text_boxes": []})
-        st.error(f"❌ Qwen KHÔNG trả scene — dùng {n_fallback} fallback scenes (~{scene_dur:.0f}s/cảnh)")
+                "text_boxes": [],
+            })
+        st.error(f"❌ Qwen fail — dùng {n_fb} fallback scenes (~{scene_dur:.0f}s/cảnh)")
 
+    # Merge short scenes
     merged = []
     for s in clean:
         if not merged: merged.append(s)
@@ -630,8 +759,7 @@ JSON FORMAT:
             else: merged.append(s)
     clean = merged
     clean[0]["start"] = 0.0
-    for i in range(len(clean) - 1):
-        clean[i]["end"] = clean[i + 1]["start"]
+    for i in range(len(clean) - 1): clean[i]["end"] = clean[i + 1]["start"]
     clean[-1]["end"] = batch_duration
 
     final_scenes = []
@@ -646,8 +774,7 @@ JSON FORMAT:
         else: final_scenes.append(s)
 
     if camera_mode == "random":
-        motions_list = list(valid_motions - {"static"})
-        for s in final_scenes: s["camera_motion"] = random.choice(motions_list)
+        for s in final_scenes: s["camera_motion"] = random.choice(list(valid_motions - {"static"}))
     elif camera_mode.startswith("fixed:"):
         fixed = camera_mode.split(":", 1)[1].strip()
         if fixed in valid_motions:
@@ -655,13 +782,12 @@ JSON FORMAT:
     return final_scenes
 
 # ============================================================
-# IMAGE PROVIDERS (V7.2: THÊM CHẶN CHỮ VIỆT + SEED LOCK)
+# IMAGE PROVIDERS
 # ============================================================
 def _build_full_prompt(prompt, chars=None, char_lock=None):
     chars = chars or {}
     safe = sanitize_prompt_text(prompt)
-    if char_lock:
-        safe = enforce_character_lock(safe, char_lock)
+    if char_lock: safe = enforce_character_lock(safe, char_lock)
     return f"""{safe}.
 
 STYLE CONSTRAINTS:
@@ -669,12 +795,10 @@ STYLE CONSTRAINTS:
 - Pure solid flat white background OR simple scene background if described above.
 - Vivid expressive cartoon character with clear emotion.
 - Selective vibrant spot colors (red, blue, orange, green) ONLY on key symbolic elements.
-- ABSOLUTELY NO TEXT, NO LETTERS, NO NUMBERS, NO CAPTIONS anywhere in the image.
-- STRICTLY NO Vietnamese text, NO accents, NO diacritics rendered in the image.
+- Absolutely NO text, letters, numbers, captions, or empty speech balloons.
 - Do not draw desk, table, markers, pens UNLESS explicitly mentioned.
 - Wide 16:9 cinematic composition.
-- CHARACTER CONSISTENCY: keep appearance EXACTLY the same across scenes.
-- CHARACTER GENDER: male = MALE, female = FEMALE. NEVER swap."""
+- CHARACTER GENDER: male character = MALE, female character = FEMALE. NEVER swap."""
 
 def _validate_image_bytes(data, provider_name):
     if not data or len(data) < 500: raise RuntimeError(f"{provider_name}: dữ liệu quá nhỏ")
@@ -686,7 +810,6 @@ def _validate_image_bytes(data, provider_name):
     return data
 
 def agnes_image_request(prompt, api_key, timeout=45, chars=None, char_lock=None, seed=None):
-    """V7.2: Agnes BỎ QUA seed (không hỗ trợ) nhưng vẫn nhận tham số để tránh lỗi."""
     api_key = (api_key or "").strip()
     if not api_key: raise RuntimeError("Agnes: chưa có key")
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
@@ -709,10 +832,9 @@ def cloudflare_image_request(prompt, account_id, api_token, timeout=45, steps=4,
     if not account_id or not api_token: raise RuntimeError("Cloudflare: thiếu thông tin")
     url = f"{CLOUDFLARE_BASE}{account_id}/ai/run/{CLOUDFLARE_MODEL}"
     headers = {"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"}
-    body = {"prompt": _build_full_prompt(prompt, chars, char_lock), "steps": steps}
-    if seed is not None:
-        body["seed"] = int(seed)  # V7.2: Cloudflare hỗ trợ seed
-    r = requests.post(url, headers=headers, json=body, timeout=timeout)
+    payload = {"prompt": _build_full_prompt(prompt, chars, char_lock), "steps": steps}
+    if seed is not None: payload["seed"] = int(seed)
+    r = requests.post(url, headers=headers, json=payload, timeout=timeout)
     if r.status_code == 429: raise RuntimeError("Cloudflare: hết quota")
     if r.status_code >= 400: raise RuntimeError(f"Cloudflare HTTP {r.status_code}")
     data = r.json()
@@ -726,9 +848,9 @@ def hf_image_request(prompt, token, timeout=45, chars=None, char_lock=None, seed
     if not token: raise RuntimeError("HF: chưa có token")
     url = f"{HF_API_URL}{HF_MODEL}"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    body = {"inputs": _build_full_prompt(prompt, chars, char_lock)}
-    if seed is not None: body["parameters"] = {"seed": int(seed)}
-    r = requests.post(url, headers=headers, json=body, timeout=timeout)
+    payload = {"inputs": _build_full_prompt(prompt, chars, char_lock)}
+    if seed is not None: payload["parameters"] = {"seed": int(seed)}
+    r = requests.post(url, headers=headers, json=payload, timeout=timeout)
     if r.status_code == 503: raise RuntimeError("HF: model loading")
     if r.status_code == 429: raise RuntimeError("HF: rate limit")
     if r.status_code >= 400: raise RuntimeError(f"HF HTTP {r.status_code}")
@@ -757,7 +879,6 @@ def together_image_request(prompt, api_key, timeout=45, chars=None, char_lock=No
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {"model": TOGETHER_MODEL, "prompt": _build_full_prompt(prompt, chars, char_lock),
                "width": WIDTH, "height": HEIGHT, "steps": 4, "n": 1, "response_format": "b64_json"}
-    if seed is not None: payload["seed"] = int(seed)
     r = requests.post(TOGETHER_BASE, headers=headers, json=payload, timeout=timeout)
     if r.status_code == 429: raise RuntimeError("Together: rate limit")
     if r.status_code >= 400: raise RuntimeError(f"Together HTTP {r.status_code}")
@@ -806,37 +927,33 @@ def pollinations_image_request(prompt, api_key, model="flux-pro", timeout=45, se
 def build_provider_list(cf_account, cf_token, hf_token, freetheai_key,
                          together_key, nexa_key, agnes_key,
                          pollinations_key="", pollinations_model="flux-pro",
-                         flux_steps=4, chars=None, char_lock=None):
-    """V7.2: Provider rotate — Cloudflare lên đầu, Agnes xuống cuối."""
+                         flux_steps=4, chars=None, char_lock=None, seed=None):
     chars = chars or {}; char_lock = char_lock or {}
-    kw = {"chars": chars, "char_lock": char_lock}
+    kw = {"chars": chars, "char_lock": char_lock, "seed": seed}
     providers = []
-    # Thứ tự V7.2: Cloudflare (nhanh+seed) → Pollinations (seed) → HF (seed) → Together → FreeTheAi → Nexa → Agnes (cuối)
     if cf_account and cf_token and cf_account.strip() and cf_token.strip():
         providers.append({"name": "Cloudflare", "fn": cloudflare_image_request,
-            "args": [cf_account.strip(), cf_token.strip()], "kwargs": {"steps": flux_steps, **kw},
-            "supports_seed": True})
+            "args": [cf_account.strip(), cf_token.strip()], "kwargs": {"steps": flux_steps, **kw}})
+    if agnes_key and agnes_key.strip():
+        providers.append({"name": "Agnes AI", "fn": agnes_image_request,
+            "args": [agnes_key.strip()], "kwargs": kw})
+    if together_key and together_key.strip():
+        providers.append({"name": "Together AI", "fn": together_image_request,
+            "args": [together_key.strip()], "kwargs": kw})
+    if freetheai_key and freetheai_key.strip():
+        providers.append({"name": "FreeTheAi", "fn": freetheai_image_request,
+            "args": [freetheai_key.strip()], "kwargs": kw})
+    if hf_token and hf_token.strip():
+        providers.append({"name": "Hugging Face", "fn": hf_image_request,
+            "args": [hf_token.strip()], "kwargs": kw})
+    if nexa_key and nexa_key.strip():
+        providers.append({"name": "NexaAPI", "fn": nexa_image_request,
+            "args": [nexa_key.strip()], "kwargs": kw})
     if pollinations_key and pollinations_key.strip():
         providers.append({"name": f"Pollinations ({pollinations_model})",
             "fn": pollinations_image_request,
             "args": [pollinations_key.strip(), pollinations_model],
-            "kwargs": kw, "supports_seed": True})
-    if hf_token and hf_token.strip():
-        providers.append({"name": "Hugging Face", "fn": hf_image_request,
-            "args": [hf_token.strip()], "kwargs": kw, "supports_seed": True})
-    if together_key and together_key.strip():
-        providers.append({"name": "Together AI", "fn": together_image_request,
-            "args": [together_key.strip()], "kwargs": kw, "supports_seed": True})
-    if freetheai_key and freetheai_key.strip():
-        providers.append({"name": "FreeTheAi", "fn": freetheai_image_request,
-            "args": [freetheai_key.strip()], "kwargs": kw, "supports_seed": True})
-    if nexa_key and nexa_key.strip():
-        providers.append({"name": "NexaAPI", "fn": nexa_image_request,
-            "args": [nexa_key.strip()], "kwargs": kw, "supports_seed": True})
-    if agnes_key and agnes_key.strip():
-        # Agnes cuối — không hỗ trợ seed nhưng vẫn fallback được
-        providers.append({"name": "Agnes AI", "fn": agnes_image_request,
-            "args": [agnes_key.strip()], "kwargs": kw, "supports_seed": False})
+            "kwargs": kw})
     return providers
 
 def save_image_from_bytes(data, output_path):
@@ -940,7 +1057,7 @@ def add_comic_overlays(image_path, title, callout_type, callout_text, callout_si
     img.save(output_path, quality=95)
 
 # ============================================================
-# HAND ASSET + TRAJECTORY
+# HAND ASSET
 # ============================================================
 def generate_fallback_hand():
     S = 320
@@ -1069,7 +1186,7 @@ def interpolate_motion(keyframes, p):
     _, s, cx, cy = keyframes[-1]; return s, cx, cy
 
 # ============================================================
-# 4 RENDER STYLES
+# RENDER 4 STYLES
 # ============================================================
 def render_scene_kttv_v2(image_path, duration, output_path, hand_path, motion="zoom_in_center"):
     total_frames = max(1, round(duration * FPS))
@@ -1277,20 +1394,19 @@ def render_scene_classic_hand(image_path, duration, output_path, hand_path, moti
 def create_placeholder_image(output_path, title):
     img = Image.new("RGB", (WIDTH, HEIGHT), "white")
     draw = ImageDraw.Draw(img)
-    f = font_for(48)
-    text = "ẢNH KHÔNG TẠO ĐƯỢC"
+    f = font_for(48); text = "ẢNH KHÔNG TẠO ĐƯỢC"
     box = draw.textbbox((0, 0), text, font=f)
     tw, th = box[2] - box[0], box[3] - box[1]
     draw.text(((WIDTH - tw) / 2, (HEIGHT - th) / 2), text, fill="#cccccc", font=f)
     img.save(output_path, quality=95)
 
 # ============================================================
-# PARALLEL GEN (V7.2: SEED LOCK)
+# PARALLEL
 # ============================================================
 def parallel_generate_images(scenes, batch_dir, providers, image_timeout,
                               progress_state, flux_steps=4, fair_share_enabled=True,
                               circuit_breaker_enabled=True, prioritize_fast=True,
-                              enable_arrows=True, enable_seed_lock=False, seed_value=42):
+                              enable_arrows=True):
     if not providers: raise RuntimeError("Không có provider nào.")
     total_scenes = len(scenes)
     if fair_share_enabled:
@@ -1298,20 +1414,16 @@ def parallel_generate_images(scenes, batch_dir, providers, image_timeout,
         st.caption(f"⚖️ Fair share cap: mỗi provider tối đa **{fair_share_cap}** cảnh")
     else: fair_share_cap = 999999
     if circuit_breaker_enabled:
-        st.caption(f"🔌 Circuit breaker: fail {CIRCUIT_BREAKER_THRESHOLD} lần → loại")
+        st.caption(f"🔌 Circuit breaker: provider fail {CIRCUIT_BREAKER_THRESHOLD} lần → loại")
     if prioritize_fast:
         st.caption(f"⚡ Slow penalty: provider > {SLOW_PROVIDER_THRESHOLD:.0f}s → sleep {SLOW_PROVIDER_PENALTY}s")
-    if enable_seed_lock:
-        st.caption(f"🎲 Seed lock: dùng seed cố định **{seed_value}** (chỉ provider hỗ trợ seed)")
-    st.caption(f"🔁 Mỗi cảnh tối đa **{MAX_ATTEMPTS_PER_SCENE}** lần thử")
 
     scene_queue = Queue(); scene_attempts = {}
     for i, s in enumerate(scenes):
         img_raw = batch_dir / f"scene_{i+1:03d}_raw.png"
         img = batch_dir / f"scene_{i+1:03d}.jpg"
         if not img.exists():
-            scene_queue.put((i, s, img_raw, img))
-            scene_attempts[i] = 0
+            scene_queue.put((i, s, img_raw, img)); scene_attempts[i] = 0
             progress_state["scene_status"][i] = {"status": "pending", "provider": None,
                 "started": None, "elapsed": 0.0, "attempts": 0}
         else:
@@ -1326,7 +1438,6 @@ def parallel_generate_images(scenes, batch_dir, providers, image_timeout,
 
     def worker(provider_cfg):
         name = provider_cfg["name"]
-        supports_seed = provider_cfg.get("supports_seed", False)
         my_count = 0; consecutive_fails = 0; local_ok = 0; local_time = 0.0
         while my_count < fair_share_cap:
             if circuit_breaker_enabled and consecutive_fails >= CIRCUIT_BREAKER_THRESHOLD:
@@ -1354,16 +1465,7 @@ def parallel_generate_images(scenes, batch_dir, providers, image_timeout,
                 progress_state["scene_status"][idx] = {"status": "working", "provider": name,
                     "started": t_start, "elapsed": 0.0, "attempts": current_attempts + 1}
             try:
-                # V7.2: Seed lock
-                if enable_seed_lock and supports_seed:
-                    seed = int(seed_value)  # Cùng seed cho mọi cảnh
-                elif supports_seed:
-                    seed = hash(f"{scene['visual_prompt']}_{idx}") % (2**31)  # Seed riêng từng cảnh
-                else:
-                    seed = None
                 kwargs = provider_cfg.get("kwargs", {}).copy()
-                if seed is not None and supports_seed:
-                    kwargs["seed"] = seed
                 data = provider_cfg["fn"](scene["visual_prompt"], *provider_cfg.get("args", []),
                                           timeout=image_timeout, **kwargs)
                 if not data or len(data) < 500: raise RuntimeError("empty data")
@@ -1421,16 +1523,7 @@ def parallel_generate_images(scenes, batch_dir, providers, image_timeout,
             success = False
             for cfg in providers:
                 try:
-                    supports_seed = cfg.get("supports_seed", False)
-                    if enable_seed_lock and supports_seed:
-                        seed = int(seed_value)
-                    elif supports_seed:
-                        seed = hash(f"{scene['visual_prompt']}_{idx}") % (2**31)
-                    else:
-                        seed = None
                     kwargs = cfg.get("kwargs", {}).copy()
-                    if seed is not None and supports_seed:
-                        kwargs["seed"] = seed
                     data = cfg["fn"](scene["visual_prompt"], *cfg.get("args", []),
                                      timeout=min(image_timeout, 45), **kwargs)
                     if data and len(data) > 500:
@@ -1470,27 +1563,28 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
                  circuit_breaker_enabled=True, prioritize_fast=True,
                  chars=None, char_lock=None, enable_arrows=True,
                  enable_sfx=True, sfx_volume=-12,
-                 enable_seed_lock=False, seed_value=42):
+                 enable_music=True, music_volume=-22, seed_lock=None):
     total = len(scenes)
     if total == 0: raise RuntimeError("Không có cảnh nào để render.")
     chars = chars or {}; char_lock = char_lock or {}
     providers = build_provider_list(cf_account, cf_token, hf_token, freetheai_key,
         together_key, nexa_key, agnes_key, pollinations_key, pollinations_model,
-        flux_steps, chars=chars, char_lock=char_lock)
+        flux_steps, chars=chars, char_lock=char_lock, seed=seed_lock)
     if not providers: raise RuntimeError("Chưa cấu hình provider ảnh nào.")
 
-    st.markdown(f"### 🔗 {len(providers)} Provider (thứ tự ưu tiên V7.2)")
+    st.markdown(f"### 🔗 {len(providers)} Provider")
     pc = st.columns(min(4, len(providers)))
     for i, p in enumerate(providers):
-        with pc[i % len(pc)]:
-            seed_badge = "🎲" if p.get("supports_seed") else "❌"
-            st.markdown(f"**{i+1}.** {p['name']} {seed_badge}")
-    if chars: st.info(f"👥 Nhân vật: {', '.join(chars.keys())}")
-    if char_lock: st.success(f"🔒 Đã khóa {len(char_lock)} nhân vật")
-    if enable_seed_lock: st.warning(f"🎲 Seed lock BẬT — seed={seed_value}. Chỉ provider có 🎲 mới áp dụng.")
+        with pc[i % len(pc)]: st.markdown(f"**{i+1}.** {p['name']}")
+    if char_lock: st.success(f"🔒 Khóa {len(char_lock)} nhân vật")
+    if seed_lock is not None: st.info(f"🎲 Seed lock: {seed_lock}")
     if enable_sfx:
         sfx_count = sum(1 for s in scenes if s.get("sfx", "none") != "none")
-        st.info(f"🔊 Sẽ chèn SFX vào {sfx_count}/{total} cảnh")
+        st.info(f"🔊 SFX: {sfx_count}/{total} cảnh")
+    if enable_music:
+        music_count = sum(1 for s in scenes if s.get("music_emotion", "none") != "none")
+        emotions = Counter(s.get("music_emotion", "neutral") for s in scenes if s.get("music_emotion") != "none")
+        st.info(f"🎵 Nhạc nền: {music_count}/{total} cảnh — {dict(emotions)}")
 
     st.markdown("### 🎨 Tạo ảnh song song")
     progress_state = {"done": 0, "scene_status": {},
@@ -1547,7 +1641,7 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
         try:
             r, _ = parallel_generate_images(scenes, batch_dir, providers, image_timeout,
                 progress_state, flux_steps, fair_share_enabled, circuit_breaker_enabled,
-                prioritize_fast, enable_arrows, enable_seed_lock, seed_value)
+                prioritize_fast, enable_arrows)
             result_container["result"] = r
         except Exception as e: result_container["error"] = e
     t = threading.Thread(target=run_parallel, daemon=True)
@@ -1588,21 +1682,22 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
              "-c", "copy", "-movflags", "+faststart", str(batch_video)], timeout=900)
 
     final_batch = batch_dir / "batch_final.mp4"
+    sfx_track = None; music_track = None
     if enable_sfx:
-        st.markdown("### 🔊 Trộn sound effects")
-        sfx_track = batch_dir / "sfx_track.wav"
-        result = build_sfx_track(scenes, sfx_track, SFX_SAMPLE_RATE, sfx_volume)
-        if result:
-            st.info(f"✅ SFX track với {sum(1 for s in scenes if s.get('sfx','none') != 'none')} hiệu ứng")
-            mixed_audio = batch_dir / "audio_mixed.m4a"
-            mix_sfx_into_audio(str(batch_audio), str(sfx_track), str(mixed_audio))
-            run_cmd(["ffmpeg", "-y", "-i", str(batch_video), "-i", str(mixed_audio),
-                     "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac",
-                     "-b:a", "128k", "-movflags", "+faststart", str(final_batch)], timeout=900)
-        else:
-            run_cmd(["ffmpeg", "-y", "-i", str(batch_video), "-i", str(batch_audio),
-                     "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac",
-                     "-b:a", "128k", "-movflags", "+faststart", str(final_batch)], timeout=900)
+        st.markdown("### 🔊 Tạo SFX track")
+        sfx_track = build_sfx_track(scenes, batch_dir / "sfx.wav", SFX_SAMPLE_RATE, sfx_volume)
+    if enable_music:
+        st.markdown("### 🎵 Tạo nhạc nền theo cảm xúc")
+        music_track = build_music_track(scenes, batch_dir / "music.wav", SFX_SAMPLE_RATE, music_volume)
+
+    if sfx_track or music_track:
+        st.info(f"🎛️ Mix: voice + {'SFX ' if sfx_track else ''}{'+ music' if music_track else ''}")
+        mixed = batch_dir / "audio_mixed.m4a"
+        mix_audio_tracks(str(batch_audio), str(sfx_track) if sfx_track else None,
+                         str(music_track) if music_track else None, str(mixed))
+        run_cmd(["ffmpeg", "-y", "-i", str(batch_video), "-i", str(mixed),
+                 "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac",
+                 "-b:a", "128k", "-movflags", "+faststart", str(final_batch)], timeout=900)
     else:
         run_cmd(["ffmpeg", "-y", "-i", str(batch_video), "-i", str(batch_audio),
                  "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac",
@@ -1629,18 +1724,15 @@ if st.sidebar.button("🔎 KIỂM TRA PROVIDER", use_container_width=True):
                                       char_second_name, char_second_desc, enable_char_lock)
     providers = build_provider_list(cf_account, cf_token, hf_token, freetheai_key,
         together_key, nexa_key, agnes_key, pollinations_key, pollinations_model,
-        flux_steps, chars={}, char_lock=char_lock)
+        flux_steps, chars={}, char_lock=char_lock, seed=None)
     if not providers:
         st.error("Chưa có provider nào.")
     else:
         st.write(f"**{len(providers)} provider:**")
-        for i, p in enumerate(providers, 1):
-            seed_badge = "🎲 Có seed" if p.get("supports_seed") else "❌ Không seed"
-            st.write(f"{i}. {p['name']} — {seed_badge}")
-        if char_lock:
-            st.success(f"🔒 Character lock: {list(char_lock.keys())}")
+        for i, p in enumerate(providers, 1): st.write(f"{i}. {p['name']}")
+        if char_lock: st.success(f"🔒 Character lock: {list(char_lock.keys())}")
         if st.button("▶️ Test 1 ảnh"):
-            tp = "2D comic doodle: a female character with long hair in green shirt sitting at desk with laptop, thinking pose, red accents, white background, no text"
+            tp = "2D comic doodle: a female character with long hair in green shirt at desk with laptop, thinking pose, red accents, white background, no text"
             for cfg in providers:
                 try:
                     with st.spinner(f"Test {cfg['name']}..."):
@@ -1653,7 +1745,6 @@ if st.sidebar.button("🔎 KIỂM TRA PROVIDER", use_container_width=True):
                         st.image(img, use_container_width=True); break
                 except Exception as e:
                     st.warning(f"❌ {cfg['name']}: {str(e)[:150]}")
-                    continue
 
 audio = st.file_uploader("🎤 Tải lên voice", type=["mp3", "m4a", "wav", "ogg", "webm", "mp4"])
 
@@ -1662,19 +1753,25 @@ if audio:
     if st.button("🚀 BẮT ĐẦU", type="primary", use_container_width=True):
         if not groq_key:
             st.error("Cần Groq API Key."); st.stop()
-        if language_mode == "Auto Detect (khuyên dùng)":
-            lang_code = None
-            st.info(f"🌐 Ngôn ngữ: **Auto Detect**")
-        elif language_mode == "English":
-            lang_code = "en"; st.info(f"🌐 Ngôn ngữ: **English**")
-        else:
-            lang_code = "vi"; st.info(f"🌐 Ngôn ngữ: **Tiếng Việt**")
+
+        lang_code = None
+        if language_mode == "Tiếng Việt": lang_code = "vi"
+        elif language_mode == "English": lang_code = "en"
+        st.info(f"🌐 Ngôn ngữ: **{language_mode}**")
+
+        # Map script mode
+        if use_script_mode == "Kết hợp voice + text": internal_mode = "combined"
+        elif use_script_mode == "Chỉ dùng text": internal_mode = "text_only"
+        else: internal_mode = "voice_only"
+        st.info(f"📝 Chế độ: **{use_script_mode}**")
 
         char_lock = build_character_lock(char_main_name, char_main_desc,
                                           char_second_name, char_second_desc, enable_char_lock)
         if char_lock: st.success(f"🔒 Khóa {len(char_lock)} nhân vật")
+        seed_lock = random.randint(1, 2**31 - 1) if enable_seed_lock else None
+        if seed_lock: st.info(f"🎲 Seed lock: {seed_lock}")
 
-        root = Path(tempfile.mkdtemp(prefix="wb_v72_"))
+        root = Path(tempfile.mkdtemp(prefix="wb_v8_"))
         try:
             source = root / audio.name
             source.write_bytes(audio.getbuffer())
@@ -1683,7 +1780,7 @@ if audio:
 
             client = groq_client(groq_key)
             batch_dir = root / "batches"; batch_dir.mkdir()
-            chunks = chunk_audio(source, batch_dir)
+            chunks = chunk_audio(source, batch_dir, BATCH_SECONDS)
             hand_path = Path("hand.png")
             batch_videos = []; all_scenes = 0
             status = st.empty()
@@ -1699,7 +1796,7 @@ if audio:
 
             for idx, (bi, chunk, bdur) in enumerate(valid_chunks):
                 bstart = bi * BATCH_SECONDS
-                status.markdown(f"### 🧠 Đợt {idx+1}/{len(valid_chunks)} — STT...")
+                status.markdown(f"### 🧠 Đợt {idx+1}/{len(valid_chunks)} — STT ({lang_code or 'auto'})...")
                 tr = transcribe_file(client, chunk, stt_model, language=lang_code)
                 if lang_code is None:
                     detected = detect_language_from_result(tr)
@@ -1707,8 +1804,17 @@ if audio:
                 segs = normalize_segments(tr, bstart)
                 batch_text = "\n".join(f"[{x['start']:.2f}-{x['end']:.2f}] {x['text']}" for x in segs)
                 if len(batch_text.strip()) < 50:
-                    st.error(f"⚠️ Transcript quá ngắn ({len(batch_text)} ký tự)! Kiểm tra language mode.")
-                    st.code(batch_text[:500] if batch_text else "(empty)")
+                    st.error(f"⚠️ Transcript quá ngắn ({len(batch_text)} ký tự)!")
+
+                # Prepare script chunk
+                total_chunks = len(valid_chunks)
+                batch_script = ""
+                if script_text and internal_mode in ("combined", "text_only"):
+                    script_lines = [l.strip() for l in script_text.split("\n") if l.strip()]
+                    lines_per = max(1, len(script_lines) // total_chunks + 1)
+                    start_l = idx * lines_per
+                    end_l = min(start_l + lines_per, len(script_lines))
+                    batch_script = "\n".join(script_lines[start_l:end_l])
 
                 status.markdown(f"### ✂️ Đợt {idx+1}/{len(valid_chunks)} — Lên kịch bản...")
                 scenes = make_scene_plan(client, batch_text, bstart, bdur, planner_model,
@@ -1716,14 +1822,15 @@ if audio:
                                          language=lang_code or "vi",
                                          enable_rich=enable_rich_overlay,
                                          char_lock=char_lock,
-                                         enable_sfx=enable_sfx)
+                                         enable_sfx=enable_sfx,
+                                         enable_music=enable_music,
+                                         user_script=batch_script,
+                                         use_script_mode=internal_mode)
                 st.markdown(f"#### 📝 Đợt {idx+1}: {bdur:.1f}s → **{len(scenes)} cảnh**")
                 with st.expander("Chi tiết cảnh", expanded=False):
                     for si, s in enumerate(scenes, 1):
                         ci = f" | [{s.get('callout_type','').upper()}]: \"{s.get('callout_text','')}\"" if s.get('callout_text') else ""
-                        tb_count = len(s.get("text_boxes", []))
-                        sfx = s.get("sfx", "none")
-                        st.caption(f"{si:02d}. {s['start']:.1f}s–{s['end']:.1f}s — {s['title']}{ci} | 🎥 {s.get('camera_motion','?')} | 📦 {tb_count} | 🔊 {sfx}")
+                        st.caption(f"{si:02d}. {s['start']:.1f}s–{s['end']:.1f}s — {s['title']}{ci} | 🎥 {s.get('camera_motion','?')} | 🔊 {s.get('sfx','none')} | 🎵 {s.get('music_emotion','none')}")
 
                 batch_work = root / f"work_{idx+1:03d}"; batch_work.mkdir()
                 status.markdown(f"### 🎨 Đợt {idx+1}/{len(valid_chunks)} — Tạo ảnh + render...")
@@ -1734,7 +1841,8 @@ if audio:
                                   circuit_breaker_enabled, prioritize_fast,
                                   chars={}, char_lock=char_lock, enable_arrows=enable_arrows,
                                   enable_sfx=enable_sfx, sfx_volume=sfx_volume,
-                                  enable_seed_lock=enable_seed_lock, seed_value=seed_value)
+                                  enable_music=enable_music, music_volume=music_volume,
+                                  seed_lock=seed_lock)
                 saved = root / f"batch_final_{idx+1:03d}.mp4"
                 shutil.copy2(bv, saved); batch_videos.append(saved)
                 all_scenes += len(scenes)
