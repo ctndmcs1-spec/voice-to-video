@@ -517,7 +517,7 @@ JSON FORMAT:
     raw_response = ""
     try:
         r = client.chat.completions.create(
-            model=model, temperature=0.15, max_tokens=18000,
+            model=model, temperature=0.15, max_tokens=12000,
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}])
         raw_response = r.choices[0].message.content or ""
         try:
