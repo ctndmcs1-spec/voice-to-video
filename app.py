@@ -1,16 +1,16 @@
 """
-Xưởng Video Diễn Hoạt Kiến Thức AI — Bản Siêu Cấp V7
-=====================================================
-V7 MỚI:
-- Nhân vật đồng nhất xuyên suốt video (character lock description)
-- Song ngữ Việt/Anh (auto-detect hoặc chọn thủ công)
-- Sound effects tự động khớp nội dung (whoosh/pop/ding/impact/sad/bell/typing)
-- Mix SFX vào audio track tự động qua FFmpeg
+Xưởng Video Diễn Hoạt Kiến Thức AI — Bản Siêu Cấp V7.2
+========================================================
+FIX V7.2:
+1. BATCH_SECONDS = 5 phút (giảm lệch hình khi dùng GPT-OSS-120B)
+2. Font Noto fallback (fix lỗi dấu tiếng Việt trên Termux)
+3. Chặn chữ tiếng Việt do AI vẽ (fix lỗi dấu tùm lum trong ảnh)
+4. Checkbox "Cố định Seed" (tăng đồng nhất nhân vật)
+5. Provider rotate khi Cloudflare hết quota
 
-Kế thừa V6:
-- Overlay infographic nhiều text box + mũi tên
-- Provider đảo thứ tự + Slow penalty + Circuit breaker + Fair share
-- Live Dashboard + 4 hàm render riêng + Font fallback 4 lớp
+Kế thừa V7:
+- Nhân vật đồng nhất + Song ngữ + Sound effects + Overlay infographic
+- 4 hàm render riêng + 8 camera motion + Live Dashboard
 """
 
 import os, re, io, json, math, time, base64, random, shutil, subprocess, tempfile, threading, wave
@@ -29,8 +29,8 @@ import numpy as np
 # ============================================================
 # CẤU HÌNH
 # ============================================================
-APP_TITLE = "Xưởng Video Diễn Hoạt Kiến Thức AI (Bản Siêu Cấp V7)"
-BATCH_SECONDS = 10 * 60
+APP_TITLE = "Xưởng Video Diễn Hoạt Kiến Thức AI (Bản Siêu Cấp V7.2)"
+BATCH_SECONDS = 5 * 60  # V7.2: 5 phút (giảm lệch hình)
 FPS = 30
 WIDTH = 1280
 HEIGHT = 720
@@ -65,70 +65,70 @@ COLOR_MAP = {"red": "#d32f2f", "green": "#2e7d32", "blue": "#1565c0",
     "orange": "#ef6c00", "purple": "#6a1b9a", "black": "#212121",
     "yellow": "#f9a825", "pink": "#c2185b"}
 SIZE_MAP = {"small": 22, "medium": 30, "large": 44, "huge": 58}
-
 VALID_SFX = {"none", "whoosh", "pop", "ding", "impact", "sad", "bell", "typing", "sparkle", "swoosh"}
 
 # ============================================================
 # UI
 # ============================================================
 st.set_page_config(page_title=APP_TITLE, page_icon="🎬", layout="wide")
-st.title("🎬 Xưởng Video Diễn Hoạt Kiến Thức AI — Siêu Cấp V7")
-st.caption("Nhân vật đồng nhất + Song ngữ Việt/Anh + Sound effects tự động + Overlay Infographic")
+st.title("🎬 Xưởng Video Diễn Hoạt Kiến Thức AI — Siêu Cấp V7.2")
+st.caption("Fix lệch hình + Font Noto + Chặn chữ VN + Seed Lock + Rotate Provider")
 
 with st.sidebar:
     st.header("🔑 API Keys")
     groq_key = st.text_input("Groq API Key",
-        value=st.secrets.get("GROQ_API_KEY", os.getenv("GROQ_API_KEY", "")), type="password")
+        value=os.getenv("GROQ_API_KEY", ""), type="password")
 
     with st.expander("🎨 Nhà cung cấp ảnh AI", expanded=True):
         pollinations_key = st.text_input("Pollinations API Key",
-            value=st.secrets.get("POLLINATIONS_API_KEY", os.getenv("POLLINATIONS_API_KEY", "")), type="password")
+            value=os.getenv("POLLINATIONS_API_KEY", ""), type="password")
         pollinations_model = st.selectbox("Pollinations Model",
-            ["flux-pro", "flux", "gptimage", "kontext", "flux-realism"], index=0,
-            help="kontext giữ nhân vật nhất quán tốt nhất")
+            ["flux-pro", "flux", "gptimage", "kontext", "flux-realism"], index=0)
         agnes_key = st.text_input("Agnes AI API Key",
-            value=st.secrets.get("AGNES_API_KEY", os.getenv("AGNES_API_KEY", "")), type="password")
+            value=os.getenv("AGNES_API_KEY", ""), type="password")
         cf_account = st.text_input("Cloudflare Account ID",
-            value=st.secrets.get("CLOUDFLARE_ACCOUNT_ID", os.getenv("CLOUDFLARE_ACCOUNT_ID", "")), type="password")
+            value=os.getenv("CLOUDFLARE_ACCOUNT_ID", ""), type="password")
         cf_token = st.text_input("Cloudflare API Token",
-            value=st.secrets.get("CLOUDFLARE_API_TOKEN", os.getenv("CLOUDFLARE_API_TOKEN", "")), type="password")
+            value=os.getenv("CLOUDFLARE_API_TOKEN", ""), type="password")
         hf_token = st.text_input("Hugging Face Token",
-            value=st.secrets.get("HF_TOKEN", os.getenv("HF_TOKEN", "")), type="password")
+            value=os.getenv("HF_TOKEN", ""), type="password")
         freetheai_key = st.text_input("FreeTheAi API Key",
-            value=st.secrets.get("FREETHEAI_API_KEY", os.getenv("FREETHEAI_API_KEY", "")), type="password")
+            value=os.getenv("FREETHEAI_API_KEY", ""), type="password")
         together_key = st.text_input("Together AI API Key",
-            value=st.secrets.get("TOGETHER_API_KEY", os.getenv("TOGETHER_API_KEY", "")), type="password")
+            value=os.getenv("TOGETHER_API_KEY", ""), type="password")
         nexa_key = st.text_input("NexaAPI Key",
-            value=st.secrets.get("NEXA_API_KEY", os.getenv("NEXA_API_KEY", "")), type="password")
+            value=os.getenv("NEXA_API_KEY", ""), type="password")
 
     st.header("🌐 Ngôn ngữ")
     language_mode = st.selectbox("Ngôn ngữ video",
-        ["Tiếng Việt", "English"], index=0,
-        help="English mode: AI tạo ảnh full power, không lo lỗi dấu tiếng Việt")
+        ["Auto Detect (khuyên dùng)", "Tiếng Việt", "English"], index=0)
 
     st.header("👥 Nhân vật đồng nhất")
-    st.caption("Khóa ngoại hình nhân vật xuyên suốt video. Mô tả càng chi tiết càng tốt (tiếng Anh).")
     char_main_name = st.text_input("Tên nhân vật chính", value="Tôi")
     char_main_desc = st.text_area(
         "Mô tả ngoại hình nhân vật chính (English)",
-        value="a young Vietnamese man, short black hair, brown eyes, wearing a blue hoodie and dark jeans",
-        height=80,
-        help="VD: 'a young man, short black hair, blue hoodie, brown eyes'")
-    char_second_name = st.text_input("Tên nhân vật phụ (để trống nếu không có)", value="Linh")
+        value="a young person, short black hair, wearing a blue hoodie and dark jeans",
+        height=70)
+    char_second_name = st.text_input("Tên nhân vật phụ (để trống nếu không có)", value="")
     char_second_desc = st.text_area(
         "Mô tả ngoại hình nhân vật phụ (English)",
-        value="a young Vietnamese woman, long black hair tied in ponytail, wearing an orange hoodie and blue jeans",
-        height=80)
-    enable_char_lock = st.checkbox("🔒 Khóa ngoại hình nhân vật", value=True,
-        help="Bật: mọi cảnh đều có nhân vật giống nhau. Tắt: AI tự do sáng tạo.")
+        value="", height=70)
+    enable_char_lock = st.checkbox("🔒 Khóa ngoại hình nhân vật", value=True)
+
+    # V7.2 MỚI: Seed Lock
+    st.header("🎲 Cố định Seed (V7.2 MỚI)")
+    enable_seed_lock = st.checkbox("Bật cố định seed", value=False,
+        help="Bật: mọi cảnh dùng cùng seed → nhân vật đồng nhất hơn (~80-90%), nhưng bối cảnh có thể lặp. CHỈ hoạt động với Cloudflare, HF, Pollinations. Agnes KHÔNG hỗ trợ seed.")
+    seed_value = st.number_input("Giá trị seed", min_value=0, max_value=2**31-1, value=42,
+        help="Mỗi video có thể đổi seed khác để tránh lặp bối cảnh giữa các video")
 
     st.header("🔊 Sound Effects")
     enable_sfx = st.checkbox("Bật sound effects tự động", value=True)
-    sfx_volume = st.slider("Âm lượng SFX (dB)", -30, 0, -12,
-        help="Càng gần 0 càng to. -12dB là mức cân bằng tốt.")
+    sfx_volume = st.slider("Âm lượng SFX (dB)", -30, 0, -12)
 
     st.header("🧠 Mô hình Groq")
-    stt_model = st.selectbox("STT Model", ["whisper-large-v3", "whisper-large-v3-turbo"], index=0)
+    stt_model = st.selectbox("STT Model",
+        ["whisper-large-v3", "whisper-large-v3-turbo"], index=0)
     planner_model = st.selectbox("Biên kịch Model",
         ["qwen/qwen3.8-27b", "openai/gpt-oss-120b", "openai/gpt-oss-20b"], index=0)
 
@@ -182,34 +182,55 @@ def ffprobe_duration(path):
     return float(out.strip())
 
 def extract_json(text):
+    if not text:
+        raise ValueError("Empty response")
     text = text.strip()
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
-    text = re.sub(r"\s*```$", "", text)
+    text = re.sub(r"\s*```\s*$", "", text)
     try:
         return json.loads(text)
     except Exception:
         pass
-    starts = [m.start() for m in re.finditer(r"\{", text)]
-    ends = [m.end() for m in re.finditer(r"\}", text)]
-    for s in starts:
-        for e in reversed(ends):
-            if e <= s:
-                continue
-            try:
-                return json.loads(text[s:e])
-            except Exception:
-                continue
-    raise ValueError("AI không phản hồi JSON hợp lệ")
+    best_obj = None; best_len = 0; depth = 0; start = -1
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0: start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    candidate = text[start:i+1]
+                    if len(candidate) > best_len:
+                        try:
+                            obj = json.loads(candidate)
+                            best_obj = obj; best_len = len(candidate)
+                        except Exception: pass
+    if best_obj is not None: return best_obj
+    raise ValueError(f"AI không phản hồi JSON hợp lệ (len={len(text)})")
 
 def groq_client(key):
     return Groq(api_key=key)
 
-def transcribe_file(client, path, model, language="vi"):
+def transcribe_file(client, path, model, language=None):
+    """language=None → Whisper auto-detect."""
     with open(path, "rb") as f:
-        return client.audio.transcriptions.create(
-            file=(Path(path).name, f.read()), model=model,
-            response_format="verbose_json", timestamp_granularities=["segment"],
-            language=language, temperature=0.0)
+        kwargs = {
+            "file": (Path(path).name, f.read()),
+            "model": model,
+            "response_format": "verbose_json",
+            "timestamp_granularities": ["segment"],
+            "temperature": 0.0,
+        }
+        if language: kwargs["language"] = language
+        return client.audio.transcriptions.create(**kwargs)
+
+def detect_language_from_result(result):
+    try:
+        data = result.model_dump() if hasattr(result, "model_dump") else result
+        if isinstance(data, dict): return data.get("language", "unknown")
+        return getattr(result, "language", "unknown")
+    except Exception: return "unknown"
 
 def chunk_audio(src, out_dir):
     pattern = str(Path(out_dir) / "batch_%03d.m4a")
@@ -243,51 +264,21 @@ def sanitize_prompt_text(prompt):
 # ============================================================
 # CHARACTER LOCK
 # ============================================================
-def parse_characters(raw_text):
-    chars = {}
-    for line in (raw_text or "").split("\n"):
-        line = line.strip()
-        if not line or "=" not in line:
-            continue
-        parts = line.split("=", 1)
-        name = parts[0].strip().lower()
-        gender = parts[1].strip().lower()
-        if not name:
-            continue
-        if gender in ("nam", "boy", "m", "male"):
-            gender = "male"
-        elif gender in ("nữ", "nu", "girl", "f", "female"):
-            gender = "female"
-        else:
-            continue
-        chars[name] = gender
-    return chars
-
-def build_character_lock(char_main_name, char_main_desc, char_second_name, char_second_desc, enabled=True):
-    """Trả về dict {"name": "english description"} để lock ngoại hình."""
-    if not enabled:
-        return {}
+def build_character_lock(main_name, main_desc, second_name, second_desc, enabled=True):
+    if not enabled: return {}
     lock = {}
-    if char_main_name.strip() and char_main_desc.strip():
-        lock[char_main_name.strip().lower()] = char_main_desc.strip()
-    if char_second_name.strip() and char_second_desc.strip():
-        lock[char_second_name.strip().lower()] = char_second_desc.strip()
+    if main_name.strip() and main_desc.strip():
+        lock[main_name.strip().lower()] = main_desc.strip()
+    if second_name.strip() and second_desc.strip():
+        lock[second_name.strip().lower()] = second_desc.strip()
     return lock
 
 def enforce_character_lock(prompt, char_lock):
-    """
-    Nếu prompt có tên nhân vật đã khóa, chèn mô tả ngoại hình vào prompt.
-    VD: char_lock = {"tôi": "a young man, short black hair, blue hoodie"}
-        prompt = "a male character sitting on bridge"
-        → "a male character (a young man, short black hair, blue hoodie) sitting on bridge"
-    """
-    if not char_lock:
-        return prompt
+    if not char_lock: return prompt
     prompt_lower = prompt.lower()
     result = prompt
     for name, desc in char_lock.items():
         if name in prompt_lower and desc not in prompt_lower:
-            # Thêm mô tả vào đầu prompt
             result = f"[CHARACTER CONSISTENCY: {name} = {desc}] " + result
     return result
 
@@ -317,46 +308,48 @@ def trajectory_to_content_space(trajectory_full):
 
 def split_trajectory_into_phases(trajectory, ratios=PHASE_RATIOS):
     n = len(trajectory)
-    if n < 3:
-        return [trajectory, [], []]
+    if n < 3: return [trajectory, [], []]
     b1 = max(1, int(n * ratios[0]))
     b2 = max(b1 + 1, int(n * (ratios[0] + ratios[1])))
     b2 = min(b2, n - 1)
     return [trajectory[:b1], trajectory[b1:b2], trajectory[b2:]]
 
 # ============================================================
-# FONT
+# FONT FALLBACK (V7.2: THÊM NOTO)
 # ============================================================
 @st.cache_resource(show_spinner=False)
 def _download_fallback_font():
-    cache_path = Path("/tmp/DejaVuSans-Bold.ttf")
-    if cache_path.exists():
-        return str(cache_path)
-    for url in [
-        "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans-Bold.ttf",
-        "https://cdn.jsdelivr.net/gh/dejavu-fonts/dejavu-fonts/ttf/DejaVuSans-Bold.ttf",
-    ]:
+    cache_path = Path("/tmp/NotoSans-Bold.ttf")
+    if cache_path.exists(): return str(cache_path)
+    urls = [
+        "https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSans/NotoSans-Bold.ttf",
+        "https://cdn.jsdelivr.net/gh/googlefonts/noto-fonts@main/hinted/ttf/NotoSans/NotoSans-Bold.ttf",
+    ]
+    for url in urls:
         try:
             r = requests.get(url, timeout=30)
             if r.status_code == 200 and len(r.content) > 100000:
                 cache_path.write_bytes(r.content)
                 return str(cache_path)
-        except Exception:
-            continue
+        except Exception: continue
     return None
 
 def font_for(size):
+    # V7.2: Ưu tiên font Noto (hỗ trợ tiếng Việt tốt nhất)
     for p in [
+        os.path.expanduser("~/.fonts/NotoSans-Bold.ttf"),  # Termux user font
+        "/data/data/com.termux/files/usr/share/fonts/TTF/NotoSans-Bold.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSans-Bold.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
         "C:/Windows/Fonts/arialbd.ttf",
         "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
     ]:
         if os.path.exists(p):
             try: return ImageFont.truetype(p, size)
             except Exception: continue
-    for fb in ["arial.ttf", "DejaVuSans.ttf"]:
+    for fb in ["NotoSans-Bold.ttf", "arial.ttf", "DejaVuSans.ttf"]:
         try: return ImageFont.truetype(fb, size)
         except Exception: continue
     try:
@@ -369,7 +362,6 @@ def font_for(size):
 # SFX GENERATOR + MIXER
 # ============================================================
 def generate_sfx_wav(sfx_type, duration=0.5, sample_rate=SFX_SAMPLE_RATE):
-    """Tạo file WAV SFX đơn giản bằng numpy. Trả về numpy array float32."""
     t = np.linspace(0, duration, int(sample_rate * duration), False)
     if sfx_type == "whoosh":
         noise = np.random.randn(len(t))
@@ -400,76 +392,50 @@ def generate_sfx_wav(sfx_type, duration=0.5, sample_rate=SFX_SAMPLE_RATE):
         noise = np.random.randn(len(t))
         envelope = (t / duration) * np.exp(-t * 3)
         data = noise * envelope * 0.4
-    else:
-        return None
+    else: return None
     max_val = np.max(np.abs(data))
-    if max_val > 0:
-        data = data / max_val * 0.5
+    if max_val > 0: data = data / max_val * 0.5
     return data.astype(np.float32)
 
 def write_sfx_wav(data, path, sample_rate=SFX_SAMPLE_RATE):
     data_int = (data * 32767).astype(np.int16)
     with wave.open(str(path), 'w') as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(sample_rate)
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(sample_rate)
         w.writeframes(data_int.tobytes())
 
 def build_sfx_track(scenes, output_path, sample_rate=SFX_SAMPLE_RATE, volume_db=-12):
-    """
-    Tạo 1 file WAV chứa tất cả SFX ở đúng timestamp.
-    scenes: list of dict có 'start' (giây) và 'sfx' (loại)
-    """
     total_duration = max((s["end"] for s in scenes), default=0) + 1.0
     total_samples = int(total_duration * sample_rate)
     track = np.zeros(total_samples, dtype=np.float32)
-    sfx_cache = {}
-    has_any = False
-
+    sfx_cache = {}; has_any = False
     for s in scenes:
         sfx_type = s.get("sfx", "none")
-        if sfx_type not in VALID_SFX or sfx_type == "none":
-            continue
+        if sfx_type not in VALID_SFX or sfx_type == "none": continue
         if sfx_type not in sfx_cache:
-            data = generate_sfx_wav(sfx_type, duration=0.6, sample_rate=sample_rate)
-            sfx_cache[sfx_type] = data
+            sfx_cache[sfx_type] = generate_sfx_wav(sfx_type, duration=0.6, sample_rate=sample_rate)
         data = sfx_cache[sfx_type]
-        if data is None:
-            continue
+        if data is None: continue
         start_sample = int(s["start"] * sample_rate)
         end_sample = min(start_sample + len(data), total_samples)
-        if start_sample >= total_samples:
-            continue
+        if start_sample >= total_samples: continue
         length = end_sample - start_sample
         track[start_sample:end_sample] += data[:length]
         has_any = True
-
-    if not has_any:
-        return None
-
+    if not has_any: return None
     max_val = np.max(np.abs(track))
-    if max_val > 1.0:
-        track = track / max_val
+    if max_val > 1.0: track = track / max_val
     volume_factor = 10 ** (volume_db / 20.0)
     track = track * volume_factor
-
     write_sfx_wav(track, output_path, sample_rate)
     return output_path
 
 def mix_sfx_into_audio(voice_audio_path, sfx_track_path, output_path):
-    """Mix SFX track vào voice audio."""
     if not sfx_track_path or not Path(sfx_track_path).exists():
         shutil.copy2(voice_audio_path, output_path)
         return output_path
-    run_cmd([
-        "ffmpeg", "-y",
-        "-i", str(voice_audio_path),
-        "-i", str(sfx_track_path),
-        "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=2[aout]",
-        "-map", "[aout]",
-        "-c:a", "aac", "-b:a", "128k",
-        str(output_path)
-    ], timeout=600)
+    run_cmd(["ffmpeg", "-y", "-i", str(voice_audio_path), "-i", str(sfx_track_path),
+             "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=2[aout]",
+             "-map", "[aout]", "-c:a", "aac", "-b:a", "128k", str(output_path)], timeout=600)
     return output_path
 
 # ============================================================
@@ -477,8 +443,7 @@ def mix_sfx_into_audio(voice_audio_path, sfx_track_path, output_path):
 # ============================================================
 def make_scene_plan(client, transcript_text, batch_start, batch_duration, model,
                     min_s, max_s, max_scenes, camera_mode="auto",
-                    language="vi", enable_rich=True, char_lock=None,
-                    enable_sfx=True):
+                    language="vi", enable_rich=True, char_lock=None, enable_sfx=True):
     expected_scenes = max(1, round(batch_duration / 23.0))
     is_english = (language == "en")
     lang_name = "English" if is_english else "Tiếng Việt"
@@ -486,72 +451,52 @@ def make_scene_plan(client, transcript_text, batch_start, batch_duration, model,
     char_note = ""
     if char_lock:
         char_lines = [f"  - {name}: {desc}" for name, desc in char_lock.items()]
-        char_note = "DANH SÁCH NHÂN VẬT CỐ ĐỊNH (mọi cảnh có nhân vật đều phải mô tả y hệt):\n" + "\n".join(char_lines) + "\n"
+        char_note = "DANH SÁCH NHÂN VẬT CỐ ĐỊNH:\n" + "\n".join(char_lines) + "\n"
 
     rich_note = ""
     if enable_rich:
         rich_note = """
 QUY TẮC OVERLAY INFOGRAPHIC ("text_boxes"):
-Tạo thêm 2-4 "text_boxes" chú thích rải rác kiểu infographic:
+Tạo thêm 2-4 text_boxes chú thích rải rác:
 {"text": "...", "x": 0.15, "y": 0.20, "color": "red", "size": "large", "style": "outlined", "arrow": null}
-- x,y tương đối 0.0-1.0
-- color: red/green/blue/orange/purple/black/yellow/pink
-- size: small/medium/large
-- style: plain/outlined/highlighted
-- arrow: null hoặc {"to_x": 0.5, "to_y": 0.6}
+- x,y tương đối 0.0-1.0; color red/green/blue/orange/purple/black; size small/medium/large
 - KHÔNG đè khuôn mặt nhân vật (tránh x 0.35-0.65, y 0.3-0.7)
 """ if enable_rich else ""
 
     sfx_note = ""
     if enable_sfx:
-        sfx_note = f"""
+        sfx_note = """
 QUY TẮC SOUND EFFECTS ("sfx"):
-Chọn 1 hiệu ứng âm thanh phù hợp với cảm xúc/nội dung của cảnh:
-- "whoosh": chuyển cảnh, mở đầu, dẫn dắt
-- "pop": bong bóng thoại, sticker nhấn mạnh
-- "ding": phát hiện, "aha moment", kết luận
-- "impact": câu nói mạnh, cảnh gay cấn, va đập
-- "sad": cảnh buồn, thất vọng
-- "bell": điểm quan trọng cần nhớ
-- "typing": gõ phím, viết lách
-- "sparkle": lấp lánh, kỳ diệu, thành công
-- "swoosh": trượt, lướt, chuyển động nhanh
-- "none": không cần SFX (dùng cho cảnh tĩnh, suy nghĩ)
-LUÂN PHIÊN, tránh lặp lại liên tiếp cùng một loại.
+Chọn 1: "whoosh"/"pop"/"ding"/"impact"/"sad"/"bell"/"typing"/"sparkle"/"swoosh"/"none". LUÂN PHIÊN.
 """ if enable_sfx else ""
 
     system = f"""
-Bạn là giám đốc sáng tạo kịch bản cho kênh hoạt họa kiến thức phong cách "Kiến Thức Thú Vị".
-NGÔN NGỮ OUTPUT: {lang_name}. TẤT CẢ title, callout_text, text_boxes phải viết bằng {lang_name}.
-Nhiệm vụ: Chia đoạn âm thanh {batch_duration:.0f}s thành khoảng {expected_scenes} cảnh lớn ({min_s}-{max_s}s/cảnh).
+Bạn là giám đốc sáng tạo kịch bản cho kênh hoạt họa kiến thức "Kiến Thức Thú Vị".
+NGÔN NGỮ OUTPUT: {lang_name}. TẤT CẢ text phải viết bằng {lang_name}.
+Nhiệm vụ: Chia {batch_duration:.0f}s thành khoảng {expected_scenes} cảnh ({min_s}-{max_s}s/cảnh).
 
 {char_note}
-QUY TẮC VỀ TIÊU ĐỀ ("title"):
-- {"English: natural, 3-6 words, UPPERCASE, summarize main idea. Example: 'PEOPLE PLEASING TRAP', 'FEAR OF JUDGMENT'" if is_english else "Tiếng Việt tự nhiên, 3-6 từ, VIẾT HOA, tóm tắt luận điểm chính."}
+QUY TẮC TIÊU ĐỀ ("title"):
+- {"English: 3-6 words, UPPERCASE" if is_english else "Tiếng Việt tự nhiên, 3-6 từ, VIẾT HOA"}.
 - KHÔNG dùng từ ghép kiểu dịch máy.
 
-QUY TẮC VỀ CHỮ TRÊN TRANH ("callout_type", "callout_text"):
-- "speech": bong bóng thoại. "thought": đám mây suy nghĩ. "sticker": nhãn dán. "none": không chữ.
-- LUÂN PHIÊN thay đổi.
+QUY TẮC CHỮ TRÊN TRANH:
+- "speech"/"thought"/"sticker"/"none". LUÂN PHIÊN.
 
-QUY TẮC QUAN TRỌNG NHẤT — MÔ TẢ TRANH ("visual_prompt") PHẢI SÁNG TẠO:
-MỖI CẢNH LÀ MỘT "SÂN KHẤU" KHÁC NHAU. TUYỆT ĐỐI KHÔNG lặp bố cục.
+QUY TẮC SÁNG TẠO "visual_prompt":
+MỖI CẢNH LÀ SÂN KHẤU KHÁC NHAU. Không lặp bố cục.
 Bao gồm: nhân vật + tư thế, hành động, bối cảnh, đồ vật ẩn dụ, cảm xúc, màu nhấn.
-VÍ DỤ TỐT:
-- "2D comic doodle: a young man standing at the edge of a cliff at sunset, red sunset, blue waves, white background, bold black outlines, no text"
-- "2D comic doodle: a female character in green shirt sitting at desk with laptop, thinking pose, red accents, white background, no text"
 
-QUY TẮC NHÂN VẬT (RẤT QUAN TRỌNG):
-- Khi mô tả visual_prompt có nhân vật, PHẢI dùng mô tả y hệt từ danh sách nhân vật cố định (nếu có).
-- Ghi rõ giới tính: "male character" / "female character".
-- TUYỆT ĐỐI KHÔNG dùng "two friends", "two people" chung chung.
+QUY TẮC NHÂN VẬT:
+- Dùng mô tả y hệt danh sách nhân vật cố định (nếu có).
+- Ghi rõ giới tính "male character"/"female character".
+- KHÔNG dùng "two friends"/"two people" chung chung.
 
-RÀNG BUỘC PHONG CÁCH: 2D comic doodle, nét mực đen dày, nền TRẮNG TINH, KHÔNG chữ/số/bong bóng rỗng trong ảnh AI vẽ (tool sẽ tự overlay chữ sau).
+RÀNG BUỘC PHONG CÁCH: 2D comic doodle, nét mực đen dày, nền TRẮNG TINH, KHÔNG chữ/số trong ảnh AI vẽ.
 {rich_note}
 {sfx_note}
-QUY TẮC CAMERA MOTION ("camera_motion"):
-Chọn 1 trong: "zoom_in_center", "zoom_out_center", "pan_left_to_right", "pan_right_to_left",
-"zoom_in_top_left", "zoom_in_bottom_right", "ken_burns_slow", "static". LUÂN PHIÊN.
+QUY TẮC CAMERA MOTION:
+Chọn 1: "zoom_in_center"/"zoom_out_center"/"pan_left_to_right"/"pan_right_to_left"/"zoom_in_top_left"/"zoom_in_bottom_right"/"ken_burns_slow"/"static". LUÂN PHIÊN.
 
 JSON FORMAT:
 {{
@@ -559,9 +504,8 @@ JSON FORMAT:
     {{
       "start": 0.0, "end": 22.0,
       "title": "{'FEAR OF JUDGMENT' if is_english else 'NỖI SỢ BỊ PHÁN XÉT'}",
-      "callout_type": "thought", "callout_text": "{'WHAT ARE THEY THINKING?' if is_english else 'TỚ ĐANG NGHĨ GÌ?'}", "callout_side": "right",
-      "camera_motion": "zoom_in_center",
-      "sfx": "sparkle",
+      "callout_type": "thought", "callout_text": "{'WHAT?' if is_english else 'TỚ ĐANG NGHĨ GÌ?'}", "callout_side": "right",
+      "camera_motion": "zoom_in_center", "sfx": "sparkle",
       "visual_prompt": "2D comic doodle: ...",
       "text_boxes": [{{"text": "...", "x": 0.2, "y": 0.15, "color": "red", "size": "large", "style": "outlined", "arrow": null}}]
     }}
@@ -570,13 +514,24 @@ JSON FORMAT:
 """
     user = f"Audio length: {batch_duration:.2f}s.\nMAX {expected_scenes} SCENES ({min_s}-{max_s}s each).\n\nTRANSCRIPT:\n{transcript_text}"
 
+    raw_response = ""
     try:
         r = client.chat.completions.create(
             model=model, temperature=0.15, max_tokens=18000,
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}])
-        obj = extract_json(r.choices[0].message.content)
+        raw_response = r.choices[0].message.content or ""
+        try:
+            debug_dir = Path(tempfile.gettempdir()) / "wb_debug"
+            debug_dir.mkdir(exist_ok=True)
+            (debug_dir / f"qwen_response_{int(time.time())}.txt").write_text(raw_response, encoding="utf-8")
+        except Exception: pass
+        obj = extract_json(raw_response)
         raw_scenes = obj.get("scenes", [])
-    except Exception:
+        if not raw_scenes:
+            st.warning(f"⚠️ Qwen trả JSON nhưng không có scenes. Preview: {raw_response[:200]}")
+    except Exception as e:
+        st.error(f"❌ Qwen/Parse fail: {str(e)[:200]}")
+        if raw_response: st.code(raw_response[:1500], language="text")
         raw_scenes = []
 
     valid_motions = {"zoom_in_center", "zoom_out_center", "pan_left_to_right", "pan_right_to_left",
@@ -624,24 +579,44 @@ JSON FORMAT:
             if cm not in valid_motions: cm = "zoom_in_center"
             sfx = str(s.get("sfx", "none")).strip().lower()
             if sfx not in VALID_SFX: sfx = "none"
-            clean.append({
-                "start": a, "end": b,
+            clean.append({"start": a, "end": b,
                 "title": str(s.get("title", "BÀI HỌC")).strip().upper(),
-                "callout_type": ct,
-                "callout_text": str(s.get("callout_text", "")).strip(),
+                "callout_type": ct, "callout_text": str(s.get("callout_text", "")).strip(),
                 "callout_side": str(s.get("callout_side", "right")).strip().lower(),
                 "camera_motion": cm, "sfx": sfx,
                 "visual_prompt": vp,
-                "text_boxes": clean_text_boxes(s.get("text_boxes", [])),
-            })
+                "text_boxes": clean_text_boxes(s.get("text_boxes", []))})
         except Exception: continue
 
     if not clean:
-        clean = [{"start": 0.0, "end": batch_duration, "title": "BÀI HỌC",
-            "callout_type": "speech", "callout_text": "!", "callout_side": "right",
-            "camera_motion": "zoom_in_center", "sfx": "whoosh",
-            "visual_prompt": "2D comic doodle: a man standing at the edge of a cliff at sunset, red sunset, blue waves, white background, bold black outlines, no text",
-            "text_boxes": []}]
+        # FALLBACK V7.2: chia nhiều scene + đa ngôn ngữ
+        n_fallback = max(3, int(batch_duration / 23.0))
+        scene_dur = batch_duration / n_fallback
+        fb_title = "LESSON" if is_english else "BÀI HỌC"
+        fb_prompts = [
+            "2D comic doodle: a person standing at the edge of a cliff at sunset, red sunset, blue waves, white background, bold black outlines, no text",
+            "2D comic doodle: a person sitting alone on a bench in a park, thinking pose, question marks floating, blue accents, white background, no text",
+            "2D comic doodle: a person walking on a winding path with a treasure chest at the end, red accents, white background, no text",
+            "2D comic doodle: a person holding a glowing light bulb above head, idea concept, yellow sparkles, white background, no text",
+            "2D comic doodle: a person climbing a mountain, determination, red flag at peak, white background, no text",
+            "2D comic doodle: a person trapped inside a giant hourglass, sand falling, blue accents, white background, no text",
+            "2D comic doodle: a person looking at their reflection in a cracked mirror, red accents, white background, no text",
+            "2D comic doodle: a person planting a small tree, growth concept, green accents, white background, no text",
+            "2D comic doodle: a person surrounded by floating books, learning concept, blue accents, white background, no text",
+            "2D comic doodle: a person opening a mysterious door with light coming through, orange glow, white background, no text",
+        ]
+        clean = []
+        for i in range(n_fallback):
+            clean.append({
+                "start": i * scene_dur, "end": (i + 1) * scene_dur,
+                "title": f"{fb_title} {i+1:02d}",
+                "callout_type": "none", "callout_text": "", "callout_side": "right",
+                "camera_motion": random.choice(["zoom_in_center", "zoom_out_center",
+                                                 "pan_left_to_right", "ken_burns_slow"]),
+                "sfx": random.choice(["whoosh", "pop", "ding", "sparkle", "swoosh"]),
+                "visual_prompt": fb_prompts[i % len(fb_prompts)],
+                "text_boxes": []})
+        st.error(f"❌ Qwen KHÔNG trả scene — dùng {n_fallback} fallback scenes (~{scene_dur:.0f}s/cảnh)")
 
     merged = []
     for s in clean:
@@ -680,7 +655,7 @@ JSON FORMAT:
     return final_scenes
 
 # ============================================================
-# IMAGE PROVIDERS
+# IMAGE PROVIDERS (V7.2: THÊM CHẶN CHỮ VIỆT + SEED LOCK)
 # ============================================================
 def _build_full_prompt(prompt, chars=None, char_lock=None):
     chars = chars or {}
@@ -694,11 +669,12 @@ STYLE CONSTRAINTS:
 - Pure solid flat white background OR simple scene background if described above.
 - Vivid expressive cartoon character with clear emotion.
 - Selective vibrant spot colors (red, blue, orange, green) ONLY on key symbolic elements.
-- Absolutely NO text, letters, numbers, captions, or empty speech balloons.
+- ABSOLUTELY NO TEXT, NO LETTERS, NO NUMBERS, NO CAPTIONS anywhere in the image.
+- STRICTLY NO Vietnamese text, NO accents, NO diacritics rendered in the image.
 - Do not draw desk, table, markers, pens UNLESS explicitly mentioned.
 - Wide 16:9 cinematic composition.
-- CHARACTER CONSISTENCY: If character description mentioned, keep appearance EXACTLY the same across scenes.
-- CHARACTER GENDER: male character = MALE, female character = FEMALE. NEVER swap."""
+- CHARACTER CONSISTENCY: keep appearance EXACTLY the same across scenes.
+- CHARACTER GENDER: male = MALE, female = FEMALE. NEVER swap."""
 
 def _validate_image_bytes(data, provider_name):
     if not data or len(data) < 500: raise RuntimeError(f"{provider_name}: dữ liệu quá nhỏ")
@@ -709,7 +685,8 @@ def _validate_image_bytes(data, provider_name):
         raise RuntimeError(f"{provider_name}: không phải ảnh")
     return data
 
-def agnes_image_request(prompt, api_key, timeout=45, chars=None, char_lock=None):
+def agnes_image_request(prompt, api_key, timeout=45, chars=None, char_lock=None, seed=None):
+    """V7.2: Agnes BỎ QUA seed (không hỗ trợ) nhưng vẫn nhận tham số để tránh lỗi."""
     api_key = (api_key or "").strip()
     if not api_key: raise RuntimeError("Agnes: chưa có key")
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
@@ -727,13 +704,15 @@ def agnes_image_request(prompt, api_key, timeout=45, chars=None, char_lock=None)
         return _validate_image_bytes(img.content, "Agnes")
     raise RuntimeError("Agnes: no image")
 
-def cloudflare_image_request(prompt, account_id, api_token, timeout=45, steps=4, chars=None, char_lock=None):
+def cloudflare_image_request(prompt, account_id, api_token, timeout=45, steps=4, chars=None, char_lock=None, seed=None):
     account_id = (account_id or "").strip(); api_token = (api_token or "").strip()
     if not account_id or not api_token: raise RuntimeError("Cloudflare: thiếu thông tin")
     url = f"{CLOUDFLARE_BASE}{account_id}/ai/run/{CLOUDFLARE_MODEL}"
     headers = {"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"}
-    r = requests.post(url, headers=headers,
-                      json={"prompt": _build_full_prompt(prompt, chars, char_lock), "steps": steps}, timeout=timeout)
+    body = {"prompt": _build_full_prompt(prompt, chars, char_lock), "steps": steps}
+    if seed is not None:
+        body["seed"] = int(seed)  # V7.2: Cloudflare hỗ trợ seed
+    r = requests.post(url, headers=headers, json=body, timeout=timeout)
     if r.status_code == 429: raise RuntimeError("Cloudflare: hết quota")
     if r.status_code >= 400: raise RuntimeError(f"Cloudflare HTTP {r.status_code}")
     data = r.json()
@@ -742,23 +721,25 @@ def cloudflare_image_request(prompt, account_id, api_token, timeout=45, steps=4,
     if not b64: raise RuntimeError("Cloudflare: no image")
     return _validate_image_bytes(base64.b64decode(b64), "Cloudflare")
 
-def hf_image_request(prompt, token, timeout=45, chars=None, char_lock=None):
+def hf_image_request(prompt, token, timeout=45, chars=None, char_lock=None, seed=None):
     token = (token or "").strip()
     if not token: raise RuntimeError("HF: chưa có token")
     url = f"{HF_API_URL}{HF_MODEL}"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    r = requests.post(url, headers=headers,
-                      json={"inputs": _build_full_prompt(prompt, chars, char_lock)}, timeout=timeout)
+    body = {"inputs": _build_full_prompt(prompt, chars, char_lock)}
+    if seed is not None: body["parameters"] = {"seed": int(seed)}
+    r = requests.post(url, headers=headers, json=body, timeout=timeout)
     if r.status_code == 503: raise RuntimeError("HF: model loading")
     if r.status_code == 429: raise RuntimeError("HF: rate limit")
     if r.status_code >= 400: raise RuntimeError(f"HF HTTP {r.status_code}")
     return _validate_image_bytes(r.content, "HF")
 
-def freetheai_image_request(prompt, api_key, timeout=45, chars=None, char_lock=None):
+def freetheai_image_request(prompt, api_key, timeout=45, chars=None, char_lock=None, seed=None):
     api_key = (api_key or "").strip()
     if not api_key: raise RuntimeError("FreeTheAi: chưa có key")
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {"model": "flux", "prompt": _build_full_prompt(prompt, chars, char_lock), "n": 1, "size": "1280x720"}
+    if seed is not None: payload["seed"] = int(seed)
     r = requests.post(FREETHEAI_BASE, headers=headers, json=payload, timeout=timeout)
     if r.status_code == 429: raise RuntimeError("FreeTheAi: rate limit")
     if r.status_code >= 400: raise RuntimeError(f"FreeTheAi HTTP {r.status_code}")
@@ -770,12 +751,13 @@ def freetheai_image_request(prompt, api_key, timeout=45, chars=None, char_lock=N
         return _validate_image_bytes(img.content, "FreeTheAi")
     raise RuntimeError("FreeTheAi: no image")
 
-def together_image_request(prompt, api_key, timeout=45, chars=None, char_lock=None):
+def together_image_request(prompt, api_key, timeout=45, chars=None, char_lock=None, seed=None):
     api_key = (api_key or "").strip()
     if not api_key: raise RuntimeError("Together: chưa có key")
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {"model": TOGETHER_MODEL, "prompt": _build_full_prompt(prompt, chars, char_lock),
                "width": WIDTH, "height": HEIGHT, "steps": 4, "n": 1, "response_format": "b64_json"}
+    if seed is not None: payload["seed"] = int(seed)
     r = requests.post(TOGETHER_BASE, headers=headers, json=payload, timeout=timeout)
     if r.status_code == 429: raise RuntimeError("Together: rate limit")
     if r.status_code >= 400: raise RuntimeError(f"Together HTTP {r.status_code}")
@@ -787,12 +769,13 @@ def together_image_request(prompt, api_key, timeout=45, chars=None, char_lock=No
         return _validate_image_bytes(img.content, "Together")
     raise RuntimeError("Together: no image")
 
-def nexa_image_request(prompt, api_key, timeout=45, chars=None, char_lock=None):
+def nexa_image_request(prompt, api_key, timeout=45, chars=None, char_lock=None, seed=None):
     api_key = (api_key or "").strip()
     if not api_key: raise RuntimeError("NexaAPI: chưa có key")
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {"model": NEXA_MODEL, "prompt": _build_full_prompt(prompt, chars, char_lock),
                "width": WIDTH, "height": HEIGHT, "n": 1}
+    if seed is not None: payload["seed"] = int(seed)
     r = requests.post(NEXA_BASE, headers=headers, json=payload, timeout=timeout)
     if r.status_code == 429: raise RuntimeError("NexaAPI: rate limit")
     if r.status_code >= 400: raise RuntimeError(f"NexaAPI HTTP {r.status_code}")
@@ -811,7 +794,7 @@ def pollinations_image_request(prompt, api_key, model="flux-pro", timeout=45, se
     url = f"{POLLINATIONS_BASE}{encoded}"
     params = {"width": WIDTH, "height": HEIGHT, "model": model,
               "nologo": "true", "enhance": "true", "safe": "false"}
-    if seed is not None: params["seed"] = seed
+    if seed is not None: params["seed"] = int(seed)
     headers = {"Authorization": f"Bearer {api_key}", "Accept": "image/*"}
     r = requests.get(url, params=params, headers=headers, timeout=timeout, allow_redirects=True)
     if r.status_code == 401: raise RuntimeError("Pollinations 401")
@@ -824,32 +807,36 @@ def build_provider_list(cf_account, cf_token, hf_token, freetheai_key,
                          together_key, nexa_key, agnes_key,
                          pollinations_key="", pollinations_model="flux-pro",
                          flux_steps=4, chars=None, char_lock=None):
+    """V7.2: Provider rotate — Cloudflare lên đầu, Agnes xuống cuối."""
     chars = chars or {}; char_lock = char_lock or {}
     kw = {"chars": chars, "char_lock": char_lock}
     providers = []
+    # Thứ tự V7.2: Cloudflare (nhanh+seed) → Pollinations (seed) → HF (seed) → Together → FreeTheAi → Nexa → Agnes (cuối)
     if cf_account and cf_token and cf_account.strip() and cf_token.strip():
         providers.append({"name": "Cloudflare", "fn": cloudflare_image_request,
-            "args": [cf_account.strip(), cf_token.strip()], "kwargs": {"steps": flux_steps, **kw}})
-    if agnes_key and agnes_key.strip():
-        providers.append({"name": "Agnes AI", "fn": agnes_image_request,
-            "args": [agnes_key.strip()], "kwargs": kw})
-    if together_key and together_key.strip():
-        providers.append({"name": "Together AI", "fn": together_image_request,
-            "args": [together_key.strip()], "kwargs": kw})
-    if freetheai_key and freetheai_key.strip():
-        providers.append({"name": "FreeTheAi", "fn": freetheai_image_request,
-            "args": [freetheai_key.strip()], "kwargs": kw})
-    if hf_token and hf_token.strip():
-        providers.append({"name": "Hugging Face", "fn": hf_image_request,
-            "args": [hf_token.strip()], "kwargs": kw})
-    if nexa_key and nexa_key.strip():
-        providers.append({"name": "NexaAPI", "fn": nexa_image_request,
-            "args": [nexa_key.strip()], "kwargs": kw})
+            "args": [cf_account.strip(), cf_token.strip()], "kwargs": {"steps": flux_steps, **kw},
+            "supports_seed": True})
     if pollinations_key and pollinations_key.strip():
         providers.append({"name": f"Pollinations ({pollinations_model})",
             "fn": pollinations_image_request,
             "args": [pollinations_key.strip(), pollinations_model],
-            "kwargs": kw, "supports_seed": ["seed"]})
+            "kwargs": kw, "supports_seed": True})
+    if hf_token and hf_token.strip():
+        providers.append({"name": "Hugging Face", "fn": hf_image_request,
+            "args": [hf_token.strip()], "kwargs": kw, "supports_seed": True})
+    if together_key and together_key.strip():
+        providers.append({"name": "Together AI", "fn": together_image_request,
+            "args": [together_key.strip()], "kwargs": kw, "supports_seed": True})
+    if freetheai_key and freetheai_key.strip():
+        providers.append({"name": "FreeTheAi", "fn": freetheai_image_request,
+            "args": [freetheai_key.strip()], "kwargs": kw, "supports_seed": True})
+    if nexa_key and nexa_key.strip():
+        providers.append({"name": "NexaAPI", "fn": nexa_image_request,
+            "args": [nexa_key.strip()], "kwargs": kw, "supports_seed": True})
+    if agnes_key and agnes_key.strip():
+        # Agnes cuối — không hỗ trợ seed nhưng vẫn fallback được
+        providers.append({"name": "Agnes AI", "fn": agnes_image_request,
+            "args": [agnes_key.strip()], "kwargs": kw, "supports_seed": False})
     return providers
 
 def save_image_from_bytes(data, output_path):
@@ -1082,7 +1069,7 @@ def interpolate_motion(keyframes, p):
     _, s, cx, cy = keyframes[-1]; return s, cx, cy
 
 # ============================================================
-# RENDER 4 STYLES
+# 4 RENDER STYLES
 # ============================================================
 def render_scene_kttv_v2(image_path, duration, output_path, hand_path, motion="zoom_in_center"):
     total_frames = max(1, round(duration * FPS))
@@ -1298,12 +1285,12 @@ def create_placeholder_image(output_path, title):
     img.save(output_path, quality=95)
 
 # ============================================================
-# PARALLEL GEN
+# PARALLEL GEN (V7.2: SEED LOCK)
 # ============================================================
 def parallel_generate_images(scenes, batch_dir, providers, image_timeout,
                               progress_state, flux_steps=4, fair_share_enabled=True,
                               circuit_breaker_enabled=True, prioritize_fast=True,
-                              enable_arrows=True):
+                              enable_arrows=True, enable_seed_lock=False, seed_value=42):
     if not providers: raise RuntimeError("Không có provider nào.")
     total_scenes = len(scenes)
     if fair_share_enabled:
@@ -1311,9 +1298,11 @@ def parallel_generate_images(scenes, batch_dir, providers, image_timeout,
         st.caption(f"⚖️ Fair share cap: mỗi provider tối đa **{fair_share_cap}** cảnh")
     else: fair_share_cap = 999999
     if circuit_breaker_enabled:
-        st.caption(f"🔌 Circuit breaker: provider fail {CIRCUIT_BREAKER_THRESHOLD} lần → loại")
+        st.caption(f"🔌 Circuit breaker: fail {CIRCUIT_BREAKER_THRESHOLD} lần → loại")
     if prioritize_fast:
         st.caption(f"⚡ Slow penalty: provider > {SLOW_PROVIDER_THRESHOLD:.0f}s → sleep {SLOW_PROVIDER_PENALTY}s")
+    if enable_seed_lock:
+        st.caption(f"🎲 Seed lock: dùng seed cố định **{seed_value}** (chỉ provider hỗ trợ seed)")
     st.caption(f"🔁 Mỗi cảnh tối đa **{MAX_ATTEMPTS_PER_SCENE}** lần thử")
 
     scene_queue = Queue(); scene_attempts = {}
@@ -1321,7 +1310,8 @@ def parallel_generate_images(scenes, batch_dir, providers, image_timeout,
         img_raw = batch_dir / f"scene_{i+1:03d}_raw.png"
         img = batch_dir / f"scene_{i+1:03d}.jpg"
         if not img.exists():
-            scene_queue.put((i, s, img_raw, img)); scene_attempts[i] = 0
+            scene_queue.put((i, s, img_raw, img))
+            scene_attempts[i] = 0
             progress_state["scene_status"][i] = {"status": "pending", "provider": None,
                 "started": None, "elapsed": 0.0, "attempts": 0}
         else:
@@ -1336,6 +1326,7 @@ def parallel_generate_images(scenes, batch_dir, providers, image_timeout,
 
     def worker(provider_cfg):
         name = provider_cfg["name"]
+        supports_seed = provider_cfg.get("supports_seed", False)
         my_count = 0; consecutive_fails = 0; local_ok = 0; local_time = 0.0
         while my_count < fair_share_cap:
             if circuit_breaker_enabled and consecutive_fails >= CIRCUIT_BREAKER_THRESHOLD:
@@ -1363,9 +1354,16 @@ def parallel_generate_images(scenes, batch_dir, providers, image_timeout,
                 progress_state["scene_status"][idx] = {"status": "working", "provider": name,
                     "started": t_start, "elapsed": 0.0, "attempts": current_attempts + 1}
             try:
-                seed = hash(f"{scene['visual_prompt']}_{idx}") % (2**31)
+                # V7.2: Seed lock
+                if enable_seed_lock and supports_seed:
+                    seed = int(seed_value)  # Cùng seed cho mọi cảnh
+                elif supports_seed:
+                    seed = hash(f"{scene['visual_prompt']}_{idx}") % (2**31)  # Seed riêng từng cảnh
+                else:
+                    seed = None
                 kwargs = provider_cfg.get("kwargs", {}).copy()
-                if "seed" in provider_cfg.get("supports_seed", []): kwargs["seed"] = seed
+                if seed is not None and supports_seed:
+                    kwargs["seed"] = seed
                 data = provider_cfg["fn"](scene["visual_prompt"], *provider_cfg.get("args", []),
                                           timeout=image_timeout, **kwargs)
                 if not data or len(data) < 500: raise RuntimeError("empty data")
@@ -1423,9 +1421,16 @@ def parallel_generate_images(scenes, batch_dir, providers, image_timeout,
             success = False
             for cfg in providers:
                 try:
-                    seed = hash(f"{scene['visual_prompt']}_{idx}") % (2**31)
+                    supports_seed = cfg.get("supports_seed", False)
+                    if enable_seed_lock and supports_seed:
+                        seed = int(seed_value)
+                    elif supports_seed:
+                        seed = hash(f"{scene['visual_prompt']}_{idx}") % (2**31)
+                    else:
+                        seed = None
                     kwargs = cfg.get("kwargs", {}).copy()
-                    if "seed" in cfg.get("supports_seed", []): kwargs["seed"] = seed
+                    if seed is not None and supports_seed:
+                        kwargs["seed"] = seed
                     data = cfg["fn"](scene["visual_prompt"], *cfg.get("args", []),
                                      timeout=min(image_timeout, 45), **kwargs)
                     if data and len(data) > 500:
@@ -1456,7 +1461,7 @@ def parallel_generate_images(scenes, batch_dir, providers, image_timeout,
     return results, len(failed_scenes)
 
 # ============================================================
-# RENDER BATCH (VỚI SFX)
+# RENDER BATCH
 # ============================================================
 def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
                  cf_account, cf_token, hf_token, freetheai_key, together_key,
@@ -1464,7 +1469,8 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
                  image_timeout, flux_steps=4, fair_share_enabled=True,
                  circuit_breaker_enabled=True, prioritize_fast=True,
                  chars=None, char_lock=None, enable_arrows=True,
-                 enable_sfx=True, sfx_volume=-12):
+                 enable_sfx=True, sfx_volume=-12,
+                 enable_seed_lock=False, seed_value=42):
     total = len(scenes)
     if total == 0: raise RuntimeError("Không có cảnh nào để render.")
     chars = chars or {}; char_lock = char_lock or {}
@@ -1473,14 +1479,15 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
         flux_steps, chars=chars, char_lock=char_lock)
     if not providers: raise RuntimeError("Chưa cấu hình provider ảnh nào.")
 
-    st.markdown(f"### 🔗 {len(providers)} Provider (ưu tiên nhanh → chậm)")
+    st.markdown(f"### 🔗 {len(providers)} Provider (thứ tự ưu tiên V7.2)")
     pc = st.columns(min(4, len(providers)))
     for i, p in enumerate(providers):
-        with pc[i % len(pc)]: st.markdown(f"**{i+1}.** {p['name']}")
-    if chars:
-        st.info(f"👥 Nhân vật: {', '.join(f'{k}' for k in chars.keys())}")
-    if char_lock:
-        st.success(f"🔒 Đã khóa {len(char_lock)} nhân vật (ngoại hình đồng nhất xuyên suốt)")
+        with pc[i % len(pc)]:
+            seed_badge = "🎲" if p.get("supports_seed") else "❌"
+            st.markdown(f"**{i+1}.** {p['name']} {seed_badge}")
+    if chars: st.info(f"👥 Nhân vật: {', '.join(chars.keys())}")
+    if char_lock: st.success(f"🔒 Đã khóa {len(char_lock)} nhân vật")
+    if enable_seed_lock: st.warning(f"🎲 Seed lock BẬT — seed={seed_value}. Chỉ provider có 🎲 mới áp dụng.")
     if enable_sfx:
         sfx_count = sum(1 for s in scenes if s.get("sfx", "none") != "none")
         st.info(f"🔊 Sẽ chèn SFX vào {sfx_count}/{total} cảnh")
@@ -1540,7 +1547,7 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
         try:
             r, _ = parallel_generate_images(scenes, batch_dir, providers, image_timeout,
                 progress_state, flux_steps, fair_share_enabled, circuit_breaker_enabled,
-                prioritize_fast, enable_arrows)
+                prioritize_fast, enable_arrows, enable_seed_lock, seed_value)
             result_container["result"] = r
         except Exception as e: result_container["error"] = e
     t = threading.Thread(target=run_parallel, daemon=True)
@@ -1574,30 +1581,25 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
         render_bar.progress(i / total)
         render_text.markdown(f"**🎬 Render: {i}/{total}** — {s['title']}")
 
-    # Concat scene videos
     concat_file = batch_dir / "concat.txt"
     concat_file.write_text("\n".join(f"file '{p.resolve()}'" for p in scene_videos), encoding="utf-8")
     batch_video = batch_dir / "batch_video.mp4"
     run_cmd(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file),
              "-c", "copy", "-movflags", "+faststart", str(batch_video)], timeout=900)
 
-    # Build SFX track nếu enabled
     final_batch = batch_dir / "batch_final.mp4"
     if enable_sfx:
         st.markdown("### 🔊 Trộn sound effects")
         sfx_track = batch_dir / "sfx_track.wav"
         result = build_sfx_track(scenes, sfx_track, SFX_SAMPLE_RATE, sfx_volume)
         if result:
-            st.info(f"✅ Đã tạo SFX track với {sum(1 for s in scenes if s.get('sfx','none') != 'none')} hiệu ứng")
-            # Mix voice + sfx
+            st.info(f"✅ SFX track với {sum(1 for s in scenes if s.get('sfx','none') != 'none')} hiệu ứng")
             mixed_audio = batch_dir / "audio_mixed.m4a"
             mix_sfx_into_audio(str(batch_audio), str(sfx_track), str(mixed_audio))
-            # Ghép video với audio mixed
             run_cmd(["ffmpeg", "-y", "-i", str(batch_video), "-i", str(mixed_audio),
                      "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac",
                      "-b:a", "128k", "-movflags", "+faststart", str(final_batch)], timeout=900)
         else:
-            st.warning("⚠️ Không có SFX nào được tạo, dùng audio gốc")
             run_cmd(["ffmpeg", "-y", "-i", str(batch_video), "-i", str(batch_audio),
                      "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac",
                      "-b:a", "128k", "-movflags", "+faststart", str(final_batch)], timeout=900)
@@ -1633,9 +1635,10 @@ if st.sidebar.button("🔎 KIỂM TRA PROVIDER", use_container_width=True):
     else:
         st.write(f"**{len(providers)} provider:**")
         for i, p in enumerate(providers, 1):
-            st.write(f"{i}. {p['name']}")
+            seed_badge = "🎲 Có seed" if p.get("supports_seed") else "❌ Không seed"
+            st.write(f"{i}. {p['name']} — {seed_badge}")
         if char_lock:
-            st.success(f"🔒 Character lock active: {list(char_lock.keys())}")
+            st.success(f"🔒 Character lock: {list(char_lock.keys())}")
         if st.button("▶️ Test 1 ảnh"):
             tp = "2D comic doodle: a female character with long hair in green shirt sitting at desk with laptop, thinking pose, red accents, white background, no text"
             for cfg in providers:
@@ -1659,23 +1662,24 @@ if audio:
     if st.button("🚀 BẮT ĐẦU", type="primary", use_container_width=True):
         if not groq_key:
             st.error("Cần Groq API Key."); st.stop()
-
-        chars = parse_characters(f"{char_main_name} = male\n{char_second_name} = female") if False else {}
-        # Xác định language code
-        lang_code = "en" if language_mode == "English" else "vi"
-        st.info(f"🌐 Ngôn ngữ: **{language_mode}** ({lang_code})")
+        if language_mode == "Auto Detect (khuyên dùng)":
+            lang_code = None
+            st.info(f"🌐 Ngôn ngữ: **Auto Detect**")
+        elif language_mode == "English":
+            lang_code = "en"; st.info(f"🌐 Ngôn ngữ: **English**")
+        else:
+            lang_code = "vi"; st.info(f"🌐 Ngôn ngữ: **Tiếng Việt**")
 
         char_lock = build_character_lock(char_main_name, char_main_desc,
                                           char_second_name, char_second_desc, enable_char_lock)
-        if char_lock:
-            st.success(f"🔒 Khóa {len(char_lock)} nhân vật")
+        if char_lock: st.success(f"🔒 Khóa {len(char_lock)} nhân vật")
 
-        root = Path(tempfile.mkdtemp(prefix="wb_v7_"))
+        root = Path(tempfile.mkdtemp(prefix="wb_v72_"))
         try:
             source = root / audio.name
             source.write_bytes(audio.getbuffer())
             duration = ffprobe_duration(source)
-            st.info(f"Thời lượng: {duration/60:.2f} phút. Batch 10 phút.")
+            st.info(f"Thời lượng: {duration/60:.2f} phút. Batch {BATCH_SECONDS//60} phút.")
 
             client = groq_client(groq_key)
             batch_dir = root / "batches"; batch_dir.mkdir()
@@ -1695,15 +1699,21 @@ if audio:
 
             for idx, (bi, chunk, bdur) in enumerate(valid_chunks):
                 bstart = bi * BATCH_SECONDS
-                status.markdown(f"### 🧠 Đợt {idx+1}/{len(valid_chunks)} — STT ({lang_code})...")
+                status.markdown(f"### 🧠 Đợt {idx+1}/{len(valid_chunks)} — STT...")
                 tr = transcribe_file(client, chunk, stt_model, language=lang_code)
+                if lang_code is None:
+                    detected = detect_language_from_result(tr)
+                    st.info(f"🌐 Whisper phát hiện: **{detected}**")
                 segs = normalize_segments(tr, bstart)
                 batch_text = "\n".join(f"[{x['start']:.2f}-{x['end']:.2f}] {x['text']}" for x in segs)
+                if len(batch_text.strip()) < 50:
+                    st.error(f"⚠️ Transcript quá ngắn ({len(batch_text)} ký tự)! Kiểm tra language mode.")
+                    st.code(batch_text[:500] if batch_text else "(empty)")
 
                 status.markdown(f"### ✂️ Đợt {idx+1}/{len(valid_chunks)} — Lên kịch bản...")
                 scenes = make_scene_plan(client, batch_text, bstart, bdur, planner_model,
                                          scene_min, scene_max, max_scenes, camera_mode,
-                                         language=lang_code,
+                                         language=lang_code or "vi",
                                          enable_rich=enable_rich_overlay,
                                          char_lock=char_lock,
                                          enable_sfx=enable_sfx)
@@ -1723,7 +1733,8 @@ if audio:
                                   image_timeout, flux_steps, fair_share_enabled,
                                   circuit_breaker_enabled, prioritize_fast,
                                   chars={}, char_lock=char_lock, enable_arrows=enable_arrows,
-                                  enable_sfx=enable_sfx, sfx_volume=sfx_volume)
+                                  enable_sfx=enable_sfx, sfx_volume=sfx_volume,
+                                  enable_seed_lock=enable_seed_lock, seed_value=seed_value)
                 saved = root / f"batch_final_{idx+1:03d}.mp4"
                 shutil.copy2(bv, saved); batch_videos.append(saved)
                 all_scenes += len(scenes)
