@@ -1,14 +1,13 @@
 """
-Xưởng Video Diễn Hoạt Kiến Thức AI — Bản Siêu Cấp V8.1
-========================================================
-V8.1 FIX & NÂNG CẤP:
-- Font: tự tải Noto Sans Bold/Regular, fallback nhiều lớp → chữ đẹp không lỗi dấu
-- Smart Text Box Layout: 4 vùng riêng biệt, không đè chữ
-- Arrow: bounds check, không vẽ ra ngoài canvas
-- Text Shadow + Background: chữ dễ đọc trên mọi nền
-- Title Underline: gạch chân đỏ accent chuyên nghiệp
-- Callout: shadow nhẹ + viền dày hơn
-- Qwen prompt: giới hạn 2-3 text_boxes, tọa độ cố định 4 vùng
+Xưởng Video Diễn Hoạt Kiến Thức AI — Bản Siêu Cấp V9
+=====================================================
+V9 MỚI:
+- Style Mode: Comic (mặc định) + Horror (kinh dị)
+- Horror Sanitize: biến hóa từ khóa tránh AI filter
+- Horror Camera: 6 motion chuyên horror (slow zoom, creepy pan, dramatic)
+- Fix text box cắt mép + arrow quá dài (từ V8.1)
+- Dynamic max_tokens theo model
+- Cache transcript tại ~/.wb_cache/
 """
 
 import os, re, io, json, math, time, base64, random, shutil, subprocess, tempfile, threading, wave
@@ -19,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor, wait
 
 import requests
 import streamlit as st
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from PIL import Image, ImageDraw, ImageFont
 from groq import Groq
 import cv2
 import numpy as np
@@ -27,7 +26,7 @@ import numpy as np
 # ============================================================
 # CẤU HÌNH
 # ============================================================
-APP_TITLE = "Xưởng Video Diễn Hoạt Kiến Thức AI (Bản Siêu Cấp V8.1)"
+APP_TITLE = "Xưởng Video Diễn Hoạt Kiến Thức AI (V9)"
 BATCH_SECONDS = 5 * 60
 FPS = 24
 WIDTH = 1280
@@ -66,6 +65,10 @@ COLOR_MAP = {"red": "#d32f2f", "green": "#2e7d32", "blue": "#1565c0",
 SIZE_MAP = {"small": 22, "medium": 30, "large": 44, "huge": 58}
 VALID_SFX = {"none", "whoosh", "pop", "ding", "impact", "sad", "bell", "typing", "sparkle", "swoosh"}
 
+# Horror SFX riêng
+HORROR_SFX = {"none", "whoosh", "impact", "sad", "typing", "swoosh",
+              "creak", "whisper", "scream", "heartbeat", "thunder", "silence_break"}
+
 NOTE_FREQ = {
     'C3':130.81,'D3':146.83,'E3':164.81,'F3':174.61,'G3':196.00,'A3':220.00,'B3':246.94,
     'C4':261.63,'D4':293.66,'E4':329.63,'F4':349.23,'G4':392.00,'A4':440.00,'B4':493.88,
@@ -80,17 +83,78 @@ EMOTION_CHORDS = {
     "tense":         [('C4','Eb4','G4'),('Db4','F4','Ab4'),('C4','Eb4','G4'),('Bb3','D4','F4')],
     "inspirational": [('C4','E4','G4'),('A3','C4','E4'),('F3','A3','C4'),('G3','B3','D4')],
     "neutral":       [('C4','E4','G4'),('C4','E4','G4'),('F4','A4','C5'),('G4','B4','D5')],
+    # Horror emotions
+    "dread":         [('A3','C4','E4'),('G3','Bb3','D4'),('F3','Ab3','C4'),('E3','G3','B3')],
+    "panic":         [('D4','F4','A4'),('Eb4','G4','Bb4'),('D4','F4','A4'),('C4','Eb4','G4')],
+    "eerie":         [('C3','Eb3','G3'),('Db3','F3','Ab3'),('C3','Eb3','G3'),('B2','D3','F3')],
+    "ominous":       [('C3','G3','C4'),('Bb2','F3','Bb3'),('Ab2','Eb3','Ab3'),('G2','D3','G3')],
 }
 VALID_EMOTIONS = set(EMOTION_CHORDS.keys()) | {"none"}
+
+# ============================================================
+# HORROR SANITIZE — Biến hóa từ khóa tránh AI filter
+# ============================================================
+HORROR_SANITIZE = {
+    r"\bblood splatter\b": "crimson liquid splatter",
+    r"\bbloodbath\b": "crimson scene",
+    r"\bbloody\b": "crimson-stained",
+    r"\bblood\b": "crimson liquid",
+    r"\bbleed(ing)?\b": "dripping red",
+    r"\bdead body\b": "still silhouette",
+    r"\bcorpse\b": "motionless figure",
+    r"\bdead\b": "motionless",
+    r"\bdeath\b": "final moment",
+    r"\bdied\b": "became still",
+    r"\bkilled\b": "silenced",
+    r"\bkill(ing|er)?\b": "confrontation",
+    r"\bmurder(er)?\b": "dark event",
+    r"\bsuicide\b": "despair",
+    r"\bweapon\b": "sharp object",
+    r"\bknife\b": "gleaming blade",
+    r"\bblade\b": "sharp edge",
+    r"\bgun\b": "dark shape",
+    r"\bgore\b": "dramatic red accents",
+    r"\bwound(ed)?\b": "red mark",
+    r"\bstab(bing|bed)?\b": "sharp impact",
+    r"\bmutilat(e|ed|ion)\b": "damaged",
+    r"\bdismember(ed)?\b": "broken apart",
+    r"\bsever(ed)?\b": "cut apart",
+    r"\bchop(ped)?\b": "cut",
+    r"\bviolent\b": "intense",
+    r"\bviolence\b": "intense confrontation",
+    r"\btorture(d)?\b": "torment",
+    r"\bscream(ing)?\b": "cry of fear",
+    r"\bterror\b": "deep dread",
+}
+
+def horror_sanitize(text):
+    """Biến hóa từ khóa kinh dị để tránh AI safety filter."""
+    result = text
+    for pattern, rep in HORROR_SANITIZE.items():
+        result = re.sub(pattern, rep, result, flags=re.IGNORECASE)
+    return result
 
 # ============================================================
 # UI
 # ============================================================
 st.set_page_config(page_title=APP_TITLE, page_icon="🎬", layout="wide")
-st.title("🎬 Xưởng Video Diễn Hoạt Kiến Thức AI — Siêu Cấp V8.1")
-st.caption("Font đẹp + Smart Layout + Voice+Text + Nhạc nền + SFX + Nhân vật đồng nhất")
+st.title("🎬 Xưởng Video Diễn Hoạt Kiến Thức AI — V9")
+st.caption("Comic + Horror mode + Voice+Text + Nhạc nền + SFX + Nhân vật đồng nhất + Font đẹp")
 
 with st.sidebar:
+    st.header("🎨 Style Mode")
+    style_mode_ui = st.radio(
+        "Phong cách video",
+        ["📚 Kiến Thức (Comic)", "👻 Kinh Dị (Horror)"],
+        index=0,
+        help="Comic: phong cách kênh Kiến Thức Thú Vị. Horror: phong cách truyện kinh dị.",
+    )
+    style_mode = "horror" if "Horror" in style_mode_ui else "comic"
+
+    if style_mode == "horror":
+        st.warning("⚠️ Horror mode: từ khóa sẽ được biến hóa để tránh AI filter. "
+                   "Chất lượng phụ thuộc provider (khuyên dùng Pollinations flux-pro).")
+
     st.header("🔑 API Keys")
     groq_key = st.text_input("Groq API Key",
         value=os.getenv("GROQ_API_KEY", ""), type="password")
@@ -99,7 +163,8 @@ with st.sidebar:
         pollinations_key = st.text_input("Pollinations API Key",
             value=os.getenv("POLLINATIONS_API_KEY", ""), type="password")
         pollinations_model = st.selectbox("Pollinations Model",
-            ["flux-pro", "flux", "gptimage", "kontext", "flux-realism"], index=0)
+            ["flux-pro", "flux", "gptimage", "kontext", "flux-realism"], index=0,
+            help="Horror mode: khuyên dùng flux-pro")
         agnes_key = st.text_input("Agnes AI API Key",
             value=os.getenv("AGNES_API_KEY", ""), type="password")
         cf_account = st.text_input("Cloudflare Account ID",
@@ -116,14 +181,10 @@ with st.sidebar:
             value=os.getenv("NEXA_API_KEY", ""), type="password")
 
     st.header("📝 Văn bản kịch bản (tùy chọn)")
-    script_text = st.text_area(
-        "Dán kịch bản để AI phân tích chính xác hơn",
-        value="", height=120,
-        help="Nếu có: AI dùng cả voice + text. Nếu trống: chỉ dùng voice.")
-    use_script_mode = st.radio(
-        "Chế độ phân tích",
-        ["Chỉ dùng voice", "Kết hợp voice + text", "Chỉ dùng text"],
-        index=0)
+    script_text = st.text_area("Dán kịch bản để AI phân tích chính xác hơn",
+        value="", height=120)
+    use_script_mode = st.radio("Chế độ phân tích",
+        ["Chỉ dùng voice", "Kết hợp voice + text", "Chỉ dùng text"], index=0)
 
     st.header("🌐 Ngôn ngữ")
     language_mode = st.selectbox("Ngôn ngữ video",
@@ -152,10 +213,10 @@ with st.sidebar:
     planner_model = st.selectbox("Biên kịch Model",
         ["qwen/qwen3.8-27b", "openai/gpt-oss-120b", "openai/gpt-oss-20b"], index=0)
 
-    st.header("🎬 Phong cách")
-    draw_style = st.selectbox("Phong cách", [
-        "1. Kiến Thức Thú Vị V2 (Vẽ 3 phase + Pan/Zoom)",
-        "2. Độc bản Hybrid (Tay vẽ + Steadicam)",
+    st.header("🎬 Phong cách diễn hoạt")
+    draw_style = st.selectbox("Render style", [
+        "1. Vẽ 3 phase + Pan/Zoom",
+        "2. Hybrid (Tay vẽ + Steadicam)",
         "3. Chỉ Camera Pan & Zoom",
         "4. Bảng trắng cổ điển",
     ], index=0)
@@ -176,8 +237,7 @@ with st.sidebar:
     st.header("⏱️ Nhịp cảnh")
     scene_min = st.slider("Tối thiểu (giây)", 18, 25, 19)
     scene_max = st.slider("Tối đa (giây)", 22, 35, 27)
-    if scene_max < scene_min:
-        scene_max = scene_min
+    if scene_max < scene_min: scene_max = scene_min
 
     st.header("⚙️ Khác")
     max_scenes = st.slider("Số cảnh tối đa/batch", 5, 50, 25)
@@ -202,15 +262,12 @@ def ffprobe_duration(path):
     return float(out.strip())
 
 def extract_json(text):
-    if not text:
-        raise ValueError("Empty response")
+    if not text: raise ValueError("Empty response")
     text = text.strip()
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
     text = re.sub(r"\s*```\s*$", "", text)
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
+    try: return json.loads(text)
+    except Exception: pass
     best_obj = None; best_len = 0; depth = 0; start = -1
     for i, ch in enumerate(text):
         if ch == "{":
@@ -220,60 +277,53 @@ def extract_json(text):
             if depth > 0:
                 depth -= 1
                 if depth == 0 and start >= 0:
-                    candidate = text[start:i+1]
-                    if len(candidate) > best_len:
+                    cand = text[start:i+1]
+                    if len(cand) > best_len:
                         try:
-                            obj = json.loads(candidate); best_obj = obj; best_len = len(candidate)
+                            obj = json.loads(cand); best_obj = obj; best_len = len(cand)
                         except Exception: pass
     if best_obj is not None: return best_obj
-    raise ValueError(f"AI không phản hồi JSON hợp lệ (preview={text[:200]})")
+    raise ValueError(f"JSON invalid (preview={text[:200]})")
 
-def groq_client(key):
-    return Groq(api_key=key)
+def groq_client(key): return Groq(api_key=key)
 
 def transcribe_file(client, path, model, language=None, cache_dir=None):
     if cache_dir:
-        cache_file = Path(cache_dir) / f"{Path(path).stem}_transcript.json"
-        if cache_file.exists():
+        cf = Path(cache_dir) / f"{Path(path).stem}_transcript.json"
+        if cf.exists():
             try:
-                data = json.loads(cache_file.read_text(encoding="utf-8"))
-                st.info(f"💾 Dùng cache: {cache_file.name}")
-                class CachedResult:
-                    def __init__(self, d): self._d = d
-                    def model_dump(self): return self._d
-                    def __getattr__(self, k): return self._d.get(k)
-                return CachedResult(data)
-            except Exception as e:
-                st.warning(f"Cache lỗi: {e}")
-
+                data = json.loads(cf.read_text(encoding="utf-8"))
+                st.info(f"💾 Cache: {cf.name}")
+                class CR:
+                    def __init__(s, d): s._d = d
+                    def model_dump(s): return s._d
+                    def __getattr__(s, k): return s._d.get(k)
+                return CR(data)
+            except Exception: pass
     with open(path, "rb") as f:
-        kwargs = {"file": (Path(path).name, f.read()), "model": model,
-                  "response_format": "verbose_json", "timestamp_granularities": ["segment"],
-                  "temperature": 0.0}
-        if language: kwargs["language"] = language
-        result = client.audio.transcriptions.create(**kwargs)
-
+        kw = {"file": (Path(path).name, f.read()), "model": model,
+              "response_format": "verbose_json", "timestamp_granularities": ["segment"],
+              "temperature": 0.0}
+        if language: kw["language"] = language
+        result = client.audio.transcriptions.create(**kw)
     if cache_dir:
         try:
             data = result.model_dump() if hasattr(result, "model_dump") else result
-            cache_file = Path(cache_dir) / f"{Path(path).stem}_transcript.json"
-            cache_file.write_text(json.dumps(data, ensure_ascii=False, default=str), encoding="utf-8")
-        except Exception as e:
-            st.warning(f"Không lưu được cache: {e}")
+            (Path(cache_dir) / f"{Path(path).stem}_transcript.json").write_text(
+                json.dumps(data, ensure_ascii=False, default=str), encoding="utf-8")
+        except Exception: pass
     return result
 
-def detect_language_from_result(result):
+def detect_language(result):
     try:
-        data = result.model_dump() if hasattr(result, "model_dump") else result
-        if isinstance(data, dict): return data.get("language", "unknown")
-        return getattr(result, "language", "unknown")
+        d = result.model_dump() if hasattr(result, "model_dump") else result
+        return d.get("language", "unknown") if isinstance(d, dict) else getattr(result, "language", "unknown")
     except Exception: return "unknown"
 
-def chunk_audio(src, out_dir, batch_seconds):
+def chunk_audio(src, out_dir, bs):
     pattern = str(Path(out_dir) / "batch_%03d.m4a")
-    run_cmd(["ffmpeg", "-y", "-i", str(src), "-map", "0:a:0",
-             "-c:a", "aac", "-b:a", "96k", "-f", "segment",
-             "-segment_time", str(batch_seconds), "-reset_timestamps", "1", pattern], timeout=900)
+    run_cmd(["ffmpeg", "-y", "-i", str(src), "-map", "0:a:0", "-c:a", "aac", "-b:a", "96k",
+             "-f", "segment", "-segment_time", str(bs), "-reset_timestamps", "1", pattern], timeout=900)
     return sorted(Path(out_dir).glob("batch_*.m4a"))
 
 def normalize_segments(result, offset):
@@ -282,295 +332,267 @@ def normalize_segments(result, offset):
     out = []
     for s in segments or []:
         if isinstance(s, dict):
-            stt = float(s.get("start", 0)); end = float(s.get("end", stt)); text = str(s.get("text", "")).strip()
+            st_ = float(s.get("start", 0)); e_ = float(s.get("end", st_)); tx = str(s.get("text", "")).strip()
         else:
-            stt = float(getattr(s, "start", 0)); end = float(getattr(s, "end", stt)); text = str(getattr(s, "text", "")).strip()
-        if text:
-            out.append({"start": stt + offset, "end": end + offset, "text": text})
+            st_ = float(getattr(s, "start", 0)); e_ = float(getattr(s, "end", st_)); tx = str(getattr(s, "text", "")).strip()
+        if tx: out.append({"start": st_ + offset, "end": e_ + offset, "text": tx})
     return out
 
 def sanitize_prompt_text(prompt):
-    for pattern, rep in {
+    for pat, rep in {
         r"\bblood\b": "dark ink", r"\bbleed\b": "drip", r"\bsuicide\b": "despair",
         r"\bkill(ing|er)?\b": "oppression", r"\bdead\b": "fallen", r"\bdeath\b": "crisis",
         r"\bcorpse\b": "shadow", r"\bjump(ing)?\b": "falling shadow", r"\bweapon\b": "heavy chain",
     }.items():
-        prompt = re.sub(pattern, rep, prompt, flags=re.IGNORECASE)
+        prompt = re.sub(pat, rep, prompt, flags=re.IGNORECASE)
     return prompt
 
-def build_character_lock(main_name, main_desc, second_name, second_desc, enabled=True):
+def build_character_lock(mn, md, sn, sd, enabled=True):
     if not enabled: return {}
     lock = {}
-    if main_name.strip() and main_desc.strip():
-        lock[main_name.strip().lower()] = main_desc.strip()
-    if second_name.strip() and second_desc.strip():
-        lock[second_name.strip().lower()] = second_desc.strip()
+    if mn.strip() and md.strip(): lock[mn.strip().lower()] = md.strip()
+    if sn.strip() and sd.strip(): lock[sn.strip().lower()] = sd.strip()
     return lock
 
 def enforce_character_lock(prompt, char_lock):
     if not char_lock: return prompt
-    prompt_lower = prompt.lower()
-    result = prompt
+    pl = prompt.lower(); result = prompt
     for name, desc in char_lock.items():
-        if name in prompt_lower and desc not in prompt_lower:
+        if name in pl and desc not in pl:
             result = f"[CHARACTER CONSISTENCY: {name} = {desc}] " + result
     return result
 
 # ============================================================
 # TITLE BAND
 # ============================================================
-def split_title_band(image_bgr):
-    return image_bgr[:TITLE_BAND_H, :].copy(), image_bgr[TITLE_BAND_H:, :].copy()
+def split_title_band(img_bgr): return img_bgr[:TITLE_BAND_H, :].copy(), img_bgr[TITLE_BAND_H:, :].copy()
 
-def compose_frame(title_band_bgr, content_bgr):
-    canvas = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
-    canvas[:TITLE_BAND_H] = title_band_bgr
-    canvas[TITLE_BAND_H:] = content_bgr
-    return canvas
+def compose_frame(tb, ct):
+    c = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
+    c[:TITLE_BAND_H] = tb; c[TITLE_BAND_H:] = ct
+    return c
 
-def crop_content_with_motion(content_bgr, scale, cx, cy):
-    ch, cw = content_bgr.shape[:2]
-    crop_w = max(1, min(cw, int(cw / max(0.5, scale))))
-    crop_h = max(1, min(ch, int(ch / max(0.5, scale))))
-    x1 = max(0, min(cw - crop_w, int(cx - crop_w / 2)))
-    y1 = max(0, min(ch - crop_h, int(cy - crop_h / 2)))
-    return cv2.resize(content_bgr[y1:y1+crop_h, x1:x1+crop_w], (cw, ch), interpolation=cv2.INTER_LINEAR)
+def crop_content_motion(c, scale, cx, cy):
+    ch, cw = c.shape[:2]
+    w = max(1, min(cw, int(cw / max(0.5, scale))))
+    h = max(1, min(ch, int(ch / max(0.5, scale))))
+    x1 = max(0, min(cw - w, int(cx - w / 2)))
+    y1 = max(0, min(ch - h, int(cy - h / 2)))
+    return cv2.resize(c[y1:y1+h, x1:x1+w], (cw, ch), interpolation=cv2.INTER_LINEAR)
 
-def trajectory_to_content_space(trajectory_full):
-    out = [(int(px), int(py - TITLE_BAND_H)) for (px, py) in trajectory_full if py >= TITLE_BAND_H]
+def traj_to_content(traj_full):
+    out = [(int(px), int(py - TITLE_BAND_H)) for (px, py) in traj_full if py >= TITLE_BAND_H]
     return out if out else [(WIDTH // 2, CONTENT_H // 2)]
 
-def split_trajectory_into_phases(trajectory, ratios=PHASE_RATIOS):
-    n = len(trajectory)
-    if n < 3: return [trajectory, [], []]
+def split_traj_phases(traj, ratios=PHASE_RATIOS):
+    n = len(traj)
+    if n < 3: return [traj, [], []]
     b1 = max(1, int(n * ratios[0]))
     b2 = max(b1 + 1, int(n * (ratios[0] + ratios[1])))
     b2 = min(b2, n - 1)
-    return [trajectory[:b1], trajectory[b1:b2], trajectory[b2:]]
+    return [traj[:b1], traj[b1:b2], traj[b2:]]
 
 # ============================================================
-# FONT — TỰ TẢI NOTO SANS
+# FONT
 # ============================================================
 FONT_URLS = {
     "NotoSans-Bold.ttf": [
         "https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSans/NotoSans-Bold.ttf",
         "https://cdn.jsdelivr.net/gh/googlefonts/noto-fonts@main/hinted/ttf/NotoSans/NotoSans-Bold.ttf",
     ],
-    "NotoSans-Regular.ttf": [
-        "https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSans/NotoSans-Regular.ttf",
-        "https://cdn.jsdelivr.net/gh/googlefonts/noto-fonts@main/hinted/ttf/NotoSans/NotoSans-Regular.ttf",
-    ],
 }
 
 @st.cache_resource(show_spinner=False)
 def _ensure_fonts():
-    """Tải Noto Sans về ~/.fonts nếu chưa có."""
     FONT_DIR.mkdir(parents=True, exist_ok=True)
     for fname, urls in FONT_URLS.items():
-        target = FONT_DIR / fname
-        if target.exists() and target.stat().st_size > 50000:
-            continue
+        t = FONT_DIR / fname
+        if t.exists() and t.stat().st_size > 50000: continue
         for url in urls:
             try:
                 r = requests.get(url, timeout=30)
                 if r.status_code == 200 and len(r.content) > 50000:
-                    target.write_bytes(r.content)
-                    break
-            except Exception:
-                continue
-    # Fallback cache trong /tmp
-    tmp_cache = Path("/tmp/DejaVuSans-Bold.ttf")
-    if not tmp_cache.exists():
+                    t.write_bytes(r.content); break
+            except Exception: continue
+    tmp = Path("/tmp/DejaVuSans-Bold.ttf")
+    if not tmp.exists():
         try:
             r = requests.get("https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans-Bold.ttf", timeout=30)
-            if r.status_code == 200 and len(r.content) > 100000:
-                tmp_cache.write_bytes(r.content)
-        except Exception:
-            pass
+            if r.status_code == 200 and len(r.content) > 100000: tmp.write_bytes(r.content)
+        except Exception: pass
     return True
 
 def font_for(size, bold=True):
     try: _ensure_fonts()
     except Exception: pass
-
-    # Lớp 1: Noto Sans tự tải
     noto = FONT_DIR / ("NotoSans-Bold.ttf" if bold else "NotoSans-Regular.ttf")
     if noto.exists():
         try: return ImageFont.truetype(str(noto), size)
         except Exception: pass
-
-    # Lớp 2: Font hệ thống
-    candidates = [
+    for p in [
         "/data/data/com.termux/files/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
         "/data/data/com.termux/files/usr/share/fonts/TTF/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
         "C:/Windows/Fonts/arialbd.ttf",
-        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
-    ]
-    for p in candidates:
+    ]:
         if os.path.exists(p):
             try: return ImageFont.truetype(p, size)
             except Exception: continue
-
-    # Lớp 3: Pillow default names
-    for fb in ["arial.ttf", "DejaVuSans.ttf", "NotoSans-Bold.ttf"]:
+    for fb in ["arial.ttf", "DejaVuSans.ttf"]:
         try: return ImageFont.truetype(fb, size)
         except Exception: continue
-
-    # Lớp 4: /tmp cache
-    tmp_cache = Path("/tmp/DejaVuSans-Bold.ttf")
-    if tmp_cache.exists():
-        try: return ImageFont.truetype(str(tmp_cache), size)
+    tmp = Path("/tmp/DejaVuSans-Bold.ttf")
+    if tmp.exists():
+        try: return ImageFont.truetype(str(tmp), size)
         except Exception: pass
-
-    # Lớp 5: Chịu thua
     return ImageFont.load_default()
 
 # ============================================================
 # SFX + MUSIC
 # ============================================================
-def generate_sfx_wav(sfx_type, duration=0.5, sample_rate=SFX_SAMPLE_RATE):
-    t = np.linspace(0, duration, int(sample_rate * duration), False)
+def generate_sfx_wav(sfx_type, duration=0.5, sr=SFX_SAMPLE_RATE):
+    t = np.linspace(0, duration, int(sr * duration), False)
     if sfx_type == "whoosh":
-        data = np.random.randn(len(t)) * np.exp(-t * 4) * np.sin(np.pi * t / duration) * 0.4
+        d = np.random.randn(len(t)) * np.exp(-t * 4) * np.sin(np.pi * t / duration) * 0.4
     elif sfx_type == "pop":
-        data = np.sin(2 * np.pi * 800 * t) * np.exp(-t * 20) * 0.6
+        d = np.sin(2 * np.pi * 800 * t) * np.exp(-t * 20) * 0.6
     elif sfx_type == "ding":
-        data = np.sin(2 * np.pi * 1200 * t) * np.exp(-t * 3) * 0.5
+        d = np.sin(2 * np.pi * 1200 * t) * np.exp(-t * 3) * 0.5
     elif sfx_type == "impact":
-        data = np.sin(2 * np.pi * 80 * t) * np.exp(-t * 8) * 0.8
+        d = np.sin(2 * np.pi * 80 * t) * np.exp(-t * 8) * 0.8
     elif sfx_type == "sad":
-        data = np.sin(2 * np.pi * (400 - 250 * (t / duration)) * t) * np.exp(-t * 2) * 0.5
+        d = np.sin(2 * np.pi * (400 - 250 * (t / duration)) * t) * np.exp(-t * 2) * 0.5
     elif sfx_type == "bell":
-        data = (np.sin(2 * np.pi * 1000 * t) + 0.5 * np.sin(2 * np.pi * 1500 * t)) * np.exp(-t * 4) * 0.5
+        d = (np.sin(2 * np.pi * 1000 * t) + 0.5 * np.sin(2 * np.pi * 1500 * t)) * np.exp(-t * 4) * 0.5
     elif sfx_type == "typing":
-        data = np.zeros_like(t)
+        d = np.zeros_like(t)
         for i in range(int(duration * 12)):
-            idx = int(i * sample_rate * (duration / 12))
-            if idx < len(data) - 80:
-                data[idx:idx+80] += np.random.randn(80) * 0.4
+            idx = int(i * sr * (duration / 12))
+            if idx < len(d) - 80: d[idx:idx+80] += np.random.randn(80) * 0.4
     elif sfx_type == "sparkle":
-        freqs = [1500, 2000, 2500, 3000]
-        data = sum(np.sin(2 * np.pi * f * t) for f in freqs) / len(freqs) * np.exp(-t * 2.5) * 0.4
+        fr = [1500, 2000, 2500, 3000]
+        d = sum(np.sin(2 * np.pi * f * t) for f in fr) / len(fr) * np.exp(-t * 2.5) * 0.4
     elif sfx_type == "swoosh":
-        data = np.random.randn(len(t)) * (t / duration) * np.exp(-t * 3) * 0.4
+        d = np.random.randn(len(t)) * (t / duration) * np.exp(-t * 3) * 0.4
+    # Horror SFX
+    elif sfx_type == "creak":
+        fr = 200 + 50 * np.sin(2 * np.pi * 2 * t)
+        d = np.sin(2 * np.pi * fr * t) * (0.3 + 0.7 * np.random.rand(len(t))) * np.exp(-t * 2) * 0.5
+    elif sfx_type == "whisper":
+        noise = np.random.randn(len(t))
+        env = np.sin(np.pi * t / duration) * 0.6
+        d = noise * env * 0.3
+    elif sfx_type == "scream":
+        fr = 800 + 600 * np.sin(2 * np.pi * 6 * t)
+        d = np.sin(2 * np.pi * fr * t) * np.exp(-t * 1.5) * 0.6
+    elif sfx_type == "heartbeat":
+        d = np.zeros_like(t)
+        for i in range(int(duration * 1.5)):
+            idx = int(i * sr / 1.5)
+            if idx < len(d) - 200:
+                thump = np.sin(2 * np.pi * 60 * np.arange(200) / sr) * np.exp(-np.arange(200) / 50)
+                d[idx:idx+200] += thump * 0.7
+    elif sfx_type == "thunder":
+        noise = np.random.randn(len(t))
+        env = np.exp(-t * 1.2) * (1 + 0.3 * np.sin(2 * np.pi * 3 * t))
+        d = noise * env * 0.6
+    elif sfx_type == "silence_break":
+        d = np.zeros_like(t)
+        idx = int(len(t) * 0.7)
+        d[idx:] = np.sin(2 * np.pi * 1500 * np.arange(len(t)-idx) / sr) * np.exp(-np.arange(len(t)-idx) / (sr * 0.05)) * 0.5
     else: return None
-    max_val = np.max(np.abs(data))
-    if max_val > 0: data = data / max_val * 0.5
-    return data.astype(np.float32)
+    mx = np.max(np.abs(d))
+    if mx > 0: d = d / mx * 0.5
+    return d.astype(np.float32)
 
-def write_wav(data, path, sample_rate=SFX_SAMPLE_RATE):
-    data_int = np.clip(data * 32767, -32768, 32767).astype(np.int16)
+def write_wav(data, path, sr=SFX_SAMPLE_RATE):
+    di = np.clip(data * 32767, -32768, 32767).astype(np.int16)
     with wave.open(str(path), 'w') as w:
-        w.setnchannels(1); w.setsampwidth(2); w.setframerate(sample_rate)
-        w.writeframes(data_int.tobytes())
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr)
+        w.writeframes(di.tobytes())
 
-def generate_music_track(emotion, duration, sample_rate=SFX_SAMPLE_RATE):
+def generate_music_track(emotion, duration, sr=SFX_SAMPLE_RATE):
     chords = EMOTION_CHORDS.get(emotion, EMOTION_CHORDS["neutral"])
-    total_samples = int(duration * sample_rate)
-    if total_samples <= 0: return np.zeros(0, dtype=np.float32)
-    track = np.zeros(total_samples, dtype=np.float32)
-    chord_dur = 2.5
-    samples_per_chord = int(chord_dur * sample_rate)
-    n_chords = max(1, int(np.ceil(duration / chord_dur)))
-    t_env = np.linspace(0, 1, samples_per_chord)
-    attack = np.minimum(t_env * 8, 1.0)
-    decay = np.exp(-t_env * 1.2)
-    release = np.minimum((1 - t_env) * 8, 1.0)
-    envelope = (attack * decay * release * 0.6).astype(np.float32)
-    for i in range(n_chords):
+    total = int(duration * sr)
+    if total <= 0: return np.zeros(0, dtype=np.float32)
+    track = np.zeros(total, dtype=np.float32)
+    cd = 2.5; spc = int(cd * sr)
+    nch = max(1, int(np.ceil(duration / cd)))
+    t_env = np.linspace(0, 1, spc)
+    att = np.minimum(t_env * 8, 1.0); dec = np.exp(-t_env * 1.2); rel = np.minimum((1 - t_env) * 8, 1.0)
+    env = (att * dec * rel * 0.6).astype(np.float32)
+    for i in range(nch):
         chord = chords[i % len(chords)]
-        start = i * samples_per_chord
-        end = min(start + samples_per_chord, total_samples)
-        length = end - start
-        if length <= 0: break
-        t = np.linspace(0, length / sample_rate, length, False)
-        wave = np.zeros(length, dtype=np.float32)
+        s = i * spc; e = min(s + spc, total); ln = e - s
+        if ln <= 0: break
+        t = np.linspace(0, ln / sr, ln, False)
+        w = np.zeros(ln, dtype=np.float32)
         for note in chord:
-            freq = NOTE_FREQ.get(note, 261.63)
-            vibrato = 1 + 0.003 * np.sin(2 * np.pi * 5 * t)
-            wave += np.sin(2 * np.pi * freq * vibrato * t).astype(np.float32)
-        wave /= len(chord)
-        wave *= envelope[:length]
-        track[start:end] += wave
-    delay_samples = int(0.15 * sample_rate)
-    reverb = np.zeros_like(track)
-    for i in range(delay_samples, len(track)):
-        reverb[i] = track[i] + 0.3 * reverb[i - delay_samples]
-    track = track * 0.7 + reverb * 0.3
-    max_val = np.max(np.abs(track))
-    if max_val > 0: track = track / max_val * 0.4
+            f = NOTE_FREQ.get(note, 261.63)
+            vib = 1 + 0.003 * np.sin(2 * np.pi * 5 * t)
+            w += np.sin(2 * np.pi * f * vib * t).astype(np.float32)
+        w /= len(chord); w *= env[:ln]
+        track[s:e] += w
+    ds = int(0.15 * sr); rv = np.zeros_like(track)
+    for i in range(ds, len(track)): rv[i] = track[i] + 0.3 * rv[i - ds]
+    track = track * 0.7 + rv * 0.3
+    mx = np.max(np.abs(track))
+    if mx > 0: track = track / mx * 0.4
     return track.astype(np.float32)
 
-def build_sfx_track(scenes, output_path, sample_rate=SFX_SAMPLE_RATE, volume_db=-12):
-    total_duration = max((s["end"] for s in scenes), default=0) + 1.0
-    total_samples = int(total_duration * sample_rate)
-    track = np.zeros(total_samples, dtype=np.float32)
-    cache = {}; has_any = False
+def build_sfx_track(scenes, out, sr=SFX_SAMPLE_RATE, vol_db=-12):
+    td = max((s["end"] for s in scenes), default=0) + 1.0
+    ts = int(td * sr); track = np.zeros(ts, dtype=np.float32)
+    cache = {}; any_ = False
     for s in scenes:
-        sfx_type = s.get("sfx", "none")
-        if sfx_type not in VALID_SFX or sfx_type == "none": continue
-        if sfx_type not in cache:
-            cache[sfx_type] = generate_sfx_wav(sfx_type, 0.6, sample_rate)
-        data = cache[sfx_type]
-        if data is None: continue
-        start = int(s["start"] * sample_rate)
-        end = min(start + len(data), total_samples)
-        if start >= total_samples: continue
-        track[start:end] += data[:end - start]; has_any = True
-    if not has_any: return None
-    max_val = np.max(np.abs(track))
-    if max_val > 1.0: track = track / max_val
-    track *= 10 ** (volume_db / 20.0)
-    write_wav(track, output_path, sample_rate)
-    return output_path
+        t = s.get("sfx", "none")
+        if t in ("none", None): continue
+        if t not in cache: cache[t] = generate_sfx_wav(t, 0.6, sr)
+        d = cache[t]
+        if d is None: continue
+        st_ = int(s["start"] * sr); e_ = min(st_ + len(d), ts)
+        if st_ >= ts: continue
+        track[st_:e_] += d[:e_ - st_]; any_ = True
+    if not any_: return None
+    mx = np.max(np.abs(track))
+    if mx > 1.0: track = track / mx
+    track *= 10 ** (vol_db / 20.0)
+    write_wav(track, out, sr); return out
 
-def build_music_track(scenes, output_path, sample_rate=SFX_SAMPLE_RATE, volume_db=-22):
+def build_music_track(scenes, out, sr=SFX_SAMPLE_RATE, vol_db=-22):
     if not scenes: return None
-    total_duration = max(s["end"] for s in scenes) + 0.5
-    total_samples = int(total_duration * sample_rate)
-    full_track = np.zeros(total_samples, dtype=np.float32)
-    cache = {}; has_any = False
+    td = max(s["end"] for s in scenes) + 0.5
+    ts = int(td * sr); full = np.zeros(ts, dtype=np.float32)
+    cache = {}; any_ = False
     for s in scenes:
-        emotion = s.get("music_emotion", "neutral")
-        if emotion not in VALID_EMOTIONS or emotion == "none": continue
-        start = s["start"]; dur = s["end"] - s["start"]
-        key = f"{emotion}_{int(dur)}"
-        if key not in cache:
-            cache[key] = generate_music_track(emotion, dur, sample_rate)
-        music = cache[key]
-        if len(music) == 0: continue
-        s_start = int(start * sample_rate)
-        s_end = min(s_start + len(music), total_samples)
-        if s_start >= total_samples: continue
-        length = s_end - s_start
-        fade_samples = int(0.5 * sample_rate)
-        fade_in = np.minimum(np.arange(length) / fade_samples, 1.0)
-        fade_out = np.minimum((length - np.arange(length)) / fade_samples, 1.0)
-        env = np.minimum(fade_in, fade_out).astype(np.float32)
-        full_track[s_start:s_end] += music[:length] * env
-        has_any = True
-    if not has_any or np.max(np.abs(full_track)) == 0: return None
-    full_track *= 10 ** (volume_db / 20.0)
-    write_wav(full_track, output_path, sample_rate)
-    return output_path
+        emo = s.get("music_emotion", "neutral")
+        if emo in ("none", None): continue
+        st_ = s["start"]; dur = s["end"] - s["start"]
+        key = f"{emo}_{int(dur)}"
+        if key not in cache: cache[key] = generate_music_track(emo, dur, sr)
+        mus = cache[key]
+        if len(mus) == 0: continue
+        ss = int(st_ * sr); se = min(ss + len(mus), ts)
+        if ss >= ts: continue
+        ln = se - ss; fs = int(0.5 * sr)
+        fi = np.minimum(np.arange(ln) / fs, 1.0); fo = np.minimum((ln - np.arange(ln)) / fs, 1.0)
+        env = np.minimum(fi, fo).astype(np.float32)
+        full[ss:se] += mus[:ln] * env; any_ = True
+    if not any_ or np.max(np.abs(full)) == 0: return None
+    full *= 10 ** (vol_db / 20.0)
+    write_wav(full, out, sr); return out
 
-def mix_audio_tracks(voice_path, sfx_path, music_path, output_path):
-    inputs = ["-i", str(voice_path)]
-    filters = ["[0:a]"]
-    n = 1
-    if sfx_path and Path(sfx_path).exists():
-        inputs += ["-i", str(sfx_path)]; filters.append(f"[{n}:a]"); n += 1
-    if music_path and Path(music_path).exists():
-        inputs += ["-i", str(music_path)]; filters.append(f"[{n}:a]"); n += 1
-    if n == 1:
-        shutil.copy2(voice_path, output_path); return output_path
+def mix_audio_tracks(voice, sfx, music, out):
+    inputs = ["-i", str(voice)]; filters = ["[0:a]"]; n = 1
+    if sfx and Path(sfx).exists(): inputs += ["-i", str(sfx)]; filters.append(f"[{n}:a]"); n += 1
+    if music and Path(music).exists(): inputs += ["-i", str(music)]; filters.append(f"[{n}:a]"); n += 1
+    if n == 1: shutil.copy2(voice, out); return out
     mix = "".join(filters) + f"amix=inputs={n}:duration=first:dropout_transition=2[aout]"
     run_cmd(["ffmpeg", "-y"] + inputs + ["-filter_complex", mix, "-map", "[aout]",
-             "-c:a", "aac", "-b:a", "128k", str(output_path)], timeout=600)
-    return output_path
+             "-c:a", "aac", "-b:a", "128k", str(out)], timeout=600)
+    return out
 
 # ============================================================
 # SCENE PLANNER
@@ -579,151 +601,174 @@ def make_scene_plan(client, transcript_text, batch_start, batch_duration, model,
                     min_s, max_s, max_scenes, camera_mode="auto",
                     language="vi", enable_rich=True, char_lock=None,
                     enable_sfx=True, enable_music=True,
-                    user_script="", use_script_mode="voice_only"):
-    expected_scenes = max(1, round(batch_duration / 23.0))
-    is_english = (language == "en")
-    lang_name = "English" if is_english else "Tiếng Việt"
+                    user_script="", use_script_mode="voice_only", style_mode="comic"):
+    expected = max(1, round(batch_duration / 23.0))
+    is_en = (language == "en")
+    lang_name = "English" if is_en else "Tiếng Việt"
+    is_horror = (style_mode == "horror")
 
     char_note = ""
     if char_lock:
-        char_lines = [f"  - {name}: {desc}" for name, desc in char_lock.items()]
-        char_note = "DANH SÁCH NHÂN VẬT CỐ ĐỊNH:\n" + "\n".join(char_lines) + "\n"
+        char_note = "NHÂN VẬT CỐ ĐỊNH:\n" + "\n".join(f"  - {n}: {d}" for n, d in char_lock.items()) + "\n"
 
-    rich_note = ""
-    if enable_rich:
+    # Style-specific rules
+    if is_horror:
+        style_rule = f"""
+RÀNG BUỘC PHONG CÁCH HORROR:
+- Dark atmospheric illustration, cinematic horror mood, deep shadows
+- Rich moody backgrounds: dark rooms, moonlit forests, foggy streets, abandoned places
+- Dramatic lighting: blue moonlight, red ambient, harsh shadows
+- Characters show fear, tension, dread, horror in their faces
+- Color palette: deep blacks, blood reds, cool blues, muted greens, sickly yellows
+- NO text, letters, numbers in the image (tool will overlay text later)
+- IMPORTANT: Use soft keywords. Do NOT write graphic gore. Prefer "crimson liquid", "dark red", "motionless figure", "sharp blade", "silhouette", "shadow"."""
+        title_rule = f"- {'English: 3-6 words, mysterious, unsettling, UPPERCASE' if is_en else 'Tiếng Việt: 3-6 từ, bí ẩn, đáng sợ, VIẾT HOA'}"
+        visual_rule = f"""
+MỖI CẢNH LÀ MỘT "SÂN KHẤU KINH DỊ" KHÁC NHAU:
+- Bối cảnh đa dạng: hành lang tối, nghĩa địa, rừng sương mù, căn phòng bỏ hoang, nhà vệ sinh trường học cũ, gầm cầu thang, phòng ngủ đêm khuya, trong gương, trên mái nhà...
+- Nhân vật: nhân vật chính + bóng đen/xác ẩm/mắt đỏ/hình thù kỳ dị...
+- Đồ vật ẩn dụ: đèn nhấp nháy, đồng hồ 3h sáng, cửa hé mở, gương nứt, búp bê cũ, đèn pin, điện thoại mất sóng...
+- Cảm xúc: sợ hãi, hoảng loạn, tuyệt vọng, cô đơn, bị theo dõi..."""
         rich_note = """
-QUY TẮC OVERLAY INFOGRAPHIC ("text_boxes"):
-Ngoài "title" và "callout", tạo ĐÚNG 2-3 "text_boxes" (KHÔNG nhiều hơn).
-Vị trí PHẢI ở 1 trong 4 vùng sau, cách xa nhau tối thiểu 0.3 đơn vị:
-- Vùng A (góc trên trái): x=0.10, y=0.25
-- Vùng B (góc trên phải): x=0.75, y=0.25  
-- Vùng C (góc dưới trái): x=0.15, y=0.80
-- Vùng D (góc dưới phải): x=0.75, y=0.80
-TUYỆT ĐỐI KHÔNG đặt y < 0.20 (đè title) hoặc x 0.3-0.7 & y 0.3-0.7 (đè nhân vật).
-Format: {"text":"...","x":0.15,"y":0.25,"color":"red","size":"large","style":"outlined","arrow":null}
-- color: red/green/blue/orange/purple/black/yellow/pink
-- size: small/medium/large
-- style: plain/outlined/highlighted
-- arrow: null hoặc {"to_x":0.5,"to_y":0.6} (chỉ 1-2 boxes có arrow, KHÔNG tất cả)
-"""
-
-    sfx_note = ""
-    if enable_sfx:
+QUY TẮC OVERLAY ("text_boxes"): Tạo ĐÚNG 2-3 text_boxes. Tọa độ từ 0.10-0.85.
+- Vùng A (trên trái): x=0.12, y=0.25
+- Vùng B (trên phải): x=0.72, y=0.25
+- Vùng C (dưới trái): x=0.12, y=0.80
+- Vùng D (dưới phải): x=0.72, y=0.80
+KHÔNG đặt gần title (y<0.20) hoặc đè mặt nhân vật.
+Arrow chỉ dùng khi khoảng cách < 0.30 đơn vị.""" if enable_rich else ""
         sfx_note = """
-QUY TẮC SFX ("sfx"): Chọn 1: whoosh/pop/ding/impact/sad/bell/typing/sparkle/swoosh/none. LUÂN PHIÊN.
-""" if enable_sfx else ""
-
-    music_note = ""
-    if enable_music:
+QUY TẮC SFX ("sfx"): Chọn 1: creak/whisper/scream/heartbeat/thunder/silence_break/whoosh/impact/sad/swoosh/none.
+- creak: cửa kẽo kẹt | whisper: thì thầm | scream: tiếng hét
+- heartbeat: tim đập | thunder: sấm | silence_break: cắt im lặng
+LUÂN PHIÊN, ưu tiên creak/whisper/heartbeat.""" if enable_sfx else ""
         music_note = """
-QUY TẮC NHẠC NỀN ("music_emotion"): Chọn 1: happy/sad/epic/calm/tense/inspirational/neutral/none. LUÂN PHIÊN.
-"""
+QUY TẮC NHẠC NỀN ("music_emotion"): Chọn 1: dread/panic/eerie/ominous/sad/tense/neutral/none.
+- dread: sợ hãi âm ỉ | panic: hoảng loạn | eerie: rùng rợn
+- ominous: điềm gở | sad: buồn | tense: căng
+LUÂN PHIÊN, ưu tiên dread/eerie/ominous.""" if enable_music else ""
+        camera_rule = """Chọn 1: slow_zoom_in/slow_zoom_out/creepy_pan_left/creepy_pan_right/dramatic_zoom_face/static_dread. LUÂN PHIÊN, ưu tiên slow_zoom_in/dramatic_zoom_face."""
+    else:
+        style_rule = "RÀNG BUỘC: 2D comic doodle, nét mực đen dày, nền TRẮNG TINH, KHÔNG chữ/số trong ảnh AI vẽ."
+        title_rule = f"- {'English: 3-6 words, UPPERCASE' if is_en else 'Tiếng Việt: 3-6 từ, VIẾT HOA'}"
+        visual_rule = """
+MỖI CẢNH LÀ MỘT "SÂN KHẤU" KHÁC NHAU. KHÔNG lặp bố cục.
+Bao gồm: nhân vật + tư thế, hành động, bối cảnh, đồ vật ẩn dụ, cảm xúc, màu nhấn."""
+        rich_note = """
+QUY TẮC OVERLAY ("text_boxes"): Tạo ĐÚNG 2-3 text_boxes. Tọa độ từ 0.10-0.85.
+- Vùng A: x=0.12, y=0.25 | Vùng B: x=0.72, y=0.25
+- Vùng C: x=0.12, y=0.80 | Vùng D: x=0.72, y=0.80
+KHÔNG đặt gần title (y<0.20) hoặc đè mặt nhân vật.
+Arrow chỉ dùng khi khoảng cách < 0.30 đơn vị.""" if enable_rich else ""
+        sfx_note = """
+QUY TẮC SFX ("sfx"): Chọn 1: whoosh/pop/ding/impact/sad/bell/typing/sparkle/swoosh/none. LUÂN PHIÊN.""" if enable_sfx else ""
+        music_note = """
+QUY TẮC NHẠC NỀN ("music_emotion"): Chọn 1: happy/sad/epic/calm/tense/inspirational/neutral/none. LUÂN PHIÊN.""" if enable_music else ""
+        camera_rule = """Chọn 1: zoom_in_center/zoom_out_center/pan_left_to_right/pan_right_to_left/zoom_in_top_left/zoom_in_bottom_right/ken_burns_slow/static. LUÂN PHIÊN."""
+
+    # Camera motion sample
+    if is_horror:
+        sample_motion = "slow_zoom_in"; sample_sfx = "creak"; sample_music = "dread"
+    else:
+        sample_motion = "zoom_in_center"; sample_sfx = "sparkle"; sample_music = "inspirational"
 
     system = f"""
-Bạn là giám đốc sáng tạo kịch bản cho kênh hoạt họa kiến thức phong cách "Kiến Thức Thú Vị".
+Bạn là giám đốc sáng tạo kịch bản cho kênh {("KINH DỊ" if is_horror else "hoạt họa kiến thức")} phong cách "Kiến Thức Thú Vị".
 NGÔN NGỮ OUTPUT: {lang_name}.
-Nhiệm vụ: Chia đoạn âm thanh {batch_duration:.0f}s thành khoảng {expected_scenes} cảnh lớn ({min_s}-{max_s}s/cảnh).
+Nhiệm vụ: Chia đoạn âm thanh {batch_duration:.0f}s thành khoảng {expected} cảnh lớn ({min_s}-{max_s}s/cảnh).
 
 {char_note}
 QUY TẮC TIÊU ĐỀ ("title"):
-- {"English: 3-6 words, UPPERCASE" if is_english else "Tiếng Việt tự nhiên, 3-6 từ, VIẾT HOA"}
+{title_rule}
 
 QUY TẮC CHỮ TRÊN TRANH ("callout_type", "callout_text"):
 - "speech": bong bóng thoại. "thought": đám mây. "sticker": nhãn dán. "none": không chữ.
 - LUÂN PHIÊN.
 
-QUY TẮC QUAN TRỌNG NHẤT — "visual_prompt" PHẢI SÁNG TẠO:
-MỖI CẢNH LÀ MỘT "SÂN KHẤU" KHÁC NHAU. KHÔNG lặp bố cục.
-Bao gồm: nhân vật + tư thế, hành động, bối cảnh, đồ vật ẩn dụ, cảm xúc, màu nhấn.
+QUY TẮC QUAN TRỌNG NHẤT — "visual_prompt":
+{visual_rule}
 
 QUY TẮC NHÂN VẬT: Ghi rõ "male character"/"female character". KHÔNG dùng "two friends".
 
-RÀNG BUỘC: 2D comic doodle, nét mực đen dày, nền TRẮNG TINH, KHÔNG chữ/số trong ảnh AI vẽ.
+{style_rule}
 {rich_note}
 {sfx_note}
 {music_note}
-QUY TẮC CAMERA ("camera_motion"): Chọn 1: zoom_in_center/zoom_out_center/pan_left_to_right/pan_right_to_left/zoom_in_top_left/zoom_in_bottom_right/ken_burns_slow/static. LUÂN PHIÊN.
+QUY TẮC CAMERA ("camera_motion"):
+{camera_rule}
 
 JSON FORMAT:
 {{
   "scenes": [
     {{
       "start": 0.0, "end": 22.0,
-      "title": "{'FEAR OF JUDGMENT' if is_english else 'NỖI SỢ BỊ PHÁN XÉT'}",
-      "callout_type": "thought", "callout_text": "{'WHAT ARE THEY THINKING?' if is_english else 'TỚ ĐANG NGHĨ GÌ?'}", "callout_side": "right",
-      "camera_motion": "zoom_in_center",
-      "sfx": "sparkle",
-      "music_emotion": "inspirational",
-      "visual_prompt": "2D comic doodle: ...",
+      "title": "{'THE CALL AT MIDNIGHT' if is_en and is_horror else 'CUỘC GỌI LÚC NỬA ĐÊM' if is_horror else 'FEAR OF JUDGMENT' if is_en else 'NỖI SỢ BỊ PHÁN XÉT'}",
+      "callout_type": "speech", "callout_text": "{'WHO IS THERE?' if is_en and is_horror else 'AI ĐÓ?' if is_horror else 'WHAT ARE THEY THINKING?' if is_en else 'TỚ ĐANG NGHĨ GÌ?'}", "callout_side": "right",
+      "camera_motion": "{sample_motion}",
+      "sfx": "{sample_sfx}",
+      "music_emotion": "{sample_music}",
+      "visual_prompt": "2D illustration: ...",
       "text_boxes": [{{"text":"...","x":0.15,"y":0.25,"color":"red","size":"large","style":"outlined","arrow":null}}]
     }}
   ]
 }}
 """
 
+    # Build user prompt
     if use_script_mode == "combined" and user_script.strip():
-        user = (f"Audio length: {batch_duration:.2f}s.\nMAX {expected_scenes} SCENES ({min_s}-{max_s}s each).\n\n"
+        user = (f"Audio length: {batch_duration:.2f}s.\nMAX {expected} SCENES ({min_s}-{max_s}s each).\n\n"
                 f"USER SCRIPT (accurate content):\n{user_script}\n\n"
                 f"WHISPER TRANSCRIPT (accurate timing):\n{transcript_text}\n\n"
-                f"CRITICAL: Match script to whisper timestamps. Scene start/end MUST align with whisper timing.")
+                f"CRITICAL: Match script to whisper timestamps.")
     elif use_script_mode == "text_only" and user_script.strip():
-        user = (f"Audio length: {batch_duration:.2f}s.\nMAX {expected_scenes} SCENES.\n\n"
-                f"SCRIPT:\n{user_script}\n\nDivide evenly.")
+        user = (f"Audio length: {batch_duration:.2f}s.\nMAX {expected} SCENES.\n\nSCRIPT:\n{user_script}\n\nDivide evenly.")
     else:
-        user = (f"Audio length: {batch_duration:.2f}s.\nMAX {expected_scenes} SCENES.\n\n"
-                f"TRANSCRIPT:\n{transcript_text}")
+        user = (f"Audio length: {batch_duration:.2f}s.\nMAX {expected} SCENES.\n\nTRANSCRIPT:\n{transcript_text}")
 
-    # Dynamic max_tokens
-    MODEL_TOKEN_CAP = {
-        "qwen/qwen3.8-27b": 16000,
-        "openai/gpt-oss-120b": 12000,
-        "openai/gpt-oss-20b": 8000,
-    }
-    dynamic_max = min(MODEL_TOKEN_CAP.get(model, 12000), max(4000, int(expected_scenes * 500 * 1.3)))
+    MODEL_CAP = {"qwen/qwen3.8-27b": 16000, "openai/gpt-oss-120b": 12000, "openai/gpt-oss-20b": 8000}
+    dyn_max = min(MODEL_CAP.get(model, 12000), max(4000, int(expected * 500 * 1.3)))
 
-    raw_response = ""
+    raw = ""
     try:
-        r = client.chat.completions.create(
-            model=model, temperature=0.15, max_tokens=dynamic_max,
+        r = client.chat.completions.create(model=model, temperature=0.15, max_tokens=dyn_max,
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}])
-        raw_response = r.choices[0].message.content or ""
-        obj = extract_json(raw_response)
-        raw_scenes = obj.get("scenes", [])
-        if not raw_scenes:
-            st.warning(f"⚠️ Qwen trả JSON nhưng không có scenes. Preview: {raw_response[:200]}")
+        raw = r.choices[0].message.content or ""
+        obj = extract_json(raw); raw_scenes = obj.get("scenes", [])
+        if not raw_scenes: st.warning(f"⚠️ Không có scenes. Preview: {raw[:200]}")
     except Exception as e:
         st.error(f"❌ Qwen/Parse fail: {str(e)[:200]}")
-        if raw_response: st.code(raw_response[:1000], language="text")
+        if raw: st.code(raw[:1000], language="text")
         raw_scenes = []
 
-    valid_motions = {"zoom_in_center", "zoom_out_center", "pan_left_to_right", "pan_right_to_left",
-                     "zoom_in_top_left", "zoom_in_bottom_right", "ken_burns_slow", "static"}
+    valid_motions = (set(HORROR_MOTIONS.keys()) if is_horror else
+                     {"zoom_in_center", "zoom_out_center", "pan_left_to_right", "pan_right_to_left",
+                      "zoom_in_top_left", "zoom_in_bottom_right", "ken_burns_slow", "static"})
     valid_colors = set(COLOR_MAP.keys())
     valid_sizes = {"small", "medium", "large", "huge"}
     valid_styles = {"plain", "outlined", "highlighted"}
+    valid_sfx_set = HORROR_SFX if is_horror else VALID_SFX
 
-    def clean_text_boxes(tbs):
+    def clean_tbs(tbs):
         out = []
         for tb in (tbs or [])[:4]:
             try:
                 text = str(tb.get("text", "")).strip()
                 if not text or len(text) > 40: continue
-                x = max(0.05, min(0.95, float(tb.get("x", 0.5))))
-                y = max(0.05, min(0.90, float(tb.get("y", 0.5))))
-                color = str(tb.get("color", "black")).lower()
-                if color not in valid_colors: color = "black"
-                size = str(tb.get("size", "medium")).lower()
-                if size not in valid_sizes: size = "medium"
-                style = str(tb.get("style", "outlined")).lower()
-                if style not in valid_styles: style = "outlined"
-                arrow = tb.get("arrow"); arrow_clean = None
-                if isinstance(arrow, dict):
+                x = max(0.10, min(0.85, float(tb.get("x", 0.5))))
+                y = max(0.22, min(0.88, float(tb.get("y", 0.5))))
+                c = str(tb.get("color", "black")).lower()
+                if c not in valid_colors: c = "black"
+                s = str(tb.get("size", "medium")).lower()
+                if s not in valid_sizes: s = "medium"
+                st_ = str(tb.get("style", "outlined")).lower()
+                if st_ not in valid_styles: st_ = "outlined"
+                arr = tb.get("arrow"); ac = None
+                if isinstance(arr, dict):
                     try:
-                        arrow_clean = {"to_x": max(0.0, min(1.0, float(arrow.get("to_x", x)))),
-                                       "to_y": max(0.0, min(1.0, float(arrow.get("to_y", y))))}
-                    except Exception: arrow_clean = None
-                out.append({"text": text, "x": x, "y": y, "color": color,
-                            "size": size, "style": style, "arrow": arrow_clean})
+                        ac = {"to_x": max(0.05, min(0.95, float(arr.get("to_x", x)))),
+                              "to_y": max(0.15, min(0.95, float(arr.get("to_y", y))))}
+                    except Exception: ac = None
+                out.append({"text": text, "x": x, "y": y, "color": c, "size": s, "style": st_, "arrow": ac})
             except Exception: continue
         return out
 
@@ -732,54 +777,62 @@ JSON FORMAT:
         try:
             a = max(0.0, float(s["start"])); b = min(batch_duration, float(s["end"]))
             if b <= a + 1.0: continue
-            vp = sanitize_prompt_text(str(s.get("visual_prompt", "")))
+            vp = str(s.get("visual_prompt", "")).strip()
             if not vp or len(vp) < 10: continue
+            if is_horror: vp = horror_sanitize(vp)
+            else: vp = sanitize_prompt_text(vp)
             ct = str(s.get("callout_type", "speech")).strip().lower()
             if ct not in ("speech", "thought", "sticker", "none"): ct = "speech"
-            cm = str(s.get("camera_motion", "zoom_in_center")).strip().lower()
-            if cm not in valid_motions: cm = "zoom_in_center"
+            cm = str(s.get("camera_motion", list(valid_motions)[0])).strip().lower()
+            if cm not in valid_motions: cm = list(valid_motions)[0]
             sfx = str(s.get("sfx", "none")).strip().lower()
-            if sfx not in VALID_SFX: sfx = "none"
+            if sfx not in valid_sfx_set: sfx = "none"
             emo = str(s.get("music_emotion", "neutral")).strip().lower()
             if emo not in VALID_EMOTIONS: emo = "neutral"
-            clean.append({
-                "start": a, "end": b,
+            clean.append({"start": a, "end": b,
                 "title": str(s.get("title", "BÀI HỌC")).strip().upper(),
-                "callout_type": ct,
-                "callout_text": str(s.get("callout_text", "")).strip(),
+                "callout_type": ct, "callout_text": str(s.get("callout_text", "")).strip(),
                 "callout_side": str(s.get("callout_side", "right")).strip().lower(),
                 "camera_motion": cm, "sfx": sfx, "music_emotion": emo,
-                "visual_prompt": vp,
-                "text_boxes": clean_text_boxes(s.get("text_boxes", [])),
-            })
+                "visual_prompt": vp, "text_boxes": clean_tbs(s.get("text_boxes", []))})
         except Exception: continue
 
     if not clean:
-        n_fb = max(3, int(batch_duration / 23.0))
-        scene_dur = batch_duration / n_fb
-        fb_title = "LESSON" if is_english else "BÀI HỌC"
-        fb_prompts = [
-            "2D comic doodle: a person standing at the edge of a cliff at sunset, red sunset, blue waves, white background, bold black outlines, no text",
-            "2D comic doodle: a person sitting alone on a bench in a park, thinking pose, question marks floating, blue accents, white background, no text",
-            "2D comic doodle: a person walking on a winding path with a treasure chest at the end, red accents, white background, no text",
-            "2D comic doodle: a person holding a glowing light bulb above head, idea concept, yellow sparkles, white background, no text",
-            "2D comic doodle: a person climbing a mountain, determination, red flag at peak, white background, no text",
-            "2D comic doodle: a person trapped inside a giant hourglass, sand falling, blue accents, white background, no text",
-        ]
+        n = max(3, int(batch_duration / 23.0)); sd = batch_duration / n
+        fb_t = "SCENE" if is_en else "CẢNH"
+        if is_horror:
+            fb_prompts = [
+                "2D dark horror illustration: a lone figure walking through a foggy forest at night, moonlight, deep shadows, cold blue tones, no text",
+                "2D dark horror illustration: an empty hallway with flickering lights, doorway slightly open, red ambient glow, no text",
+                "2D dark horror illustration: a person staring at their own reflection in a cracked mirror, fear in eyes, no text",
+                "2D dark horror illustration: a figure standing at the end of a long corridor, back turned, shadow stretching, no text",
+                "2D dark horror illustration: an old bedroom at 3am, curtains moving, moonlight through window, no text",
+            ]
+            emotions_pool = ["dread", "eerie", "ominous", "panic", "tense"]
+            sfx_pool = ["creak", "whisper", "heartbeat", "thunder", "silence_break"]
+            motions_pool = list(HORROR_MOTIONS.keys())
+        else:
+            fb_prompts = [
+                "2D comic doodle: a person standing at the edge of a cliff at sunset, red sunset, white background, no text",
+                "2D comic doodle: a person sitting alone on a bench, thinking pose, blue accents, white background, no text",
+                "2D comic doodle: a person holding a glowing light bulb, yellow sparkles, white background, no text",
+            ]
+            emotions_pool = ["neutral", "calm", "inspirational"]
+            sfx_pool = ["whoosh", "pop", "ding"]
+            motions_pool = ["zoom_in_center", "zoom_out_center", "ken_burns_slow"]
         clean = []
-        for i in range(n_fb):
-            clean.append({
-                "start": i * scene_dur, "end": (i + 1) * scene_dur,
-                "title": f"{fb_title} {i+1:02d}",
+        for i in range(n):
+            clean.append({"start": i * sd, "end": (i + 1) * sd,
+                "title": f"{fb_t} {i+1:02d}",
                 "callout_type": "none", "callout_text": "", "callout_side": "right",
-                "camera_motion": random.choice(list(valid_motions - {"static"})),
-                "sfx": random.choice(["whoosh", "pop", "ding", "sparkle", "swoosh"]),
-                "music_emotion": random.choice(["neutral", "calm", "inspirational"]),
+                "camera_motion": random.choice(motions_pool),
+                "sfx": random.choice(sfx_pool),
+                "music_emotion": random.choice(emotions_pool),
                 "visual_prompt": fb_prompts[i % len(fb_prompts)],
-                "text_boxes": [],
-            })
-        st.error(f"❌ Qwen fail — dùng {n_fb} fallback scenes (~{scene_dur:.0f}s/cảnh)")
+                "text_boxes": []})
+        st.error(f"❌ Qwen fail — {n} fallback scenes (~{sd:.0f}s/cảnh)")
 
+    # Merge short
     merged = []
     for s in clean:
         if not merged: merged.append(s)
@@ -795,77 +848,84 @@ JSON FORMAT:
     for i in range(len(clean) - 1): clean[i]["end"] = clean[i + 1]["start"]
     clean[-1]["end"] = batch_duration
 
-    final_scenes = []
+    final = []
     for s in clean:
         dur = s["end"] - s["start"]
         if dur > 35.0:
             mid = s["start"] + dur / 2.0
-            final_scenes.append({**s, "end": mid})
-            final_scenes.append({**s, "start": mid, "title": f"{s['title']} (TIẾP)",
-                "callout_type": "sticker", "callout_text": "!", "camera_motion": "zoom_out_center",
-                "text_boxes": [], "sfx": "swoosh"})
-        else: final_scenes.append(s)
+            final.append({**s, "end": mid})
+            final.append({**s, "start": mid, "title": f"{s['title']} (TIẾP)",
+                "callout_type": "sticker", "callout_text": "!", "text_boxes": []})
+        else: final.append(s)
 
     if camera_mode == "random":
-        for s in final_scenes: s["camera_motion"] = random.choice(list(valid_motions - {"static"}))
+        for s in final: s["camera_motion"] = random.choice(list(valid_motions))
     elif camera_mode.startswith("fixed:"):
         fixed = camera_mode.split(":", 1)[1].strip()
         if fixed in valid_motions:
-            for s in final_scenes: s["camera_motion"] = fixed
-    return final_scenes
+            for s in final: s["camera_motion"] = fixed
+    return final
 
 # ============================================================
 # IMAGE PROVIDERS
 # ============================================================
-def _build_full_prompt(prompt, chars=None, char_lock=None):
+def _build_full_prompt(prompt, chars=None, char_lock=None, style_mode="comic"):
     chars = chars or {}
-    safe = sanitize_prompt_text(prompt)
+    if style_mode == "horror":
+        safe = horror_sanitize(prompt)
+        style = """Dramatic dark illustration, cinematic horror atmosphere, deep shadows, high contrast lighting.
+Rich moody backgrounds: dark rooms, moonlit forests, foggy streets, abandoned places.
+Dramatic lighting: blue moonlight, red ambient, harsh shadows.
+Expressive characters showing fear, tension, dread, or horror.
+Color palette: deep blacks, blood reds, cool blues, muted greens, sickly yellows.
+Soft keywords only: use "crimson liquid", "dark red", "motionless figure", "sharp blade", "silhouette", "shadow" instead of graphic gore.
+Absolutely NO text, letters, numbers, captions, or empty speech balloons.
+Wide 16:9 cinematic composition.
+CHARACTER GENDER: male character = MALE, female character = FEMALE. NEVER swap."""
+    else:
+        safe = sanitize_prompt_text(prompt)
+        style = """Authentic 2D comic doodle art style, thick black ink contour outlines, hand-drawn wobbly lines.
+Pure solid flat white background OR simple scene background if described above.
+Vivid expressive cartoon character with clear emotion.
+Selective vibrant spot colors (red, blue, orange, green) ONLY on key symbolic elements.
+Absolutely NO text, letters, numbers, captions, or empty speech balloons.
+Do not draw desk, table, markers, pens UNLESS explicitly mentioned.
+Wide 16:9 cinematic composition.
+CHARACTER GENDER: male character = MALE, female character = FEMALE. NEVER swap."""
     if char_lock: safe = enforce_character_lock(safe, char_lock)
-    return f"""{safe}.
+    return f"{safe}.\n\nSTYLE CONSTRAINTS:\n{style}"
 
-STYLE CONSTRAINTS:
-- Authentic 2D comic doodle art style, thick black ink contour outlines, hand-drawn wobbly lines.
-- Pure solid flat white background OR simple scene background if described above.
-- Vivid expressive cartoon character with clear emotion.
-- Selective vibrant spot colors (red, blue, orange, green) ONLY on key symbolic elements.
-- Absolutely NO text, letters, numbers, captions, or empty speech balloons.
-- Do not draw desk, table, markers, pens UNLESS explicitly mentioned.
-- Wide 16:9 cinematic composition.
-- CHARACTER GENDER: male character = MALE, female character = FEMALE. NEVER swap."""
-
-def _validate_image_bytes(data, provider_name):
-    if not data or len(data) < 500: raise RuntimeError(f"{provider_name}: dữ liệu quá nhỏ")
+def _validate(data, name):
+    if not data or len(data) < 500: raise RuntimeError(f"{name}: dữ liệu quá nhỏ")
     if not (data[:3] == b'\xff\xd8\xff' or data[:8] == b'\x89PNG\r\n\x1a\n' or data[:4] == b'RIFF'):
-        preview = data[:150].decode("utf-8", errors="ignore").lower()
-        if "<html" in preview or "<!doctype" in preview:
-            raise RuntimeError(f"{provider_name}: HTML response")
-        raise RuntimeError(f"{provider_name}: không phải ảnh")
+        pv = data[:150].decode("utf-8", errors="ignore").lower()
+        if "<html" in pv or "<!doctype" in pv: raise RuntimeError(f"{name}: HTML")
+        raise RuntimeError(f"{name}: không phải ảnh")
     return data
 
-def agnes_image_request(prompt, api_key, timeout=45, chars=None, char_lock=None, seed=None):
+def agnes_image_request(prompt, api_key, timeout=45, chars=None, char_lock=None, seed=None, style_mode="comic"):
     api_key = (api_key or "").strip()
     if not api_key: raise RuntimeError("Agnes: chưa có key")
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {"model": AGNES_MODEL, "prompt": _build_full_prompt(prompt, chars, char_lock),
+    payload = {"model": AGNES_MODEL, "prompt": _build_full_prompt(prompt, chars, char_lock, style_mode),
                "size": "1280x720", "extra_body": {"response_format": "b64_json"}}
     r = requests.post(AGNES_API_URL, headers=headers, json=payload, timeout=timeout)
     if r.status_code == 429: raise RuntimeError("Agnes: rate limit")
     if r.status_code == 401: raise RuntimeError("Agnes: key sai")
     if r.status_code >= 400: raise RuntimeError(f"Agnes HTTP {r.status_code}")
-    data = r.json()
-    item = data.get("data", [{}])[0]
-    if item.get("b64_json"): return _validate_image_bytes(base64.b64decode(item["b64_json"]), "Agnes")
+    data = r.json(); item = data.get("data", [{}])[0]
+    if item.get("b64_json"): return _validate(base64.b64decode(item["b64_json"]), "Agnes")
     if item.get("url"):
         img = requests.get(item["url"], timeout=timeout)
-        return _validate_image_bytes(img.content, "Agnes")
+        return _validate(img.content, "Agnes")
     raise RuntimeError("Agnes: no image")
 
-def cloudflare_image_request(prompt, account_id, api_token, timeout=45, steps=4, chars=None, char_lock=None, seed=None):
+def cloudflare_image_request(prompt, account_id, api_token, timeout=45, steps=4, chars=None, char_lock=None, seed=None, style_mode="comic"):
     account_id = (account_id or "").strip(); api_token = (api_token or "").strip()
     if not account_id or not api_token: raise RuntimeError("Cloudflare: thiếu thông tin")
     url = f"{CLOUDFLARE_BASE}{account_id}/ai/run/{CLOUDFLARE_MODEL}"
     headers = {"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"}
-    payload = {"prompt": _build_full_prompt(prompt, chars, char_lock), "steps": steps}
+    payload = {"prompt": _build_full_prompt(prompt, chars, char_lock, style_mode), "steps": steps}
     if seed is not None: payload["seed"] = int(seed)
     r = requests.post(url, headers=headers, json=payload, timeout=timeout)
     if r.status_code == 429: raise RuntimeError("Cloudflare: hết quota")
@@ -874,77 +934,74 @@ def cloudflare_image_request(prompt, account_id, api_token, timeout=45, steps=4,
     if not data.get("success", True): raise RuntimeError("Cloudflare fail")
     b64 = data.get("result", {}).get("image")
     if not b64: raise RuntimeError("Cloudflare: no image")
-    return _validate_image_bytes(base64.b64decode(b64), "Cloudflare")
+    return _validate(base64.b64decode(b64), "Cloudflare")
 
-def hf_image_request(prompt, token, timeout=45, chars=None, char_lock=None, seed=None):
+def hf_image_request(prompt, token, timeout=45, chars=None, char_lock=None, seed=None, style_mode="comic"):
     token = (token or "").strip()
     if not token: raise RuntimeError("HF: chưa có token")
     url = f"{HF_API_URL}{HF_MODEL}"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    payload = {"inputs": _build_full_prompt(prompt, chars, char_lock)}
+    payload = {"inputs": _build_full_prompt(prompt, chars, char_lock, style_mode)}
     if seed is not None: payload["parameters"] = {"seed": int(seed)}
     r = requests.post(url, headers=headers, json=payload, timeout=timeout)
     if r.status_code == 503: raise RuntimeError("HF: model loading")
     if r.status_code == 429: raise RuntimeError("HF: rate limit")
     if r.status_code >= 400: raise RuntimeError(f"HF HTTP {r.status_code}")
-    return _validate_image_bytes(r.content, "HF")
+    return _validate(r.content, "HF")
 
-def freetheai_image_request(prompt, api_key, timeout=45, chars=None, char_lock=None, seed=None):
+def freetheai_image_request(prompt, api_key, timeout=45, chars=None, char_lock=None, seed=None, style_mode="comic"):
     api_key = (api_key or "").strip()
     if not api_key: raise RuntimeError("FreeTheAi: chưa có key")
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {"model": "flux", "prompt": _build_full_prompt(prompt, chars, char_lock), "n": 1, "size": "1280x720"}
+    payload = {"model": "flux", "prompt": _build_full_prompt(prompt, chars, char_lock, style_mode), "n": 1, "size": "1280x720"}
     if seed is not None: payload["seed"] = int(seed)
     r = requests.post(FREETHEAI_BASE, headers=headers, json=payload, timeout=timeout)
     if r.status_code == 429: raise RuntimeError("FreeTheAi: rate limit")
     if r.status_code >= 400: raise RuntimeError(f"FreeTheAi HTTP {r.status_code}")
-    data = r.json()
-    item = data.get("data", [{}])[0]
-    if item.get("b64_json"): return _validate_image_bytes(base64.b64decode(item["b64_json"]), "FreeTheAi")
+    data = r.json(); item = data.get("data", [{}])[0]
+    if item.get("b64_json"): return _validate(base64.b64decode(item["b64_json"]), "FreeTheAi")
     if item.get("url"):
         img = requests.get(item["url"], timeout=timeout)
-        return _validate_image_bytes(img.content, "FreeTheAi")
+        return _validate(img.content, "FreeTheAi")
     raise RuntimeError("FreeTheAi: no image")
 
-def together_image_request(prompt, api_key, timeout=45, chars=None, char_lock=None, seed=None):
+def together_image_request(prompt, api_key, timeout=45, chars=None, char_lock=None, seed=None, style_mode="comic"):
     api_key = (api_key or "").strip()
     if not api_key: raise RuntimeError("Together: chưa có key")
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {"model": TOGETHER_MODEL, "prompt": _build_full_prompt(prompt, chars, char_lock),
+    payload = {"model": TOGETHER_MODEL, "prompt": _build_full_prompt(prompt, chars, char_lock, style_mode),
                "width": WIDTH, "height": HEIGHT, "steps": 4, "n": 1, "response_format": "b64_json"}
     r = requests.post(TOGETHER_BASE, headers=headers, json=payload, timeout=timeout)
     if r.status_code == 429: raise RuntimeError("Together: rate limit")
     if r.status_code >= 400: raise RuntimeError(f"Together HTTP {r.status_code}")
-    data = r.json()
-    item = data.get("data", [{}])[0]
-    if item.get("b64_json"): return _validate_image_bytes(base64.b64decode(item["b64_json"]), "Together")
+    data = r.json(); item = data.get("data", [{}])[0]
+    if item.get("b64_json"): return _validate(base64.b64decode(item["b64_json"]), "Together")
     if item.get("url"):
         img = requests.get(item["url"], timeout=timeout)
-        return _validate_image_bytes(img.content, "Together")
+        return _validate(img.content, "Together")
     raise RuntimeError("Together: no image")
 
-def nexa_image_request(prompt, api_key, timeout=45, chars=None, char_lock=None, seed=None):
+def nexa_image_request(prompt, api_key, timeout=45, chars=None, char_lock=None, seed=None, style_mode="comic"):
     api_key = (api_key or "").strip()
     if not api_key: raise RuntimeError("NexaAPI: chưa có key")
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {"model": NEXA_MODEL, "prompt": _build_full_prompt(prompt, chars, char_lock),
+    payload = {"model": NEXA_MODEL, "prompt": _build_full_prompt(prompt, chars, char_lock, style_mode),
                "width": WIDTH, "height": HEIGHT, "n": 1}
     if seed is not None: payload["seed"] = int(seed)
     r = requests.post(NEXA_BASE, headers=headers, json=payload, timeout=timeout)
     if r.status_code == 429: raise RuntimeError("NexaAPI: rate limit")
     if r.status_code >= 400: raise RuntimeError(f"NexaAPI HTTP {r.status_code}")
-    data = r.json()
-    item = data.get("data", [{}])[0]
-    if item.get("b64_json"): return _validate_image_bytes(base64.b64decode(item["b64_json"]), "NexaAPI")
+    data = r.json(); item = data.get("data", [{}])[0]
+    if item.get("b64_json"): return _validate(base64.b64decode(item["b64_json"]), "NexaAPI")
     if item.get("url"):
         img = requests.get(item["url"], timeout=timeout)
-        return _validate_image_bytes(img.content, "NexaAPI")
+        return _validate(img.content, "NexaAPI")
     raise RuntimeError("NexaAPI: no image")
 
-def pollinations_image_request(prompt, api_key, model="flux-pro", timeout=45, seed=None, chars=None, char_lock=None):
+def pollinations_image_request(prompt, api_key, model="flux-pro", timeout=45, seed=None, chars=None, char_lock=None, style_mode="comic"):
     api_key = (api_key or "").strip()
     if not api_key: raise RuntimeError("Pollinations: chưa có key")
-    encoded = requests.utils.quote(_build_full_prompt(prompt, chars, char_lock), safe="")
+    encoded = requests.utils.quote(_build_full_prompt(prompt, chars, char_lock, style_mode), safe="")
     url = f"{POLLINATIONS_BASE}{encoded}"
     params = {"width": WIDTH, "height": HEIGHT, "model": model,
               "nologo": "true", "enhance": "true", "safe": "false"}
@@ -955,42 +1012,34 @@ def pollinations_image_request(prompt, api_key, model="flux-pro", timeout=45, se
     if r.status_code == 402: raise RuntimeError("Pollinations 402")
     if r.status_code == 429: raise RuntimeError("Pollinations 429")
     if r.status_code >= 400: raise RuntimeError(f"Pollinations HTTP {r.status_code}")
-    return _validate_image_bytes(r.content, "Pollinations")
+    return _validate(r.content, "Pollinations")
 
-def build_provider_list(cf_account, cf_token, hf_token, freetheai_key,
-                         together_key, nexa_key, agnes_key,
-                         pollinations_key="", pollinations_model="flux-pro",
-                         flux_steps=4, chars=None, char_lock=None, seed=None):
+def build_provider_list(cf_account, cf_token, hf_token, freetheai_key, together_key, nexa_key, agnes_key,
+                         pollinations_key="", pollinations_model="flux-pro", flux_steps=4,
+                         chars=None, char_lock=None, seed=None, style_mode="comic"):
     chars = chars or {}; char_lock = char_lock or {}
-    kw = {"chars": chars, "char_lock": char_lock, "seed": seed}
+    kw = {"chars": chars, "char_lock": char_lock, "seed": seed, "style_mode": style_mode}
     providers = []
     if cf_account and cf_token and cf_account.strip() and cf_token.strip():
         providers.append({"name": "Cloudflare", "fn": cloudflare_image_request,
             "args": [cf_account.strip(), cf_token.strip()], "kwargs": {"steps": flux_steps, **kw}})
     if agnes_key and agnes_key.strip():
-        providers.append({"name": "Agnes AI", "fn": agnes_image_request,
-            "args": [agnes_key.strip()], "kwargs": kw})
+        providers.append({"name": "Agnes AI", "fn": agnes_image_request, "args": [agnes_key.strip()], "kwargs": kw})
     if together_key and together_key.strip():
-        providers.append({"name": "Together AI", "fn": together_image_request,
-            "args": [together_key.strip()], "kwargs": kw})
+        providers.append({"name": "Together AI", "fn": together_image_request, "args": [together_key.strip()], "kwargs": kw})
     if freetheai_key and freetheai_key.strip():
-        providers.append({"name": "FreeTheAi", "fn": freetheai_image_request,
-            "args": [freetheai_key.strip()], "kwargs": kw})
+        providers.append({"name": "FreeTheAi", "fn": freetheai_image_request, "args": [freetheai_key.strip()], "kwargs": kw})
     if hf_token and hf_token.strip():
-        providers.append({"name": "Hugging Face", "fn": hf_image_request,
-            "args": [hf_token.strip()], "kwargs": kw})
+        providers.append({"name": "Hugging Face", "fn": hf_image_request, "args": [hf_token.strip()], "kwargs": kw})
     if nexa_key and nexa_key.strip():
-        providers.append({"name": "NexaAPI", "fn": nexa_image_request,
-            "args": [nexa_key.strip()], "kwargs": kw})
+        providers.append({"name": "NexaAPI", "fn": nexa_image_request, "args": [nexa_key.strip()], "kwargs": kw})
     if pollinations_key and pollinations_key.strip():
-        providers.append({"name": f"Pollinations ({pollinations_model})",
-            "fn": pollinations_image_request,
-            "args": [pollinations_key.strip(), pollinations_model],
-            "kwargs": kw})
+        providers.append({"name": f"Pollinations ({pollinations_model})", "fn": pollinations_image_request,
+            "args": [pollinations_key.strip(), pollinations_model], "kwargs": kw})
     return providers
 
-def save_image_from_bytes(data, output_path):
-    if not data: raise RuntimeError("Dữ liệu ảnh rỗng")
+def save_image(data, output_path):
+    if not data: raise RuntimeError("Dữ liệu rỗng")
     Path(output_path).write_bytes(data)
     try:
         with Image.open(output_path) as im: im.verify()
@@ -999,126 +1048,99 @@ def save_image_from_bytes(data, output_path):
             im.save(output_path, "JPEG", quality=95)
     except Exception as e:
         Path(output_path).unlink(missing_ok=True)
-        raise RuntimeError(f"Ảnh không hợp lệ: {e}")
+        raise RuntimeError(f"Ảnh invalid: {e}")
 
 # ============================================================
-# OVERLAY — V8.1 NÂNG CẤP
+# OVERLAY — V9 với fix V8.1
 # ============================================================
-def draw_arrow(draw, start_xy, end_xy, color_hex, width=5):
-    """Vẽ mũi tên với đầu to rõ nét."""
-    draw.line([start_xy, end_xy], fill=color_hex, width=width)
-    angle = math.atan2(end_xy[1] - start_xy[1], end_xy[0] - start_xy[0])
-    arrow_len = 20; arrow_angle = math.pi / 5
-    p1 = (end_xy[0] - arrow_len * math.cos(angle - arrow_angle),
-          end_xy[1] - arrow_len * math.sin(angle - arrow_angle))
-    p2 = (end_xy[0] - arrow_len * math.cos(angle + arrow_angle),
-          end_xy[1] - arrow_len * math.sin(angle + arrow_angle))
-    draw.polygon([end_xy, p1, p2], fill=color_hex)
+def draw_arrow(draw, s, e, color, w=5):
+    draw.line([s, e], fill=color, width=w)
+    ang = math.atan2(e[1] - s[1], e[0] - s[0])
+    al = 20; aa = math.pi / 5
+    p1 = (e[0] - al * math.cos(ang - aa), e[1] - al * math.sin(ang - aa))
+    p2 = (e[0] - al * math.cos(ang + aa), e[1] - al * math.sin(ang + aa))
+    draw.polygon([e, p1, p2], fill=color)
 
-def draw_text_with_shadow(draw, xy, text, font, fill, stroke_width=0, stroke_fill=None, shadow=True):
-    """Vẽ text có shadow nhẹ để dễ đọc."""
+def draw_text_shadow(draw, xy, text, font, fill, sw=0, sf=None, shadow=True):
     x, y = xy
-    if shadow:
-        # Shadow đen mờ phía sau
-        draw.text((x + 2, y + 2), text, font=font, fill=(0, 0, 0, 80))
-    if stroke_width > 0 and stroke_fill:
-        draw.text((x, y), text, font=font, fill=fill, stroke_width=stroke_width, stroke_fill=stroke_fill)
-    else:
-        draw.text((x, y), text, font=font, fill=fill)
+    if shadow: draw.text((x + 2, y + 2), text, font=font, fill=(0, 0, 0, 80))
+    if sw > 0 and sf: draw.text((x, y), text, font=font, fill=fill, stroke_width=sw, stroke_fill=sf)
+    else: draw.text((x, y), text, font=font, fill=fill)
 
 def draw_rich_text_box(img, draw, tb, enable_shadow=True):
-    """Vẽ text box chuyên nghiệp với background + shadow."""
     try:
         x = int(tb["x"] * WIDTH); y = int(tb["y"] * HEIGHT)
         text = tb["text"]; color = COLOR_MAP.get(tb["color"], "#212121")
-        f_size = SIZE_MAP.get(tb["size"], 30); style = tb["style"]
+        f_size = SIZE_MAP.get(tb["size"], 30); stl = tb["style"]
         f = font_for(f_size, bold=True)
         bbox = draw.textbbox((0, 0), text, font=f)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        # V8.1 FIX: Clamp để không tràn mép
+        if x + tw + 20 > WIDTH: x = max(10, WIDTH - tw - 20)
+        if y + th + 20 > HEIGHT: y = max(TITLE_BAND_H + 10, HEIGHT - th - 20)
+        if x < 10: x = 10
+        if y < TITLE_BAND_H + 10: y = TITLE_BAND_H + 10
 
-        if style == "highlighted":
-            # Box nền màu đậm, chữ trắng
-            pad_x, pad_y = 16, 10
-            rect = [x - pad_x, y - pad_y, x + tw + pad_x, y + th + pad_y + 6]
+        if stl == "highlighted":
+            px, py = 16, 10
+            rect = [x - px, y - py, x + tw + px, y + th + py + 6]
             if enable_shadow:
-                draw.rounded_rectangle([rect[0]+3, rect[1]+3, rect[2]+3, rect[3]+3],
-                                       radius=10, fill=(0,0,0,60))
+                draw.rounded_rectangle([rect[0]+3, rect[1]+3, rect[2]+3, rect[3]+3], radius=10, fill=(0,0,0,60))
             draw.rounded_rectangle(rect, radius=10, fill=color, outline="white", width=3)
             draw.text((x, y), text, fill="white", font=f)
-
-        elif style == "outlined":
-            # Chữ có viền trắng dày
-            draw_text_with_shadow(draw, (x, y), text, f, fill=color,
-                                   stroke_width=3, stroke_fill="white", shadow=enable_shadow)
-
-        else:  # plain
-            # Chữ có background trắng mờ
-            pad_x, pad_y = 10, 6
-            rect = [x - pad_x, y - pad_y, x + tw + pad_x, y + th + pad_y + 4]
+        elif stl == "outlined":
+            draw_text_shadow(draw, (x, y), text, f, fill=color, sw=3, sf="white", shadow=enable_shadow)
+        else:
+            px, py = 10, 6
+            rect = [x - px, y - py, x + tw + px, y + th + py + 4]
             bg = Image.new("RGBA", (rect[2]-rect[0], rect[3]-rect[1]), (255,255,255,200))
             img.paste(bg, (rect[0], rect[1]), bg)
             draw.text((x, y), text, fill=color, font=f)
-    except Exception:
-        pass
+    except Exception: pass
 
-def smart_filter_text_boxes(text_boxes, callout_text, callout_type, callout_side):
-    """Lọc text_boxes để không đè title, không đè nhân vật, không đè callout, không đè nhau."""
-    filtered = []
-    min_dist = 0.20  # khoảng cách tối thiểu giữa các box
-    for tb in text_boxes:
+def smart_filter_tbs(tbs, callout_text, callout_type, callout_side):
+    filtered = []; min_dist = 0.20
+    for tb in tbs:
         x, y = tb["x"], tb["y"]
-        # Loại bỏ nếu đè title band (y < 0.20)
-        if y < 0.20:
-            continue
-        # Loại bỏ nếu đè mặt nhân vật (vùng giữa)
-        if 0.30 < x < 0.70 and 0.35 < y < 0.70:
-            continue
-        # Loại bỏ nếu đè callout speech bubble
+        if y < 0.20: continue
+        if 0.30 < x < 0.70 and 0.35 < y < 0.70: continue
         if callout_text and callout_type != "none":
             if callout_side == "left":
-                if x < 0.45 and 0.35 < y < 0.55:
-                    continue
+                if x < 0.45 and 0.35 < y < 0.55: continue
             else:
-                if x > 0.55 and 0.35 < y < 0.55:
-                    continue
-        # Loại bỏ nếu quá gần box khác
-        too_close = False
+                if x > 0.55 and 0.35 < y < 0.55: continue
+        close = False
         for ex in filtered:
-            if abs(ex["x"] - x) < min_dist and abs(ex["y"] - y) < min_dist:
-                too_close = True; break
-        if not too_close:
-            filtered.append(tb)
-        if len(filtered) >= 3:  # tối đa 3 box
-            break
+            if abs(ex["x"] - x) < min_dist and abs(ex["y"] - y) < min_dist: close = True; break
+        if not close: filtered.append(tb)
+        if len(filtered) >= 3: break
     return filtered
 
-def add_comic_overlays(image_path, title, callout_type, callout_text, callout_side,
-                        output_path, text_boxes=None, enable_arrows=True,
-                        enable_shadow=True):
+def add_comic_overlays(image_path, title, callout_type, callout_text, callout_side, output_path,
+                        text_boxes=None, enable_arrows=True, enable_shadow=True, style_mode="comic"):
     img = Image.open(image_path).convert("RGB").resize((WIDTH, HEIGHT))
     draw = ImageDraw.Draw(img)
+    is_horror = (style_mode == "horror")
+    title_color = "#1a0000" if is_horror else "#111111"
+    underline_color = "#8b0000" if is_horror else "#d32f2f"
+    bubble_text_color = "#6a0000" if is_horror else "#1b5e20"
+    thought_text_color = "#1a0033" if is_horror else "#0d47a1"
 
-    # --- 1. TITLE ---
+    # 1. Title
     if title:
-        draw.rectangle([0, 0, WIDTH, TITLE_BAND_H], fill="white")
-        f_size = 38
-        f_title = font_for(f_size, bold=True)
+        draw.rectangle([0, 0, WIDTH, TITLE_BAND_H], fill="white" if not is_horror else "#0a0a0a")
+        f_size = 38; f_title = font_for(f_size, bold=True)
         while f_size > 20:
             box = draw.textbbox((0, 0), title, font=f_title)
-            if box[2] - box[0] <= 900:
-                break
-            f_size -= 2
-            f_title = font_for(f_size, bold=True)
+            if box[2] - box[0] <= 900: break
+            f_size -= 2; f_title = font_for(f_size, bold=True)
         box = draw.textbbox((0, 0), title, font=f_title)
         tw = box[2] - box[0]
-        # Vẽ title với gạch chân đỏ accent
-        draw.text(((WIDTH - tw) / 2, 22), title, fill="#111111", font=f_title)
-        # Gạch chân
-        underline_y = 22 + (box[3] - box[1]) + 8
-        draw.line([(WIDTH/2 - tw/2, underline_y), (WIDTH/2 + tw/2, underline_y)],
-                  fill="#d32f2f", width=4)
+        draw.text(((WIDTH - tw) / 2, 22), title, fill=title_color, font=f_title)
+        uy = 22 + (box[3] - box[1]) + 8
+        draw.line([(WIDTH/2 - tw/2, uy), (WIDTH/2 + tw/2, uy)], fill=underline_color, width=4)
 
-    # --- 2. CALLOUT ---
+    # 2. Callout
     if callout_text and callout_type != "none":
         f_text = font_for(26, bold=True)
         bb = draw.textbbox((0, 0), callout_text, font=f_text)
@@ -1126,130 +1148,108 @@ def add_comic_overlays(image_path, title, callout_type, callout_text, callout_si
         cx, cy = (int(WIDTH * 0.28), int(HEIGHT * 0.45)) if callout_side == "left" else (int(WIDTH * 0.74), int(HEIGHT * 0.42))
 
         if callout_type == "speech":
-            pad_x, pad_y = 20, 14
-            rect = [cx - bw // 2 - pad_x, cy - bh // 2 - pad_y, cx + bw // 2 + pad_x, cy + bh // 2 + pad_y]
-            # Shadow cho bubble
-            if enable_shadow:
-                draw.rounded_rectangle([rect[0]+4, rect[1]+4, rect[2]+4, rect[3]+4],
-                                       radius=16, fill=(0,0,0,50))
+            px, py = 20, 14
+            rect = [cx - bw // 2 - px, cy - bh // 2 - py, cx + bw // 2 + px, cy + bh // 2 + py]
+            if enable_shadow: draw.rounded_rectangle([rect[0]+4, rect[1]+4, rect[2]+4, rect[3]+4], radius=16, fill=(0,0,0,50))
             draw.rounded_rectangle(rect, radius=16, fill="white", outline="black", width=4)
-            tail_tip = (cx - 20, cy + bh // 2 + pad_y + 22)
-            draw.polygon([(cx - 34, cy + bh // 2 + pad_y - 2), (cx - 8, cy + bh // 2 + pad_y - 2), tail_tip],
-                         fill="white", outline="black")
-            draw.line([(cx - 32, cy + bh // 2 + pad_y), (cx - 10, cy + bh // 2 + pad_y)], fill="white", width=5)
-            draw.text((cx - bw // 2, cy - bh // 2 - 2), callout_text, fill="#1b5e20", font=f_text)
+            tail = (cx - 20, cy + bh // 2 + py + 22)
+            draw.polygon([(cx - 34, cy + bh // 2 + py - 2), (cx - 8, cy + bh // 2 + py - 2), tail], fill="white", outline="black")
+            draw.line([(cx - 32, cy + bh // 2 + py), (cx - 10, cy + bh // 2 + py)], fill="white", width=5)
+            draw.text((cx - bw // 2, cy - bh // 2 - 2), callout_text, fill=bubble_text_color, font=f_text)
         elif callout_type == "thought":
-            pad_x, pad_y = 24, 16
-            rect = [cx - bw // 2 - pad_x, cy - bh // 2 - pad_y, cx + bw // 2 + pad_x, cy + bh // 2 + pad_y]
-            if enable_shadow:
-                draw.rounded_rectangle([rect[0]+4, rect[1]+4, rect[2]+4, rect[3]+4],
-                                       radius=26, fill=(0,0,0,50))
+            px, py = 24, 16
+            rect = [cx - bw // 2 - px, cy - bh // 2 - py, cx + bw // 2 + px, cy + bh // 2 + py]
+            if enable_shadow: draw.rounded_rectangle([rect[0]+4, rect[1]+4, rect[2]+4, rect[3]+4], radius=26, fill=(0,0,0,50))
             draw.rounded_rectangle(rect, radius=26, fill="white", outline="black", width=3)
-            draw.ellipse([cx - 22, cy + bh // 2 + pad_y + 6, cx - 12, cy + bh // 2 + pad_y + 16], fill="white", outline="black", width=3)
-            draw.ellipse([cx - 30, cy + bh // 2 + pad_y + 19, cx - 24, cy + bh // 2 + pad_y + 25], fill="white", outline="black", width=2)
-            draw.ellipse([cx - 36, cy + bh // 2 + pad_y + 28, cx - 32, cy + bh // 2 + pad_y + 32], fill="white", outline="black", width=2)
-            draw.text((cx - bw // 2, cy - bh // 2 - 2), callout_text, fill="#0d47a1", font=f_text)
-        else:  # sticker
-            pad_x, pad_y = 18, 11
+            draw.ellipse([cx - 22, cy + bh // 2 + py + 6, cx - 12, cy + bh // 2 + py + 16], fill="white", outline="black", width=3)
+            draw.ellipse([cx - 30, cy + bh // 2 + py + 19, cx - 24, cy + bh // 2 + py + 25], fill="white", outline="black", width=2)
+            draw.text((cx - bw // 2, cy - bh // 2 - 2), callout_text, fill=thought_text_color, font=f_text)
+        else:
+            px, py = 18, 11
             bx, by = int(WIDTH * 0.75), int(HEIGHT * 0.88)
-            b_rect = [bx - bw // 2 - pad_x, by - bh // 2 - pad_y, bx + bw // 2 + pad_x, by + bh // 2 + pad_y]
-            if enable_shadow:
-                draw.rounded_rectangle([b_rect[0]+3, b_rect[1]+3, b_rect[2]+3, b_rect[3]+3],
-                                       radius=10, fill=(0,0,0,60))
-            draw.rounded_rectangle(b_rect, radius=10, fill="white", outline="#b71c1c", width=4)
-            draw.text((bx - bw // 2, by - bh // 2 - 2), callout_text, fill="#b71c1c", font=f_text)
+            r = [bx - bw // 2 - px, by - bh // 2 - py, bx + bw // 2 + px, by + bh // 2 + py]
+            if enable_shadow: draw.rounded_rectangle([r[0]+3, r[1]+3, r[2]+3, r[3]+3], radius=10, fill=(0,0,0,60))
+            outline = "#5a0000" if is_horror else "#b71c1c"
+            text_col = "#5a0000" if is_horror else "#b71c1c"
+            draw.rounded_rectangle(r, radius=10, fill="white", outline=outline, width=4)
+            draw.text((bx - bw // 2, by - bh // 2 - 2), callout_text, fill=text_col, font=f_text)
 
-    # --- 3. RICH TEXT BOXES (V8.1: smart filter + arrow bounds) ---
+    # 3. Rich text boxes
     if text_boxes:
-        filtered = smart_filter_text_boxes(text_boxes, callout_text, callout_type, callout_side)
-
-        # Vẽ arrows trước (dưới text boxes)
+        filtered = smart_filter_tbs(text_boxes, callout_text, callout_type, callout_side)
         if enable_arrows:
             for tb in filtered:
-                arrow = tb.get("arrow")
-                if not arrow:
-                    continue
+                arr = tb.get("arrow")
+                if not arr: continue
                 try:
                     f = font_for(SIZE_MAP.get(tb["size"], 30), bold=True)
                     bbox = draw.textbbox((0, 0), tb["text"], font=f)
-                    tw = bbox[2] - bbox[0]
-                    th = bbox[3] - bbox[1]
+                    tw = bbox[2] - bbox[0]; th = bbox[3] - bbox[1]
                     sx = int(tb["x"] * WIDTH) + tw // 2
                     sy = int(tb["y"] * HEIGHT) + th // 2
-                    ex = int(arrow["to_x"] * WIDTH)
-                    ey = int(arrow["to_y"] * HEIGHT)
-                    # Bỏ nếu điểm đến quá gần
-                    if abs(ex - sx) < 50 and abs(ey - sy) < 50:
-                        continue
-                    # Bỏ nếu điểm đến ngoài vùng an toàn
-                    if ex < 60 or ex > WIDTH - 60 or ey < 150 or ey > HEIGHT - 60:
-                        continue
-                    color_hex = COLOR_MAP.get(tb["color"], "#212121")
-                    draw_arrow(draw, (sx, sy), (ex, ey), color_hex, width=5)
-                except Exception:
-                    pass
-
-        # Vẽ text boxes
-        for tb in filtered:
-            draw_rich_text_box(img, draw, tb, enable_shadow)
+                    ex = int(arr["to_x"] * WIDTH); ey = int(arr["to_y"] * HEIGHT)
+                    if abs(ex - sx) < 50 and abs(ey - sy) < 50: continue
+                    if ex < 60 or ex > WIDTH - 60 or ey < 150 or ey > HEIGHT - 60: continue
+                    # V8.1 FIX: Giới hạn độ dài mũi tên
+                    if math.hypot(ex - sx, ey - sy) > int(WIDTH * 0.35): continue
+                    color = COLOR_MAP.get(tb["color"], "#212121")
+                    draw_arrow(draw, (sx, sy), (ex, ey), color, w=5)
+                except Exception: pass
+        for tb in filtered: draw_rich_text_box(img, draw, tb, enable_shadow)
 
     img.save(output_path, quality=95)
 
 # ============================================================
 # HAND ASSET + TRAJECTORY
 # ============================================================
-def generate_fallback_hand():
+def fallback_hand():
     S = 320
-    im = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-    d = ImageDraw.Draw(im)
-    d.line([(40, 40), (140, 140)], fill=(30, 30, 30, 255), width=10)
-    d.polygon([(30, 30), (50, 40), (40, 50)], fill=(220, 50, 50, 255))
-    d.ellipse((110, 110, 260, 260), fill=(235, 205, 175, 255), outline=(30, 30, 30, 255), width=4)
-    d.rounded_rectangle((100, 130, 180, 220), 20, fill=(235, 205, 175, 255), outline=(30, 30, 30, 255), width=4)
+    im = Image.new("RGBA", (S, S), (0, 0, 0, 0)); d = ImageDraw.Draw(im)
+    d.line([(40, 40), (140, 140)], fill=(30,30,30,255), width=10)
+    d.polygon([(30,30),(50,40),(40,50)], fill=(220,50,50,255))
+    d.ellipse((110,110,260,260), fill=(235,205,175,255), outline=(30,30,30,255), width=4)
+    d.rounded_rectangle((100,130,180,220), 20, fill=(235,205,175,255), outline=(30,30,30,255), width=4)
     return im
 
-def load_hand_asset(hand_path, target_width=320):
+def load_hand(hand_path, tw=320):
     p = None
     for c in [hand_path, Path("hand.png"), Path("assets/hand.png")]:
         if c and Path(c).exists(): p = Path(c); break
-    pil_hand = Image.open(p).convert("RGBA") if p else generate_fallback_hand()
-    w, h = pil_hand.size
-    pil_hand = pil_hand.resize((target_width, int(h * target_width / w)), Image.Resampling.LANCZOS)
-    hand_np = np.array(pil_hand)
-    bgr = cv2.cvtColor(hand_np[:, :, :3], cv2.COLOR_RGB2BGR)
-    alpha = hand_np[:, :, 3]
+    ph = Image.open(p).convert("RGBA") if p else fallback_hand()
+    w, h = ph.size; ph = ph.resize((tw, int(h * tw / w)), Image.Resampling.LANCZOS)
+    hn = np.array(ph)
+    bgr = cv2.cvtColor(hn[:, :, :3], cv2.COLOR_RGB2BGR); alpha = hn[:, :, 3]
     alpha[:6, :] = 0; alpha[-6:, :] = 0; alpha[:, :6] = 0; alpha[:, -6:] = 0
     alpha[alpha < 110] = 0
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats((alpha > 50).astype(np.uint8))
-    if num_labels > 1: alpha[labels != (1 + np.argmax(stats[1:, cv2.CC_STAT_AREA]))] = 0
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    alpha = cv2.erode(alpha, kernel, iterations=1)
+    nl, lb, st, _ = cv2.connectedComponentsWithStats((alpha > 50).astype(np.uint8))
+    if nl > 1: alpha[lb != (1 + np.argmax(st[1:, cv2.CC_STAT_AREA]))] = 0
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    alpha = cv2.erode(alpha, k, iterations=1)
     alpha = np.minimum(alpha, cv2.GaussianBlur(alpha, (3, 3), 0))
     ys, xs = np.where(alpha > 120)
-    tip_x, tip_y = (int(xs[np.argmin(xs + ys * 1.15)]), int(ys[np.argmin(xs + ys * 1.15)])) if len(xs) > 0 else (0, 0)
-    return bgr, alpha, tip_x, tip_y
+    tx, ty = (int(xs[np.argmin(xs + ys * 1.15)]), int(ys[np.argmin(xs + ys * 1.15)])) if len(xs) > 0 else (0, 0)
+    return bgr, alpha, tx, ty
 
-def sort_contours_nn(contours, start_pt=(100, 150)):
-    def c_center(c):
+def sort_nn(contours, start=(100, 150)):
+    def cc(c):
         M = cv2.moments(c)
-        if M["m00"] > 0: return (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
-        x, y, w, h = cv2.boundingRect(c); return (x + w // 2, y + h // 2)
+        if M["m00"] > 0: return (int(M["m10"]/M["m00"]), int(M["m01"]/M["m00"]))
+        x, y, w, h = cv2.boundingRect(c); return (x + w//2, y + h//2)
     valid = [c for c in contours if cv2.arcLength(c, False) > 10]
-    sorted_res = []
+    out = []
     if valid:
-        curr = start_pt; rem = valid[:]
+        cur = start; rem = valid[:]
         while rem:
-            best_idx = 0; best_dist = float("inf")
-            for idx, c in enumerate(rem):
-                pt = c_center(c)
-                d = (pt[0] - curr[0]) ** 2 + (pt[1] - curr[1]) ** 2
-                if d < best_dist: best_dist = d; best_idx = idx
-            chosen = rem.pop(best_idx); sorted_res.append(chosen); curr = c_center(chosen)
-    return sorted_res
+            bi = 0; bd = float("inf")
+            for i, c in enumerate(rem):
+                pt = cc(c); d = (pt[0]-cur[0])**2 + (pt[1]-cur[1])**2
+                if d < bd: bd = d; bi = i
+            ch = rem.pop(bi); out.append(ch); cur = cc(ch)
+    return out
 
-def extract_continuous_trajectory(image_path):
+def extract_cont_traj(image_path):
     img = cv2.imread(str(image_path))
-    if img is None: return [(WIDTH // 2, HEIGHT // 2)]
+    if img is None: return [(WIDTH//2, HEIGHT//2)]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     _, binary = cv2.threshold(gray, 225, 255, cv2.THRESH_BINARY_INV)
     tm = np.zeros_like(binary); tm[:TITLE_BAND_H, :] = binary[:TITLE_BAND_H, :]
@@ -1257,747 +1257,634 @@ def extract_continuous_trajectory(image_path):
     tc, _ = cv2.findContours(tm, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     bc, _ = cv2.findContours(bm, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
     ts = sorted(tc, key=lambda c: cv2.boundingRect(c)[0])
-    bs = sort_contours_nn(bc, start_pt=(150, 200))
-    trajectory = []
+    bs = sort_nn(bc, start=(150, 200))
+    traj = []
     for c in ts + bs:
-        for p in c.reshape(-1, 2)[::3]: trajectory.append((int(p[0]), int(p[1])))
-    if len(trajectory) < 40:
-        trajectory = [(x, y) for y in range(120, 680, 45) for x in range(80, 1200, 25)]
-    return trajectory
+        for p in c.reshape(-1, 2)[::3]: traj.append((int(p[0]), int(p[1])))
+    if len(traj) < 40: traj = [(x, y) for y in range(120, 680, 45) for x in range(80, 1200, 25)]
+    return traj
 
-def extract_staggered_trajectories(image_path):
+def extract_stag_traj(image_path):
     img = cv2.imread(str(image_path))
-    if img is None: return [[(WIDTH // 2, HEIGHT // 2)]]
+    if img is None: return [[(WIDTH//2, HEIGHT//2)]]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     _, binary = cv2.threshold(gray, 225, 255, cv2.THRESH_BINARY_INV)
     mt = np.zeros_like(binary); mt[:TITLE_BAND_H, :] = binary[:TITLE_BAND_H, :]
-    ml = np.zeros_like(binary); ml[TITLE_BAND_H:HEIGHT, :int(WIDTH * 0.48)] = binary[TITLE_BAND_H:HEIGHT, :int(WIDTH * 0.48)]
-    mr = np.zeros_like(binary); mr[TITLE_BAND_H:int(HEIGHT * 0.72), int(WIDTH * 0.48):] = binary[TITLE_BAND_H:int(HEIGHT * 0.72), int(WIDTH * 0.48):]
-    mb = np.zeros_like(binary); mb[int(HEIGHT * 0.72):, int(WIDTH * 0.48):] = binary[int(HEIGHT * 0.72):, int(WIDTH * 0.48):]
-    def to_pts(cnts): return [(int(p[0]), int(p[1])) for c in cnts for p in c.reshape(-1, 2)[::3]]
+    ml = np.zeros_like(binary); ml[TITLE_BAND_H:HEIGHT, :int(WIDTH*0.48)] = binary[TITLE_BAND_H:HEIGHT, :int(WIDTH*0.48)]
+    mr = np.zeros_like(binary); mr[TITLE_BAND_H:int(HEIGHT*0.72), int(WIDTH*0.48):] = binary[TITLE_BAND_H:int(HEIGHT*0.72), int(WIDTH*0.48):]
+    mb = np.zeros_like(binary); mb[int(HEIGHT*0.72):, int(WIDTH*0.48):] = binary[int(HEIGHT*0.72):, int(WIDTH*0.48):]
+    def tp(cs): return [(int(p[0]), int(p[1])) for c in cs for p in c.reshape(-1, 2)[::3]]
     tc, _ = cv2.findContours(mt, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     lc, _ = cv2.findContours(ml, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
     rc, _ = cv2.findContours(mr, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
     bc, _ = cv2.findContours(mb, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
-    zones = [to_pts(sorted(tc, key=lambda c: cv2.boundingRect(c)[0])),
-        to_pts(sort_contours_nn(lc, start_pt=(150, 250))),
-        to_pts(sort_contours_nn(rc, start_pt=(int(WIDTH * 0.7), 250))),
-        to_pts(sort_contours_nn(bc, start_pt=(int(WIDTH * 0.75), int(HEIGHT * 0.85))))]
+    zones = [tp(sorted(tc, key=lambda c: cv2.boundingRect(c)[0])), tp(sort_nn(lc, (150,250))),
+             tp(sort_nn(rc, (int(WIDTH*0.7), 250))), tp(sort_nn(bc, (int(WIDTH*0.75), int(HEIGHT*0.85))))]
     return [z for z in zones if len(z) > 10]
 
-def paste_hand(frame_bgr, hand_bgr, hand_alpha, x, y):
-    fh, fw = frame_bgr.shape[:2]; hh, hw = hand_bgr.shape[:2]
-    x1, y1 = max(0, x), max(0, y); x2, y2 = min(fw, x + hw), min(fh, y + hh)
+def paste_hand(f, hb, ha, x, y):
+    fh, fw = f.shape[:2]; hh, hw = hb.shape[:2]
+    x1, y1 = max(0, x), max(0, y); x2, y2 = min(fw, x+hw), min(fh, y+hh)
     if x1 >= x2 or y1 >= y2: return
-    hx1, hy1 = x1 - x, y1 - y; hx2, hy2 = hx1 + (x2 - x1), hy1 + (y2 - y1)
-    sub_hand = hand_bgr[hy1:hy2, hx1:hx2]
-    sub_alpha = (hand_alpha[hy1:hy2, hx1:hx2].astype(np.float32) / 255.0)[:, :, None]
-    roi = frame_bgr[y1:y2, x1:x2].astype(np.float32)
-    blended = sub_hand.astype(np.float32) * sub_alpha + roi * (1.0 - sub_alpha)
-    frame_bgr[y1:y2, x1:x2] = np.clip(blended, 0, 255).astype(np.uint8)
+    hx1, hy1 = x1-x, y1-y; hx2, hy2 = hx1+(x2-x1), hy1+(y2-y1)
+    sh = hb[hy1:hy2, hx1:hx2]; sa = (ha[hy1:hy2, hx1:hx2].astype(np.float32)/255.0)[:, :, None]
+    roi = f[y1:y2, x1:x2].astype(np.float32)
+    bl = sh.astype(np.float32) * sa + roi * (1.0 - sa)
+    f[y1:y2, x1:x2] = np.clip(bl, 0, 255).astype(np.uint8)
 
-def ease_in_out(t): return 0.5 * (1.0 - math.cos(math.pi * t))
+def ease(t): return 0.5 * (1.0 - math.cos(math.pi * t))
 
-def get_motion_keyframes(motion):
-    return {
-        "zoom_in_center": [(0.0, 1.00, WIDTH*0.50, HEIGHT*0.50), (1.0, 1.22, WIDTH*0.50, HEIGHT*0.50)],
-        "zoom_out_center": [(0.0, 1.22, WIDTH*0.50, HEIGHT*0.50), (1.0, 1.00, WIDTH*0.50, HEIGHT*0.50)],
-        "pan_left_to_right": [(0.0, 1.12, WIDTH*0.35, HEIGHT*0.50), (1.0, 1.12, WIDTH*0.65, HEIGHT*0.50)],
-        "pan_right_to_left": [(0.0, 1.12, WIDTH*0.65, HEIGHT*0.50), (1.0, 1.12, WIDTH*0.35, HEIGHT*0.50)],
-        "zoom_in_top_left": [(0.0, 1.00, WIDTH*0.50, HEIGHT*0.50), (1.0, 1.24, WIDTH*0.30, HEIGHT*0.35)],
-        "zoom_in_bottom_right": [(0.0, 1.00, WIDTH*0.50, HEIGHT*0.50), (1.0, 1.24, WIDTH*0.70, HEIGHT*0.65)],
-        "ken_burns_slow": [(0.0, 1.05, WIDTH*0.45, HEIGHT*0.48), (1.0, 1.18, WIDTH*0.55, HEIGHT*0.52)],
-        "static": [(0.0, 1.00, WIDTH*0.50, HEIGHT*0.50), (1.0, 1.00, WIDTH*0.50, HEIGHT*0.50)],
-    }.get(motion, [(0.0, 1.00, WIDTH*0.50, HEIGHT*0.50), (1.0, 1.22, WIDTH*0.50, HEIGHT*0.50)])
+# Comic motions
+COMIC_MOTIONS = {
+    "zoom_in_center": [(0.0, 1.00, WIDTH*0.5, HEIGHT*0.5), (1.0, 1.22, WIDTH*0.5, HEIGHT*0.5)],
+    "zoom_out_center": [(0.0, 1.22, WIDTH*0.5, HEIGHT*0.5), (1.0, 1.00, WIDTH*0.5, HEIGHT*0.5)],
+    "pan_left_to_right": [(0.0, 1.12, WIDTH*0.35, HEIGHT*0.5), (1.0, 1.12, WIDTH*0.65, HEIGHT*0.5)],
+    "pan_right_to_left": [(0.0, 1.12, WIDTH*0.65, HEIGHT*0.5), (1.0, 1.12, WIDTH*0.35, HEIGHT*0.5)],
+    "zoom_in_top_left": [(0.0, 1.00, WIDTH*0.5, HEIGHT*0.5), (1.0, 1.24, WIDTH*0.30, HEIGHT*0.35)],
+    "zoom_in_bottom_right": [(0.0, 1.00, WIDTH*0.5, HEIGHT*0.5), (1.0, 1.24, WIDTH*0.70, HEIGHT*0.65)],
+    "ken_burns_slow": [(0.0, 1.05, WIDTH*0.45, HEIGHT*0.48), (1.0, 1.18, WIDTH*0.55, HEIGHT*0.52)],
+    "static": [(0.0, 1.00, WIDTH*0.5, HEIGHT*0.5), (1.0, 1.00, WIDTH*0.5, HEIGHT*0.5)],
+}
 
-def interpolate_motion(keyframes, p):
-    if p <= keyframes[0][0]: _, s, cx, cy = keyframes[0]; return s, cx, cy
-    if p >= keyframes[-1][0]: _, s, cx, cy = keyframes[-1]; return s, cx, cy
-    for i in range(len(keyframes) - 1):
-        k0, k1 = keyframes[i], keyframes[i + 1]
+# Horror motions — chậm, dramatic
+HORROR_MOTIONS = {
+    "slow_zoom_in": [(0.0, 1.00, WIDTH*0.5, HEIGHT*0.5), (1.0, 1.15, WIDTH*0.5, HEIGHT*0.5)],
+    "slow_zoom_out": [(0.0, 1.15, WIDTH*0.5, HEIGHT*0.5), (1.0, 1.00, WIDTH*0.5, HEIGHT*0.5)],
+    "creepy_pan_left": [(0.0, 1.08, WIDTH*0.42, HEIGHT*0.5), (1.0, 1.08, WIDTH*0.58, HEIGHT*0.5)],
+    "creepy_pan_right": [(0.0, 1.08, WIDTH*0.58, HEIGHT*0.5), (1.0, 1.08, WIDTH*0.42, HEIGHT*0.5)],
+    "dramatic_zoom_face": [(0.0, 1.00, WIDTH*0.5, HEIGHT*0.5), (1.0, 1.35, WIDTH*0.5, HEIGHT*0.40)],
+    "static_dread": [(0.0, 1.05, WIDTH*0.5, HEIGHT*0.5), (1.0, 1.05, WIDTH*0.5, HEIGHT*0.5)],
+}
+
+def get_motion_kfs(motion, style_mode="comic"):
+    src = HORROR_MOTIONS if style_mode == "horror" else COMIC_MOTIONS
+    return src.get(motion, list(src.values())[0])
+
+def interp_motion(kfs, p):
+    if p <= kfs[0][0]: _, s, cx, cy = kfs[0]; return s, cx, cy
+    if p >= kfs[-1][0]: _, s, cx, cy = kfs[-1]; return s, cx, cy
+    for i in range(len(kfs)-1):
+        k0, k1 = kfs[i], kfs[i+1]
         if k0[0] <= p <= k1[0]:
-            span = k1[0] - k0[0]
-            local = (p - k0[0]) / span if span > 0 else 1.0
-            eased = ease_in_out(local)
-            return (k0[1] + (k1[1] - k0[1]) * eased,
-                    k0[2] + (k1[2] - k0[2]) * eased,
-                    k0[3] + (k1[3] - k0[3]) * eased)
-    _, s, cx, cy = keyframes[-1]; return s, cx, cy
+            sp = k1[0] - k0[0]
+            lc = (p - k0[0]) / sp if sp > 0 else 1.0
+            e = ease(lc)
+            return (k0[1] + (k1[1]-k0[1])*e, k0[2] + (k1[2]-k0[2])*e, k0[3] + (k1[3]-k0[3])*e)
+    _, s, cx, cy = kfs[-1]; return s, cx, cy
 
 # ============================================================
 # RENDER 4 STYLES
 # ============================================================
-def render_scene_kttv_v2(image_path, duration, output_path, hand_path, motion="zoom_in_center"):
-    total_frames = max(1, round(duration * FPS))
-    draw_duration = max(1.5, min(duration - 0.8, duration * DRAW_DURATION_RATIO))
-    draw_frames = int(draw_duration * FPS); retract_frames = int(0.35 * FPS)
-    original_full = cv2.imread(str(image_path))
-    if original_full is None: raise RuntimeError(f"Không đọc được ảnh: {image_path}")
-    original_full = cv2.resize(original_full, (WIDTH, HEIGHT))
-    title_band, content_bgr = split_title_band(original_full)
-    white_content = np.full_like(content_bgr, 255)
-    reveal_mask = np.zeros((CONTENT_H, WIDTH), dtype=np.uint8)
-    zone_trajectories = extract_staggered_trajectories(image_path)
-    all_pts_full = [p for z in zone_trajectories for p in z] or [(WIDTH // 2, HEIGHT // 2)]
-    all_points = trajectory_to_content_space(all_pts_full)
-    phases = split_trajectory_into_phases(all_points)
-    phase_frames = [int(draw_frames * PHASE_RATIOS[0]),
-                    int(draw_frames * (PHASE_RATIOS[0] + PHASE_RATIOS[1])), draw_frames]
-    hand_bgr, hand_alpha, tip_x, tip_y = load_hand_asset(hand_path, 320)
+def render_kttv(image_path, duration, output_path, hand_path, motion="zoom_in_center", style_mode="comic"):
+    tf = max(1, round(duration * FPS))
+    dd = max(1.5, min(duration - 0.8, duration * DRAW_DURATION_RATIO))
+    df = int(dd * FPS); rf = int(0.35 * FPS)
+    of = cv2.imread(str(image_path))
+    if of is None: raise RuntimeError(f"Không đọc được ảnh: {image_path}")
+    of = cv2.resize(of, (WIDTH, HEIGHT))
+    tb, cb = split_title_band(of)
+    wc = np.full_like(cb, 255); rm = np.zeros((CONTENT_H, WIDTH), dtype=np.uint8)
+    zt = extract_stag_traj(image_path)
+    ap_full = [p for z in zt for p in z] or [(WIDTH//2, HEIGHT//2)]
+    ap = traj_to_content(ap_full)
+    ph = split_traj_phases(ap)
+    pf = [int(df*PHASE_RATIOS[0]), int(df*(PHASE_RATIOS[0]+PHASE_RATIOS[1])), df]
+    hb, ha, tx, ty = load_hand(hand_path, 320)
     cmd = ["ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo", "-s", f"{WIDTH}x{HEIGHT}",
            "-pix_fmt", "bgr24", "-r", str(FPS), "-i", "-", "-an", "-c:v", "libx264",
            "-preset", "veryfast", "-pix_fmt", "yuv420p", str(output_path)]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-    last_tip = all_points[0] if all_points else (WIDTH // 2, CONTENT_H // 2)
-    motion_kfs = get_motion_keyframes(motion)
-    for f_idx in range(total_frames):
-        hand_visible = False; hand_pos_x = hand_pos_y = 0
-        if f_idx < draw_frames:
-            if f_idx < phase_frames[0]: cp = 0; lp = f_idx / max(1, phase_frames[0])
-            elif f_idx < phase_frames[1]: cp = 1; lp = (f_idx - phase_frames[0]) / max(1, phase_frames[1] - phase_frames[0])
-            else: cp = 2; lp = (f_idx - phase_frames[1]) / max(1, phase_frames[2] - phase_frames[1])
+    lt = ap[0] if ap else (WIDTH//2, CONTENT_H//2)
+    kfs = get_motion_kfs(motion, style_mode)
+    for fi in range(tf):
+        hv = False; hx = hy = 0
+        if fi < df:
+            if fi < pf[0]: cp=0; lp=fi/max(1,pf[0])
+            elif fi < pf[1]: cp=1; lp=(fi-pf[0])/max(1,pf[1]-pf[0])
+            else: cp=2; lp=(fi-pf[1])/max(1,pf[2]-pf[1])
             for pi in range(cp):
-                for pt in phases[pi]: cv2.circle(reveal_mask, pt, REVEAL_RADIUS, 255, -1)
-            cpts = phases[cp]
-            if cpts:
-                cnt = max(1, min(int(lp * len(cpts)), len(cpts)))
-                for pt in cpts[:cnt]: cv2.circle(reveal_mask, pt, REVEAL_RADIUS, 255, -1)
-                target = cpts[cnt - 1]
-            else: target = last_tip
-            hand_pos_x = target[0] + int(1.2 * math.sin(f_idx * 1.8))
-            hand_pos_y = target[1] + int(1.2 * math.cos(f_idx * 1.8))
-            last_tip = (hand_pos_x, hand_pos_y); hand_visible = True
-        elif f_idx < draw_frames + retract_frames:
-            reveal_mask[:, :] = 255
-            prog = (f_idx - draw_frames) / max(1, retract_frames)
-            hand_pos_x = int(last_tip[0] + (WIDTH + 180 - last_tip[0]) * prog)
-            hand_pos_y = int(last_tip[1] + (CONTENT_H + 180 - last_tip[1]) * prog)
-            hand_visible = True
-        else: reveal_mask[:, :] = 255
-        alpha = (cv2.GaussianBlur(reveal_mask, (13, 13), 0).astype(np.float32) / 255.0)[:, :, None]
-        frame_content = (content_bgr * alpha + white_content * (1.0 - alpha)).astype(np.uint8)
-        if hand_visible: paste_hand(frame_content, hand_bgr, hand_alpha, hand_pos_x - tip_x, hand_pos_y - tip_y)
-        if f_idx < draw_frames + retract_frames: scale, cx_use, cy_use = 1.0, WIDTH * 0.5, CONTENT_H * 0.5
+                for pt in ph[pi]: cv2.circle(rm, pt, REVEAL_RADIUS, 255, -1)
+            cps = ph[cp]
+            if cps:
+                cnt = max(1, min(int(lp*len(cps)), len(cps)))
+                for pt in cps[:cnt]: cv2.circle(rm, pt, REVEAL_RADIUS, 255, -1)
+                tg = cps[cnt-1]
+            else: tg = lt
+            hx = tg[0]+int(1.2*math.sin(fi*1.8)); hy = tg[1]+int(1.2*math.cos(fi*1.8))
+            lt = (hx, hy); hv = True
+        elif fi < df+rf:
+            rm[:, :] = 255; pr = (fi-df)/max(1,rf)
+            hx = int(lt[0]+(WIDTH+180-lt[0])*pr); hy = int(lt[1]+(CONTENT_H+180-lt[1])*pr); hv = True
+        else: rm[:, :] = 255
+        a = (cv2.GaussianBlur(rm, (13, 13), 0).astype(np.float32)/255.0)[:, :, None]
+        fc = (cb*a + wc*(1.0-a)).astype(np.uint8)
+        if hv: paste_hand(fc, hb, ha, hx-tx, hy-ty)
+        if fi < df+rf: sc, cu, cyu = 1.0, WIDTH*0.5, CONTENT_H*0.5
         else:
-            op = (f_idx - draw_frames - retract_frames) / max(1, total_frames - draw_frames - retract_frames)
-            st_, cxt, cyt = interpolate_motion(motion_kfs, op)
-            cyc = (cyt / HEIGHT) * CONTENT_H
-            blend = ease_in_out(min(1.0, op * 1.8))
-            scale = 1.0 + (st_ - 1.0) * blend
-            cx_use = WIDTH * 0.5 + (cxt - WIDTH * 0.5) * blend
-            cy_use = CONTENT_H * 0.5 + (cyc - CONTENT_H * 0.5) * blend
-        frame_out = compose_frame(title_band, crop_content_with_motion(frame_content, scale, cx_use, cy_use))
-        proc.stdin.write(frame_out.tobytes())
+            op = (fi-df-rf)/max(1, tf-df-rf)
+            st_, cx_, cy_ = interp_motion(kfs, op)
+            cyc = (cy_/HEIGHT)*CONTENT_H; bl = ease(min(1.0, op*1.8))
+            sc = 1.0 + (st_-1.0)*bl
+            cu = WIDTH*0.5 + (cx_-WIDTH*0.5)*bl
+            cyu = CONTENT_H*0.5 + (cyc-CONTENT_H*0.5)*bl
+        fo = compose_frame(tb, crop_content_motion(fc, sc, cu, cyu))
+        proc.stdin.write(fo.tobytes())
     proc.stdin.close(); proc.wait()
-    if proc.returncode != 0: raise RuntimeError("FFmpeg render thất bại (style 1)")
+    if proc.returncode != 0: raise RuntimeError("FFmpeg fail (style 1)")
 
-def render_scene_hybrid(image_path, duration, output_path, hand_path, motion="zoom_in_center"):
-    total_frames = max(1, round(duration * FPS))
-    draw_duration = max(1.5, min(duration - 0.8, duration * DRAW_DURATION_RATIO))
-    draw_frames = int(draw_duration * FPS); retract_frames = int(0.35 * FPS)
-    original_full = cv2.imread(str(image_path))
-    if original_full is None: raise RuntimeError(f"Không đọc được ảnh: {image_path}")
-    original_full = cv2.resize(original_full, (WIDTH, HEIGHT))
-    title_band, content_bgr = split_title_band(original_full)
-    white_content = np.full_like(content_bgr, 255)
-    reveal_mask = np.zeros((CONTENT_H, WIDTH), dtype=np.uint8)
-    trajectory_full = extract_continuous_trajectory(image_path)
-    trajectory = trajectory_to_content_space(trajectory_full)
-    phases = split_trajectory_into_phases(trajectory)
-    phase_frames = [int(draw_frames * PHASE_RATIOS[0]),
-                    int(draw_frames * (PHASE_RATIOS[0] + PHASE_RATIOS[1])), draw_frames]
-    hand_bgr, hand_alpha, tip_x, tip_y = load_hand_asset(hand_path, 320)
+def render_hybrid(image_path, duration, output_path, hand_path, motion="zoom_in_center", style_mode="comic"):
+    tf = max(1, round(duration * FPS))
+    dd = max(1.5, min(duration - 0.8, duration * DRAW_DURATION_RATIO))
+    df = int(dd*FPS); rf = int(0.35*FPS)
+    of = cv2.imread(str(image_path))
+    if of is None: raise RuntimeError(f"Không đọc được ảnh: {image_path}")
+    of = cv2.resize(of, (WIDTH, HEIGHT))
+    tb, cb = split_title_band(of)
+    wc = np.full_like(cb, 255); rm = np.zeros((CONTENT_H, WIDTH), dtype=np.uint8)
+    tr_full = extract_cont_traj(image_path); tr = traj_to_content(tr_full)
+    ph = split_traj_phases(tr)
+    pf = [int(df*PHASE_RATIOS[0]), int(df*(PHASE_RATIOS[0]+PHASE_RATIOS[1])), df]
+    hb, ha, tx, ty = load_hand(hand_path, 320)
     cmd = ["ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo", "-s", f"{WIDTH}x{HEIGHT}",
            "-pix_fmt", "bgr24", "-r", str(FPS), "-i", "-", "-an", "-c:v", "libx264",
            "-preset", "veryfast", "-pix_fmt", "yuv420p", str(output_path)]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-    last_tip = trajectory[0] if trajectory else (WIDTH // 2, CONTENT_H // 2)
-    smooth_cx, smooth_cy = float(last_tip[0]), float(last_tip[1])
-    motion_kfs = get_motion_keyframes(motion)
-    for f_idx in range(total_frames):
-        hand_visible = False; hand_pos_x = hand_pos_y = 0
-        if f_idx < draw_frames:
-            if f_idx < phase_frames[0]: cp = 0; lp = f_idx / max(1, phase_frames[0])
-            elif f_idx < phase_frames[1]: cp = 1; lp = (f_idx - phase_frames[0]) / max(1, phase_frames[1] - phase_frames[0])
-            else: cp = 2; lp = (f_idx - phase_frames[1]) / max(1, phase_frames[2] - phase_frames[1])
+    lt = tr[0] if tr else (WIDTH//2, CONTENT_H//2)
+    scx, scy = float(lt[0]), float(lt[1])
+    kfs = get_motion_kfs(motion, style_mode)
+    for fi in range(tf):
+        hv = False; hx = hy = 0
+        if fi < df:
+            if fi < pf[0]: cp=0; lp=fi/max(1,pf[0])
+            elif fi < pf[1]: cp=1; lp=(fi-pf[0])/max(1,pf[1]-pf[0])
+            else: cp=2; lp=(fi-pf[1])/max(1,pf[2]-pf[1])
             for pi in range(cp):
-                for pt in phases[pi]: cv2.circle(reveal_mask, pt, REVEAL_RADIUS, 255, -1)
-            cpts = phases[cp]
-            if cpts:
-                cnt = max(1, min(int(lp * len(cpts)), len(cpts)))
-                for pt in cpts[:cnt]: cv2.circle(reveal_mask, pt, REVEAL_RADIUS, 255, -1)
-                target = cpts[cnt - 1]
-            else: target = last_tip
-            hand_pos_x = target[0] + int(1.2 * math.sin(f_idx * 1.8))
-            hand_pos_y = target[1] + int(1.2 * math.cos(f_idx * 1.8))
-            last_tip = (hand_pos_x, hand_pos_y); hand_visible = True
-        elif f_idx < draw_frames + retract_frames:
-            reveal_mask[:, :] = 255
-            prog = (f_idx - draw_frames) / max(1, retract_frames)
-            hand_pos_x = int(last_tip[0] + (WIDTH + 180 - last_tip[0]) * prog)
-            hand_pos_y = int(last_tip[1] + (CONTENT_H + 180 - last_tip[1]) * prog)
-            hand_visible = True
-        else: reveal_mask[:, :] = 255
-        alpha = (cv2.GaussianBlur(reveal_mask, (13, 13), 0).astype(np.float32) / 255.0)[:, :, None]
-        frame_content = (content_bgr * alpha + white_content * (1.0 - alpha)).astype(np.uint8)
-        if hand_visible: paste_hand(frame_content, hand_bgr, hand_alpha, hand_pos_x - tip_x, hand_pos_y - tip_y)
-        if f_idx < draw_frames:
-            scale = 1.0
-            smooth_cx = smooth_cx * 0.95 + hand_pos_x * 0.05
-            smooth_cy = smooth_cy * 0.95 + hand_pos_y * 0.05
-            cx_use, cy_use = smooth_cx, smooth_cy
-        elif f_idx < draw_frames + retract_frames: scale, cx_use, cy_use = 1.0, smooth_cx, smooth_cy
+                for pt in ph[pi]: cv2.circle(rm, pt, REVEAL_RADIUS, 255, -1)
+            cps = ph[cp]
+            if cps:
+                cnt = max(1, min(int(lp*len(cps)), len(cps)))
+                for pt in cps[:cnt]: cv2.circle(rm, pt, REVEAL_RADIUS, 255, -1)
+                tg = cps[cnt-1]
+            else: tg = lt
+            hx = tg[0]+int(1.2*math.sin(fi*1.8)); hy = tg[1]+int(1.2*math.cos(fi*1.8))
+            lt = (hx, hy); hv = True
+        elif fi < df+rf:
+            rm[:, :] = 255; pr = (fi-df)/max(1,rf)
+            hx = int(lt[0]+(WIDTH+180-lt[0])*pr); hy = int(lt[1]+(CONTENT_H+180-lt[1])*pr); hv = True
+        else: rm[:, :] = 255
+        a = (cv2.GaussianBlur(rm, (13, 13), 0).astype(np.float32)/255.0)[:, :, None]
+        fc = (cb*a + wc*(1.0-a)).astype(np.uint8)
+        if hv: paste_hand(fc, hb, ha, hx-tx, hy-ty)
+        if fi < df:
+            sc = 1.0
+            scx = scx*0.95 + hx*0.05; scy = scy*0.95 + hy*0.05
+            cu, cyu = scx, scy
+        elif fi < df+rf: sc, cu, cyu = 1.0, scx, scy
         else:
-            op = (f_idx - draw_frames - retract_frames) / max(1, total_frames - draw_frames - retract_frames)
-            st_, cxt, cyt = interpolate_motion(motion_kfs, op)
-            cyc = (cyt / HEIGHT) * CONTENT_H
-            blend = ease_in_out(min(1.0, op * 1.8))
-            scale = 1.0 + (st_ - 1.0) * blend
-            cx_use = smooth_cx + (cxt - smooth_cx) * blend
-            cy_use = smooth_cy + (cyc - smooth_cy) * blend
-        crop_w = int(WIDTH / scale); crop_h = int(CONTENT_H / scale)
-        cx_clamped = max(crop_w // 2, min(WIDTH - crop_w // 2, int(cx_use)))
-        cy_clamped = max(crop_h // 2, min(CONTENT_H - crop_h // 2, int(cy_use)))
-        frame_out = compose_frame(title_band, crop_content_with_motion(frame_content, scale, cx_clamped, cy_clamped))
-        proc.stdin.write(frame_out.tobytes())
+            op = (fi-df-rf)/max(1, tf-df-rf)
+            st_, cx_, cy_ = interp_motion(kfs, op); cyc = (cy_/HEIGHT)*CONTENT_H
+            bl = ease(min(1.0, op*1.8)); sc = 1.0 + (st_-1.0)*bl
+            cu = scx + (cx_-scx)*bl; cyu = scy + (cyc-scy)*bl
+        cw = int(WIDTH/sc); chh = int(CONTENT_H/sc)
+        ccx = max(cw//2, min(WIDTH-cw//2, int(cu))); ccy = max(chh//2, min(CONTENT_H-chh//2, int(cyu)))
+        fo = compose_frame(tb, crop_content_motion(fc, sc, ccx, ccy))
+        proc.stdin.write(fo.tobytes())
     proc.stdin.close(); proc.wait()
-    if proc.returncode != 0: raise RuntimeError("FFmpeg render thất bại (style 2)")
+    if proc.returncode != 0: raise RuntimeError("FFmpeg fail (style 2)")
 
-def render_scene_kttv_pure(image_path, duration, output_path, motion="zoom_in_center"):
-    total_frames = max(1, round(duration * FPS))
-    original_full = cv2.resize(cv2.imread(str(image_path)), (WIDTH, HEIGHT))
-    title_band, content_bgr = split_title_band(original_full)
+def render_pure(image_path, duration, output_path, motion="zoom_in_center", style_mode="comic"):
+    tf = max(1, round(duration * FPS))
+    of = cv2.resize(cv2.imread(str(image_path)), (WIDTH, HEIGHT))
+    tb, cb = split_title_band(of)
     cmd = ["ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo", "-s", f"{WIDTH}x{HEIGHT}",
            "-pix_fmt", "bgr24", "-r", str(FPS), "-i", "-", "-an", "-c:v", "libx264",
            "-preset", "veryfast", "-pix_fmt", "yuv420p", str(output_path)]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-    kfs = get_motion_keyframes(motion)
-    for f_idx in range(total_frames):
-        p = f_idx / max(1, total_frames - 1)
-        s, cx, cyf = interpolate_motion(kfs, p)
-        cy = (cyf / HEIGHT) * CONTENT_H
-        frame_out = compose_frame(title_band, crop_content_with_motion(content_bgr, s, cx, cy))
-        proc.stdin.write(frame_out.tobytes())
+    kfs = get_motion_kfs(motion, style_mode)
+    for fi in range(tf):
+        p = fi / max(1, tf-1)
+        s, cx, cyf = interp_motion(kfs, p); cy = (cyf/HEIGHT)*CONTENT_H
+        fo = compose_frame(tb, crop_content_motion(cb, s, cx, cy))
+        proc.stdin.write(fo.tobytes())
     proc.stdin.close(); proc.wait()
 
-def render_scene_classic_hand(image_path, duration, output_path, hand_path, motion="zoom_in_center"):
-    total_frames = max(1, round(duration * FPS))
-    draw_frames = int(max(1.5, min(duration - 0.8, duration * DRAW_DURATION_RATIO)) * FPS)
-    retract_frames = int(0.35 * FPS)
-    original_full = cv2.resize(cv2.imread(str(image_path)), (WIDTH, HEIGHT))
-    title_band, content_bgr = split_title_band(original_full)
-    white_content = np.full_like(content_bgr, 255)
-    reveal_mask = np.zeros((CONTENT_H, WIDTH), dtype=np.uint8)
-    trajectory_full = extract_continuous_trajectory(image_path)
-    trajectory = trajectory_to_content_space(trajectory_full)
-    phases = split_trajectory_into_phases(trajectory)
-    phase_frames = [int(draw_frames * PHASE_RATIOS[0]),
-                    int(draw_frames * (PHASE_RATIOS[0] + PHASE_RATIOS[1])), draw_frames]
-    hand_bgr, hand_alpha, tip_x, tip_y = load_hand_asset(hand_path)
+def render_classic(image_path, duration, output_path, hand_path, motion="zoom_in_center", style_mode="comic"):
+    tf = max(1, round(duration * FPS))
+    df = int(max(1.5, min(duration-0.8, duration*DRAW_DURATION_RATIO))*FPS); rf = int(0.35*FPS)
+    of = cv2.resize(cv2.imread(str(image_path)), (WIDTH, HEIGHT))
+    tb, cb = split_title_band(of)
+    wc = np.full_like(cb, 255); rm = np.zeros((CONTENT_H, WIDTH), dtype=np.uint8)
+    tr_full = extract_cont_traj(image_path); tr = traj_to_content(tr_full)
+    ph = split_traj_phases(tr)
+    pf = [int(df*PHASE_RATIOS[0]), int(df*(PHASE_RATIOS[0]+PHASE_RATIOS[1])), df]
+    hb, ha, tx, ty = load_hand(hand_path)
     cmd = ["ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo", "-s", f"{WIDTH}x{HEIGHT}",
            "-pix_fmt", "bgr24", "-r", str(FPS), "-i", "-", "-an", "-c:v", "libx264",
            "-preset", "veryfast", "-pix_fmt", "yuv420p", str(output_path)]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-    last_tip = trajectory[0] if trajectory else (WIDTH // 2, CONTENT_H // 2)
-    for f_idx in range(total_frames):
-        hand_visible = False
-        if f_idx < draw_frames:
-            if f_idx < phase_frames[0]: cp = 0; lp = f_idx / max(1, phase_frames[0])
-            elif f_idx < phase_frames[1]: cp = 1; lp = (f_idx - phase_frames[0]) / max(1, phase_frames[1] - phase_frames[0])
-            else: cp = 2; lp = (f_idx - phase_frames[1]) / max(1, phase_frames[2] - phase_frames[1])
+    lt = tr[0] if tr else (WIDTH//2, CONTENT_H//2)
+    for fi in range(tf):
+        hv = False
+        if fi < df:
+            if fi < pf[0]: cp=0; lp=fi/max(1,pf[0])
+            elif fi < pf[1]: cp=1; lp=(fi-pf[0])/max(1,pf[1]-pf[0])
+            else: cp=2; lp=(fi-pf[1])/max(1,pf[2]-pf[1])
             for pi in range(cp):
-                for pt in phases[pi]: cv2.circle(reveal_mask, pt, REVEAL_RADIUS, 255, -1)
-            cpts = phases[cp]
-            if cpts:
-                cnt = max(1, min(int(lp * len(cpts)), len(cpts)))
-                for pt in cpts[:cnt]: cv2.circle(reveal_mask, pt, REVEAL_RADIUS, 255, -1)
-                target = cpts[cnt - 1]
-            else: target = last_tip
-            hand_pos_x = target[0] + int(1.2 * math.sin(f_idx * 1.8))
-            hand_pos_y = target[1] + int(1.2 * math.cos(f_idx * 1.8))
-            last_tip = (hand_pos_x, hand_pos_y); hand_visible = True
-        elif f_idx < draw_frames + retract_frames:
-            reveal_mask[:, :] = 255
-            prog = (f_idx - draw_frames) / max(1, retract_frames)
-            hand_pos_x = int(last_tip[0] + (WIDTH + 180 - last_tip[0]) * prog)
-            hand_pos_y = int(last_tip[1] + (CONTENT_H + 180 - last_tip[1]) * prog)
-            hand_visible = True
-        else: reveal_mask[:, :] = 255
-        alpha = (cv2.GaussianBlur(reveal_mask, (13, 13), 0).astype(np.float32) / 255.0)[:, :, None]
-        frame_content = (content_bgr * alpha + white_content * (1.0 - alpha)).astype(np.uint8)
-        if hand_visible: paste_hand(frame_content, hand_bgr, hand_alpha, hand_pos_x - tip_x, hand_pos_y - tip_y)
-        frame_out = compose_frame(title_band, frame_content)
-        proc.stdin.write(frame_out.tobytes())
+                for pt in ph[pi]: cv2.circle(rm, pt, REVEAL_RADIUS, 255, -1)
+            cps = ph[cp]
+            if cps:
+                cnt = max(1, min(int(lp*len(cps)), len(cps)))
+                for pt in cps[:cnt]: cv2.circle(rm, pt, REVEAL_RADIUS, 255, -1)
+                tg = cps[cnt-1]
+            else: tg = lt
+            hx = tg[0]+int(1.2*math.sin(fi*1.8)); hy = tg[1]+int(1.2*math.cos(fi*1.8))
+            lt = (hx, hy); hv = True
+        elif fi < df+rf:
+            rm[:, :] = 255; pr = (fi-df)/max(1,rf)
+            hx = int(lt[0]+(WIDTH+180-lt[0])*pr); hy = int(lt[1]+(CONTENT_H+180-lt[1])*pr); hv = True
+        else: rm[:, :] = 255
+        a = (cv2.GaussianBlur(rm, (13, 13), 0).astype(np.float32)/255.0)[:, :, None]
+        fc = (cb*a + wc*(1.0-a)).astype(np.uint8)
+        if hv: paste_hand(fc, hb, ha, hx-tx, hy-ty)
+        fo = compose_frame(tb, fc)
+        proc.stdin.write(fo.tobytes())
     proc.stdin.close(); proc.wait()
 
-def create_placeholder_image(output_path, title):
+def create_placeholder(out, title):
     img = Image.new("RGB", (WIDTH, HEIGHT), "white")
-    draw = ImageDraw.Draw(img)
-    f = font_for(48)
-    text = "ẢNH KHÔNG TẠO ĐƯỢC"
-    box = draw.textbbox((0, 0), text, font=f)
-    tw, th = box[2] - box[0], box[3] - box[1]
-    draw.text(((WIDTH - tw) / 2, (HEIGHT - th) / 2), text, fill="#cccccc", font=f)
-    img.save(output_path, quality=95)
+    d = ImageDraw.Draw(img); f = font_for(48); text = "ẢNH KHÔNG TẠO ĐƯỢC"
+    b = d.textbbox((0, 0), text, font=f); tw, th = b[2]-b[0], b[3]-b[1]
+    d.text(((WIDTH-tw)/2, (HEIGHT-th)/2), text, fill="#cccccc", font=f)
+    img.save(out, quality=95)
 
 # ============================================================
 # PARALLEL
 # ============================================================
-def parallel_generate_images(scenes, batch_dir, providers, image_timeout,
-                              progress_state, flux_steps=4, fair_share_enabled=True,
-                              circuit_breaker_enabled=True, prioritize_fast=True,
-                              enable_arrows=True, enable_shadow=True):
+def parallel_gen(scenes, batch_dir, providers, image_timeout, progress_state,
+                 flux_steps=4, fair_share=True, circuit=True, prio_fast=True,
+                 enable_arrows=True, enable_shadow=True, style_mode="comic"):
     if not providers: raise RuntimeError("Không có provider nào.")
-    total_scenes = len(scenes)
-    if fair_share_enabled:
-        fair_share_cap = max(3, int((total_scenes / len(providers)) * FAIR_SHARE_MULTIPLIER))
-        st.caption(f"⚖️ Fair share cap: mỗi provider tối đa **{fair_share_cap}** cảnh")
-    else: fair_share_cap = 999999
-    if circuit_breaker_enabled:
-        st.caption(f"🔌 Circuit breaker: provider fail {CIRCUIT_BREAKER_THRESHOLD} lần → loại")
-    if prioritize_fast:
-        st.caption(f"⚡ Slow penalty: provider > {SLOW_PROVIDER_THRESHOLD:.0f}s → sleep {SLOW_PROVIDER_PENALTY}s")
+    total_s = len(scenes)
+    if fair_share:
+        cap = max(3, int((total_s/len(providers))*FAIR_SHARE_MULTIPLIER))
+        st.caption(f"⚖️ Fair share cap: **{cap}** cảnh/provider")
+    else: cap = 999999
+    if circuit: st.caption(f"🔌 Circuit breaker: {CIRCUIT_BREAKER_THRESHOLD} lần fail → loại")
+    if prio_fast: st.caption(f"⚡ Slow penalty: >{SLOW_PROVIDER_THRESHOLD:.0f}s → sleep {SLOW_PROVIDER_PENALTY}s")
 
-    scene_queue = Queue(); scene_attempts = {}
+    q = Queue(); attempts = {}
     for i, s in enumerate(scenes):
-        img_raw = batch_dir / f"scene_{i+1:03d}_raw.png"
-        img = batch_dir / f"scene_{i+1:03d}.jpg"
-        if not img.exists():
-            scene_queue.put((i, s, img_raw, img)); scene_attempts[i] = 0
-            progress_state["scene_status"][i] = {"status": "pending", "provider": None,
-                "started": None, "elapsed": 0.0, "attempts": 0}
+        ir = batch_dir / f"scene_{i+1:03d}_raw.png"; im = batch_dir / f"scene_{i+1:03d}.jpg"
+        if not im.exists():
+            q.put((i, s, ir, im)); attempts[i] = 0
+            progress_state["scene_status"][i] = {"status": "pending", "provider": None, "started": None, "elapsed": 0.0, "attempts": 0}
         else:
-            progress_state["scene_status"][i] = {"status": "done", "provider": "(cached)",
-                "started": None, "elapsed": 0.0, "attempts": 0}
-    total = scene_queue.qsize()
+            progress_state["scene_status"][i] = {"status": "done", "provider": "(cached)", "started": None, "elapsed": 0.0, "attempts": 0}
+    total = q.qsize()
     if total == 0: return {}, 0
+    results = {}; failed = {}; rlock = threading.Lock()
+    pstats = {p["name"]: {"ok": 0, "err": 0, "total_time": 0.0, "last_scene": None, "errors": [], "circuit_broken": False} for p in providers}
 
-    results = {}; failed_scenes = {}; results_lock = threading.Lock()
-    provider_stats = {p["name"]: {"ok": 0, "err": 0, "total_time": 0.0,
-        "last_scene": None, "errors": [], "circuit_broken": False} for p in providers}
-
-    def worker(provider_cfg):
-        name = provider_cfg["name"]
-        my_count = 0; consecutive_fails = 0; local_ok = 0; local_time = 0.0
-        while my_count < fair_share_cap:
-            if circuit_breaker_enabled and consecutive_fails >= CIRCUIT_BREAKER_THRESHOLD:
-                with results_lock: provider_stats[name]["circuit_broken"] = True
+    def worker(pc):
+        n = pc["name"]; my = 0; cf = 0; lok = 0; ltime = 0.0
+        while my < cap:
+            if circuit and cf >= CIRCUIT_BREAKER_THRESHOLD:
+                with rlock: pstats[n]["circuit_broken"] = True
                 return
-            if prioritize_fast and local_ok >= 2:
-                if (local_time / local_ok) > SLOW_PROVIDER_THRESHOLD:
-                    time.sleep(SLOW_PROVIDER_PENALTY)
-            try: idx, scene, img_raw, img = scene_queue.get_nowait()
+            if prio_fast and lok >= 2 and (ltime/lok) > SLOW_PROVIDER_THRESHOLD:
+                time.sleep(SLOW_PROVIDER_PENALTY)
+            try: idx, s, ir, im = q.get_nowait()
             except Empty: return
-            current_attempts = scene_attempts.get(idx, 0)
-            if current_attempts >= MAX_ATTEMPTS_PER_SCENE:
-                create_placeholder_image(img, scene["title"])
-                add_comic_overlays(img, scene["title"], scene.get("callout_type", "speech"),
-                                   scene.get("callout_text", ""), scene.get("callout_side", "right"),
-                                   img, scene.get("text_boxes", []), enable_arrows, enable_shadow)
-                with results_lock:
+            ca = attempts.get(idx, 0)
+            if ca >= MAX_ATTEMPTS_PER_SCENE:
+                create_placeholder(im, s["title"])
+                add_comic_overlays(im, s["title"], s.get("callout_type", "speech"), s.get("callout_text", ""),
+                                   s.get("callout_side", "right"), im, s.get("text_boxes", []), enable_arrows, enable_shadow, style_mode)
+                with rlock:
                     results[idx] = "placeholder"; progress_state["done"] += 1
-                    progress_state["scene_status"][idx] = {"status": "placeholder",
-                        "provider": "placeholder", "started": None, "elapsed": 0.0,
-                        "attempts": current_attempts}
+                    progress_state["scene_status"][idx] = {"status": "placeholder", "provider": "placeholder", "started": None, "elapsed": 0.0, "attempts": ca}
                 continue
-            t_start = time.time()
-            with results_lock:
-                progress_state["scene_status"][idx] = {"status": "working", "provider": name,
-                    "started": t_start, "elapsed": 0.0, "attempts": current_attempts + 1}
+            t0 = time.time()
+            with rlock:
+                progress_state["scene_status"][idx] = {"status": "working", "provider": n, "started": t0, "elapsed": 0.0, "attempts": ca+1}
             try:
-                kwargs = provider_cfg.get("kwargs", {}).copy()
-                data = provider_cfg["fn"](scene["visual_prompt"], *provider_cfg.get("args", []),
-                                          timeout=image_timeout, **kwargs)
-                if not data or len(data) < 500: raise RuntimeError("empty data")
-                save_image_from_bytes(data, img_raw)
-                add_comic_overlays(img_raw, scene["title"], scene.get("callout_type", "speech"),
-                                   scene.get("callout_text", ""), scene.get("callout_side", "right"),
-                                   img, scene.get("text_boxes", []), enable_arrows, enable_shadow)
-                elapsed = time.time() - t_start
-                my_count += 1; local_ok += 1; local_time += elapsed; consecutive_fails = 0
-                with results_lock:
-                    results[idx] = name
-                    provider_stats[name]["ok"] += 1
-                    provider_stats[name]["total_time"] += elapsed
-                    provider_stats[name]["last_scene"] = idx + 1
-                    progress_state["scene_status"][idx] = {"status": "done", "provider": name,
-                        "started": t_start, "elapsed": elapsed, "attempts": current_attempts + 1}
+                kw = pc.get("kwargs", {}).copy()
+                data = pc["fn"](s["visual_prompt"], *pc.get("args", []), timeout=image_timeout, **kw)
+                if not data or len(data) < 500: raise RuntimeError("empty")
+                save_image(data, ir)
+                add_comic_overlays(ir, s["title"], s.get("callout_type", "speech"), s.get("callout_text", ""),
+                                   s.get("callout_side", "right"), im, s.get("text_boxes", []), enable_arrows, enable_shadow, style_mode)
+                el = time.time() - t0; my += 1; lok += 1; ltime += el; cf = 0
+                with rlock:
+                    results[idx] = n; pstats[n]["ok"] += 1; pstats[n]["total_time"] += el; pstats[n]["last_scene"] = idx+1
+                    progress_state["scene_status"][idx] = {"status": "done", "provider": n, "started": t0, "elapsed": el, "attempts": ca+1}
                     progress_state["done"] += 1
             except Exception as e:
-                elapsed = time.time() - t_start
-                err_msg = str(e)[:150]; consecutive_fails += 1
-                with results_lock:
-                    scene_attempts[idx] = current_attempts + 1
-                    provider_stats[name]["err"] += 1
-                    provider_stats[name]["errors"].append(err_msg)
-                    progress_state["scene_status"][idx] = {
-                        "status": "pending" if scene_attempts[idx] < MAX_ATTEMPTS_PER_SCENE else "failed",
-                        "provider": None if scene_attempts[idx] < MAX_ATTEMPTS_PER_SCENE else name,
-                        "started": None, "elapsed": elapsed,
-                        "attempts": scene_attempts[idx], "error": err_msg}
-                if scene_attempts[idx] < MAX_ATTEMPTS_PER_SCENE:
-                    scene_queue.put((idx, scene, img_raw, img))
-                    time.sleep(FAIL_SLEEP_SECONDS)
+                el = time.time() - t0; err = str(e)[:150]; cf += 1
+                with rlock:
+                    attempts[idx] = ca+1; pstats[n]["err"] += 1; pstats[n]["errors"].append(err)
+                    progress_state["scene_status"][idx] = {"status": "pending" if attempts[idx] < MAX_ATTEMPTS_PER_SCENE else "failed",
+                        "provider": None if attempts[idx] < MAX_ATTEMPTS_PER_SCENE else n, "started": None, "elapsed": el, "attempts": attempts[idx], "error": err}
+                if attempts[idx] < MAX_ATTEMPTS_PER_SCENE:
+                    q.put((idx, s, ir, im)); time.sleep(FAIL_SLEEP_SECONDS)
                 else:
-                    create_placeholder_image(img, scene["title"])
-                    add_comic_overlays(img, scene["title"], scene.get("callout_type", "speech"),
-                                       scene.get("callout_text", ""), scene.get("callout_side", "right"),
-                                       img, scene.get("text_boxes", []), enable_arrows, enable_shadow)
-                    with results_lock:
+                    create_placeholder(im, s["title"])
+                    add_comic_overlays(im, s["title"], s.get("callout_type", "speech"), s.get("callout_text", ""),
+                                       s.get("callout_side", "right"), im, s.get("text_boxes", []), enable_arrows, enable_shadow, style_mode)
+                    with rlock:
                         results[idx] = "placeholder"; progress_state["done"] += 1
-                        progress_state["scene_status"][idx] = {"status": "placeholder",
-                            "provider": "placeholder", "started": None, "elapsed": elapsed,
-                            "attempts": scene_attempts[idx]}
+                        progress_state["scene_status"][idx] = {"status": "placeholder", "provider": "placeholder", "started": None, "elapsed": el, "attempts": attempts[idx]}
 
     with ThreadPoolExecutor(max_workers=len(providers)) as ex:
-        futures = [ex.submit(worker, p) for p in providers]
-        wait(futures, timeout=None)
+        fs = [ex.submit(worker, p) for p in providers]
+        wait(fs, timeout=None)
 
-    remaining = []
-    while not scene_queue.empty():
-        try: remaining.append(scene_queue.get_nowait())
+    rem = []
+    while not q.empty():
+        try: rem.append(q.get_nowait())
         except Empty: break
-    if remaining:
-        st.warning(f"⚠️ {len(remaining)} cảnh còn sót, fallback tuần tự...")
-        for idx, scene, img_raw, img in remaining:
-            success = False
-            for cfg in providers:
+    if rem:
+        st.warning(f"⚠️ {len(rem)} cảnh sót, fallback tuần tự...")
+        for idx, s, ir, im in rem:
+            ok = False
+            for pc in providers:
                 try:
-                    kwargs = cfg.get("kwargs", {}).copy()
-                    data = cfg["fn"](scene["visual_prompt"], *cfg.get("args", []),
-                                     timeout=min(image_timeout, 45), **kwargs)
+                    kw = pc.get("kwargs", {}).copy()
+                    data = pc["fn"](s["visual_prompt"], *pc.get("args", []), timeout=min(image_timeout, 45), **kw)
                     if data and len(data) > 500:
-                        save_image_from_bytes(data, img_raw)
-                        add_comic_overlays(img_raw, scene["title"], scene.get("callout_type", "speech"),
-                                           scene.get("callout_text", ""), scene.get("callout_side", "right"),
-                                           img, scene.get("text_boxes", []), enable_arrows, enable_shadow)
-                        with results_lock:
-                            results[idx] = cfg["name"]
-                            provider_stats[cfg["name"]]["ok"] += 1
-                            progress_state["done"] += 1
-                            progress_state["scene_status"][idx] = {"status": "done",
-                                "provider": cfg["name"] + " (fallback)", "started": None,
-                                "elapsed": 0.0, "attempts": scene_attempts.get(idx, 0)}
-                        success = True; break
+                        save_image(data, ir)
+                        add_comic_overlays(ir, s["title"], s.get("callout_type", "speech"), s.get("callout_text", ""),
+                                           s.get("callout_side", "right"), im, s.get("text_boxes", []), enable_arrows, enable_shadow, style_mode)
+                        with rlock:
+                            results[idx] = pc["name"]; pstats[pc["name"]]["ok"] += 1; progress_state["done"] += 1
+                            progress_state["scene_status"][idx] = {"status": "done", "provider": pc["name"]+" (fb)", "started": None, "elapsed": 0.0, "attempts": attempts.get(idx, 0)}
+                        ok = True; break
                 except Exception: continue
-            if not success:
-                create_placeholder_image(img, scene["title"])
-                add_comic_overlays(img, scene["title"], scene.get("callout_type", "speech"),
-                                   scene.get("callout_text", ""), scene.get("callout_side", "right"),
-                                   img, scene.get("text_boxes", []), enable_arrows, enable_shadow)
-                with results_lock:
+            if not ok:
+                create_placeholder(im, s["title"])
+                add_comic_overlays(im, s["title"], s.get("callout_type", "speech"), s.get("callout_text", ""),
+                                   s.get("callout_side", "right"), im, s.get("text_boxes", []), enable_arrows, enable_shadow, style_mode)
+                with rlock:
                     results[idx] = "placeholder"; progress_state["done"] += 1
-                    progress_state["scene_status"][idx] = {"status": "placeholder",
-                        "provider": "placeholder", "started": None, "elapsed": 0.0,
-                        "attempts": scene_attempts.get(idx, 0)}
-    progress_state["provider_stats"] = provider_stats
-    return results, len(failed_scenes)
+                    progress_state["scene_status"][idx] = {"status": "placeholder", "provider": "placeholder", "started": None, "elapsed": 0.0, "attempts": attempts.get(idx, 0)}
+    progress_state["provider_stats"] = pstats
+    return results, len(failed)
 
 # ============================================================
 # RENDER BATCH
 # ============================================================
 def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
-                 cf_account, cf_token, hf_token, freetheai_key, together_key,
-                 nexa_key, agnes_key, pollinations_key, pollinations_model,
-                 image_timeout, flux_steps=4, fair_share_enabled=True,
-                 circuit_breaker_enabled=True, prioritize_fast=True,
+                 cf_acc, cf_tok, hf_tok, fta_key, tg_key, nx_key, ag_key, pol_key, pol_mod,
+                 image_timeout, flux_steps=4, fair_share=True, circuit=True, prio_fast=True,
                  chars=None, char_lock=None, enable_arrows=True, enable_shadow=True,
-                 enable_sfx=True, sfx_volume=-12,
-                 enable_music=True, music_volume=-22, seed_lock=None):
+                 enable_sfx=True, sfx_vol=-12, enable_music=True, music_vol=-22,
+                 seed_lock=None, style_mode="comic"):
     total = len(scenes)
-    if total == 0: raise RuntimeError("Không có cảnh nào để render.")
+    if total == 0: raise RuntimeError("Không có cảnh nào.")
     chars = chars or {}; char_lock = char_lock or {}
-    providers = build_provider_list(cf_account, cf_token, hf_token, freetheai_key,
-        together_key, nexa_key, agnes_key, pollinations_key, pollinations_model,
-        flux_steps, chars=chars, char_lock=char_lock, seed=seed_lock)
-    if not providers: raise RuntimeError("Chưa cấu hình provider ảnh nào.")
+    providers = build_provider_list(cf_acc, cf_tok, hf_tok, fta_key, tg_key, nx_key, ag_key,
+                                    pol_key, pol_mod, flux_steps, chars, char_lock, seed_lock, style_mode)
+    if not providers: raise RuntimeError("Chưa cấu hình provider.")
 
-    st.markdown(f"### 🔗 {len(providers)} Provider")
+    st.markdown(f"### 🔗 {len(providers)} Provider ({'👻 Horror' if style_mode=='horror' else '📚 Comic'} mode)")
     pc = st.columns(min(4, len(providers)))
     for i, p in enumerate(providers):
         with pc[i % len(pc)]: st.markdown(f"**{i+1}.** {p['name']}")
     if char_lock: st.success(f"🔒 Khóa {len(char_lock)} nhân vật")
     if seed_lock is not None: st.info(f"🎲 Seed lock: {seed_lock}")
     if enable_sfx:
-        sfx_count = sum(1 for s in scenes if s.get("sfx", "none") != "none")
-        st.info(f"🔊 SFX: {sfx_count}/{total} cảnh")
+        cnt = sum(1 for s in scenes if s.get("sfx", "none") != "none")
+        st.info(f"🔊 SFX: {cnt}/{total}")
     if enable_music:
-        music_count = sum(1 for s in scenes if s.get("music_emotion", "none") != "none")
-        emotions = Counter(s.get("music_emotion", "neutral") for s in scenes if s.get("music_emotion") != "none")
-        st.info(f"🎵 Nhạc nền: {music_count}/{total} — {dict(emotions)}")
+        cnt = sum(1 for s in scenes if s.get("music_emotion", "none") != "none")
+        emos = Counter(s.get("music_emotion", "neutral") for s in scenes if s.get("music_emotion") != "none")
+        st.info(f"🎵 Nhạc: {cnt}/{total} — {dict(emos)}")
 
     st.markdown("### 🎨 Tạo ảnh song song")
-    progress_state = {"done": 0, "scene_status": {},
-        "provider_stats": {p["name"]: {"ok": 0, "err": 0, "total_time": 0.0,
-            "last_scene": None, "errors": [], "circuit_broken": False} for p in providers}}
-    progress_lock = threading.Lock()
-    progress_bar = st.progress(0); progress_text = st.empty()
-    stats_table = st.empty(); scene_table = st.empty()
+    ps = {"done": 0, "scene_status": {}, "provider_stats": {p["name"]: {"ok":0,"err":0,"total_time":0.0,"last_scene":None,"errors":[],"circuit_broken":False} for p in providers}}
+    plock = threading.Lock()
+    bar = st.progress(0); txt = st.empty(); stats_t = st.empty(); scene_t = st.empty()
 
-    def speed_emoji(avg):
+    def spd(avg):
         if avg <= 0: return "—"
         if avg < 5: return f"🚀 {avg:.1f}s"
         if avg < 15: return f"⚡ {avg:.1f}s"
         return f"🐢 {avg:.1f}s"
 
-    def render_dashboard():
-        with progress_lock:
-            done = progress_state["done"]
-            scene_status = dict(progress_state["scene_status"])
-            pstats = dict(progress_state["provider_stats"])
-        pct = min(1.0, done / total) * 0.6
-        progress_bar.progress(pct)
-        progress_text.markdown(f"**🎨 Tạo ảnh: {done}/{total}** ({pct/0.6*100:.0f}%)")
-        stats_data = []
+    def dash():
+        with plock:
+            done = ps["done"]; ss = dict(ps["scene_status"]); pst = dict(ps["provider_stats"])
+        pct = min(1.0, done/total)*0.6
+        bar.progress(pct); txt.markdown(f"**🎨 Ảnh: {done}/{total}** ({pct/0.6*100:.0f}%)")
+        sd = []
         for p in providers:
-            name = p["name"]
-            s = pstats.get(name, {"ok": 0, "err": 0, "total_time": 0.0,
-                "last_scene": None, "errors": [], "circuit_broken": False})
-            avg = s["total_time"] / s["ok"] if s["ok"] > 0 else 0
-            last_err = s.get("errors", [])[-1][:30] if s.get("errors") else "—"
-            circuit = "🔌 BROKEN" if s.get("circuit_broken") else "✅ OK"
-            stats_data.append({"Provider": name, "✅ OK": s["ok"], "❌ Lỗi": s["err"],
-                "Tốc độ": speed_emoji(avg),
-                "🎬 Cảnh cuối": f"#{s['last_scene']}" if s["last_scene"] else "—",
-                "🔌 Circuit": circuit, "🐛 Lỗi gần nhất": last_err})
-        if stats_data:
-            stats_table.dataframe(stats_data, use_container_width=True, hide_index=True)
+            n = p["name"]; s = pst.get(n, {"ok":0,"err":0,"total_time":0.0,"last_scene":None,"errors":[],"circuit_broken":False})
+            avg = s["total_time"]/s["ok"] if s["ok"]>0 else 0
+            le = s.get("errors", [])[-1][:30] if s.get("errors") else "—"
+            cb = "🔌 BROKEN" if s.get("circuit_broken") else "✅ OK"
+            sd.append({"Provider": n, "✅ OK": s["ok"], "❌ Lỗi": s["err"], "Tốc độ": spd(avg),
+                       "🎬 Cảnh cuối": f"#{s['last_scene']}" if s["last_scene"] else "—", "🔌 Circuit": cb, "🐛 Lỗi": le})
+        if sd: stats_t.dataframe(sd, use_container_width=True, hide_index=True)
         rows = []
         for i in range(total):
-            st_info = scene_status.get(i, {"status": "pending", "provider": None,
-                "elapsed": 0.0, "attempts": 0})
-            icon = {"pending": "⏳ Chờ", "working": "🔄 Đang vẽ", "done": "✅ Xong",
-                    "failed": "❌ Lỗi", "placeholder": "⚠️ Placeholder"}.get(st_info["status"], "?")
-            prov = st_info["provider"] or "—"
-            elapsed = f"{st_info.get('elapsed', 0):.1f}s" if st_info.get("elapsed", 0) > 0 else "—"
-            attempts = st_info.get("attempts", 0)
-            rows.append({"Cảnh": f"#{i+1:02d}", "Trạng thái": icon, "Provider": prov,
-                "Thời gian": elapsed, "Số lần thử": f"{attempts}/{MAX_ATTEMPTS_PER_SCENE}"})
-        scene_table.dataframe(rows, use_container_width=True, hide_index=True,
-                              height=min(400, 35 * total + 40))
+            si = ss.get(i, {"status": "pending", "provider": None, "elapsed": 0.0, "attempts": 0})
+            ic = {"pending": "⏳", "working": "🔄", "done": "✅", "failed": "❌", "placeholder": "⚠️"}.get(si["status"], "?")
+            pv = si["provider"] or "—"
+            el = f"{si.get('elapsed', 0):.1f}s" if si.get("elapsed", 0) > 0 else "—"
+            at = si.get("attempts", 0)
+            rows.append({"Cảnh": f"#{i+1:02d}", "Trạng thái": ic, "Provider": pv, "Thời gian": el, "Lần thử": f"{at}/{MAX_ATTEMPTS_PER_SCENE}"})
+        scene_t.dataframe(rows, use_container_width=True, hide_index=True, height=min(400, 35*total+40))
 
-    result_container = {"result": None, "error": None}
-    def run_parallel():
+    rc = {"r": None, "e": None}
+    def run_p():
         try:
-            r, _ = parallel_generate_images(scenes, batch_dir, providers, image_timeout,
-                progress_state, flux_steps, fair_share_enabled, circuit_breaker_enabled,
-                prioritize_fast, enable_arrows, enable_shadow)
-            result_container["result"] = r
-        except Exception as e: result_container["error"] = e
-    t = threading.Thread(target=run_parallel, daemon=True)
-    t.start()
+            r, _ = parallel_gen(scenes, batch_dir, providers, image_timeout, ps, flux_steps,
+                                fair_share, circuit, prio_fast, enable_arrows, enable_shadow, style_mode)
+            rc["r"] = r
+        except Exception as e: rc["e"] = e
+    t = threading.Thread(target=run_p, daemon=True); t.start()
     while t.is_alive():
-        render_dashboard(); time.sleep(0.8)
-    t.join(); render_dashboard()
-    if result_container["error"]: raise result_container["error"]
-    used = result_container["result"] or {}
-    stats = Counter(used.values())
-    st.success(f"✅ Đã tạo {len(used)}/{total} ảnh — {dict(stats)}")
+        dash(); time.sleep(0.8)
+    t.join(); dash()
+    if rc["e"]: raise rc["e"]
+    used = rc["r"] or {}
+    st.success(f"✅ Đã tạo {len(used)}/{total} ảnh — {dict(Counter(used.values()))}")
 
     st.markdown("### 🎬 Render video")
-    render_bar = st.progress(0); render_text = st.empty()
-    scene_videos = []
+    rb = st.progress(0); rt = st.empty()
+    vids = []
     for i, s in enumerate(scenes, 1):
-        img = batch_dir / f"scene_{i:03d}.jpg"
-        vid = batch_dir / f"scene_{i:03d}.mp4"
-        if not img.exists(): raise RuntimeError(f"Thiếu ảnh scene {i}")
-        duration = max(1.0, float(s["end"]) - float(s["start"]))
-        motion = s.get("camera_motion", "zoom_in_center")
-        if "1." in style or "Kiến Thức Thú Vị V2" in style:
-            render_scene_kttv_v2(img, duration, vid, hand_path, motion)
-        elif "2." in style or "Độc bản" in style or "Hybrid" in style:
-            render_scene_hybrid(img, duration, vid, hand_path, motion)
-        elif "3." in style or "Chỉ Camera" in style:
-            render_scene_kttv_pure(img, duration, vid, motion)
-        else:
-            render_scene_classic_hand(img, duration, vid, hand_path, motion)
-        scene_videos.append(vid)
-        render_bar.progress(i / total)
-        render_text.markdown(f"**🎬 Render: {i}/{total}** — {s['title']}")
+        im = batch_dir / f"scene_{i:03d}.jpg"; vd = batch_dir / f"scene_{i:03d}.mp4"
+        if not im.exists(): raise RuntimeError(f"Thiếu ảnh scene {i}")
+        dur = max(1.0, float(s["end"]) - float(s["start"]))
+        mo = s.get("camera_motion", "zoom_in_center")
+        if "1." in style or "Vẽ 3 phase" in style: render_kttv(im, dur, vd, hand_path, mo, style_mode)
+        elif "2." in style or "Hybrid" in style: render_hybrid(im, dur, vd, hand_path, mo, style_mode)
+        elif "3." in style or "Chỉ Camera" in style: render_pure(im, dur, vd, mo, style_mode)
+        else: render_classic(im, dur, vd, hand_path, mo, style_mode)
+        vids.append(vd)
+        rb.progress(i/total); rt.markdown(f"**🎬 Render: {i}/{total}** — {s['title']}")
 
-    concat_file = batch_dir / "concat.txt"
-    concat_file.write_text("\n".join(f"file '{p.resolve()}'" for p in scene_videos), encoding="utf-8")
-    batch_video = batch_dir / "batch_video.mp4"
-    run_cmd(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file),
-             "-c", "copy", "-movflags", "+faststart", str(batch_video)], timeout=900)
+    cf_f = batch_dir / "concat.txt"
+    cf_f.write_text("\n".join(f"file '{p.resolve()}'" for p in vids), encoding="utf-8")
+    bv = batch_dir / "batch_video.mp4"
+    run_cmd(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(cf_f), "-c", "copy", "-movflags", "+faststart", str(bv)], timeout=900)
 
-    final_batch = batch_dir / "batch_final.mp4"
-    sfx_track = None; music_track = None
+    fb = batch_dir / "batch_final.mp4"
+    sfx_t = None; mus_t = None
     if enable_sfx:
-        st.markdown("### 🔊 Tạo SFX track")
-        sfx_track = build_sfx_track(scenes, batch_dir / "sfx.wav", SFX_SAMPLE_RATE, sfx_volume)
+        st.markdown("### 🔊 SFX")
+        sfx_t = build_sfx_track(scenes, batch_dir / "sfx.wav", SFX_SAMPLE_RATE, sfx_vol)
     if enable_music:
-        st.markdown("### 🎵 Tạo nhạc nền")
-        music_track = build_music_track(scenes, batch_dir / "music.wav", SFX_SAMPLE_RATE, music_volume)
+        st.markdown("### 🎵 Nhạc nền")
+        mus_t = build_music_track(scenes, batch_dir / "music.wav", SFX_SAMPLE_RATE, music_vol)
 
-    if sfx_track or music_track:
-        st.info(f"🎛️ Mix: voice + {'SFX ' if sfx_track else ''}{'+ music' if music_track else ''}")
+    if sfx_t or mus_t:
         mixed = batch_dir / "audio_mixed.m4a"
-        mix_audio_tracks(str(batch_audio), str(sfx_track) if sfx_track else None,
-                         str(music_track) if music_track else None, str(mixed))
-        run_cmd(["ffmpeg", "-y", "-i", str(batch_video), "-i", str(mixed),
-                 "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac",
-                 "-b:a", "128k", "-movflags", "+faststart", str(final_batch)], timeout=900)
+        mix_audio_tracks(str(batch_audio), str(sfx_t) if sfx_t else None, str(mus_t) if mus_t else None, str(mixed))
+        run_cmd(["ffmpeg", "-y", "-i", str(bv), "-i", str(mixed), "-map", "0:v:0", "-map", "1:a:0",
+                 "-c:v", "copy", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(fb)], timeout=900)
     else:
-        run_cmd(["ffmpeg", "-y", "-i", str(batch_video), "-i", str(batch_audio),
-                 "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac",
-                 "-b:a", "128k", "-movflags", "+faststart", str(final_batch)], timeout=900)
+        run_cmd(["ffmpeg", "-y", "-i", str(bv), "-i", str(batch_audio), "-map", "0:v:0", "-map", "1:a:0",
+                 "-c:v", "copy", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(fb)], timeout=900)
 
     for f in batch_dir.glob("scene_*_raw.png"): f.unlink(missing_ok=True)
     for f in batch_dir.glob("scene_*.mp4"): f.unlink(missing_ok=True)
-    concat_file.unlink(missing_ok=True); batch_video.unlink(missing_ok=True)
-    return final_batch
+    cf_f.unlink(missing_ok=True); bv.unlink(missing_ok=True)
+    return fb
 
-def concat_batches(batch_videos, output_path):
-    concat = output_path.parent / "batches.txt"
-    concat.write_text("\n".join(f"file '{p.resolve()}'" for p in batch_videos), encoding="utf-8")
-    run_cmd(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat),
-             "-c", "copy", "-movflags", "+faststart", str(output_path)], timeout=1800)
+def concat_batches(vids, out):
+    cf = out.parent / "batches.txt"
+    cf.write_text("\n".join(f"file '{p.resolve()}'" for p in vids), encoding="utf-8")
+    run_cmd(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(cf), "-c", "copy", "-movflags", "+faststart", str(out)], timeout=1800)
 
 # ============================================================
-# MAIN FLOW
+# MAIN
 # ============================================================
 st.sidebar.divider()
 
 if st.sidebar.button("🔎 KIỂM TRA PROVIDER", use_container_width=True):
-    char_lock = build_character_lock(char_main_name, char_main_desc,
-                                      char_second_name, char_second_desc, enable_char_lock)
-    providers = build_provider_list(cf_account, cf_token, hf_token, freetheai_key,
-        together_key, nexa_key, agnes_key, pollinations_key, pollinations_model,
-        flux_steps, chars={}, char_lock=char_lock, seed=None)
-    if not providers:
-        st.error("Chưa có provider nào.")
+    char_lock = build_character_lock(char_main_name, char_main_desc, char_second_name, char_second_desc, enable_char_lock)
+    providers = build_provider_list(cf_account, cf_token, hf_token, freetheai_key, together_key, nexa_key, agnes_key,
+                                    pollinations_key, pollinations_model, flux_steps, {}, char_lock, None, style_mode)
+    if not providers: st.error("Chưa có provider.")
     else:
-        st.write(f"**{len(providers)} provider:**")
+        st.write(f"**{len(providers)} provider ({style_mode} mode):**")
         for i, p in enumerate(providers, 1): st.write(f"{i}. {p['name']}")
-        if char_lock: st.success(f"🔒 Character lock: {list(char_lock.keys())}")
         if st.button("▶️ Test 1 ảnh"):
-            tp = "2D comic doodle: a female character with long hair in green shirt at desk with laptop, thinking pose, red accents, white background, no text"
-            for cfg in providers:
+            if style_mode == "horror":
+                tp = "2D dark horror illustration: a lone figure in a foggy hallway, moonlight, deep shadows, no text"
+            else:
+                tp = "2D comic doodle: a person at desk with laptop, thinking, red accents, white background, no text"
+            for pc in providers:
                 try:
-                    with st.spinner(f"Test {cfg['name']}..."):
+                    with st.spinner(f"Test {pc['name']}..."):
                         t0 = time.time()
-                        data = cfg["fn"](tp, *cfg.get("args", []), timeout=45, **cfg.get("kwargs", {}))
-                        elapsed = time.time() - t0
-                    if data and len(data) > 500:
-                        img = Image.open(io.BytesIO(data)).convert("RGB").resize((WIDTH, HEIGHT))
-                        st.success(f"✅ {cfg['name']} — {elapsed:.1f}s")
+                        d = pc["fn"](tp, *pc.get("args", []), timeout=45, **pc.get("kwargs", {}))
+                        el = time.time() - t0
+                    if d and len(d) > 500:
+                        img = Image.open(io.BytesIO(d)).convert("RGB").resize((WIDTH, HEIGHT))
+                        st.success(f"✅ {pc['name']} — {el:.1f}s")
                         st.image(img, use_container_width=True); break
                 except Exception as e:
-                    st.warning(f"❌ {cfg['name']}: {str(e)[:150]}")
+                    st.warning(f"❌ {pc['name']}: {str(e)[:150]}")
 
 audio = st.file_uploader("🎤 Tải lên voice", type=["mp3", "m4a", "wav", "ogg", "webm", "mp4"])
 
 if audio:
     st.audio(audio)
     if st.button("🚀 BẮT ĐẦU", type="primary", use_container_width=True):
-        if not groq_key:
-            st.error("Cần Groq API Key."); st.stop()
+        if not groq_key: st.error("Cần Groq API Key."); st.stop()
 
         lang_code = None
         if language_mode == "Tiếng Việt": lang_code = "vi"
         elif language_mode == "English": lang_code = "en"
-        st.info(f"🌐 Ngôn ngữ: **{language_mode}**")
+        st.info(f"🌐 Ngôn ngữ: **{language_mode}** | 🎨 Style: **{style_mode.upper()}**")
 
         if use_script_mode == "Kết hợp voice + text": internal_mode = "combined"
         elif use_script_mode == "Chỉ dùng text": internal_mode = "text_only"
         else: internal_mode = "voice_only"
-        st.info(f"📝 Chế độ: **{use_script_mode}**")
 
-        char_lock = build_character_lock(char_main_name, char_main_desc,
-                                          char_second_name, char_second_desc, enable_char_lock)
+        char_lock = build_character_lock(char_main_name, char_main_desc, char_second_name, char_second_desc, enable_char_lock)
         if char_lock: st.success(f"🔒 Khóa {len(char_lock)} nhân vật")
         seed_lock = random.randint(1, 2**31 - 1) if enable_seed_lock else None
-        if seed_lock: st.info(f"🎲 Seed lock: {seed_lock}")
+        if seed_lock: st.info(f"🎲 Seed: {seed_lock}")
 
-        # Cache dir cố định cho transcript
-        cache_dir = Path.home() / ".wb_cache"
-        cache_dir.mkdir(exist_ok=True)
+        cache_dir = Path.home() / ".wb_cache"; cache_dir.mkdir(exist_ok=True)
 
-        root = Path(tempfile.mkdtemp(prefix="wb_v81_"))
+        root = Path(tempfile.mkdtemp(prefix=f"wb_v9_{style_mode}_"))
         try:
-            source = root / audio.name
-            source.write_bytes(audio.getbuffer())
-            duration = ffprobe_duration(source)
-            st.info(f"Thời lượng: {duration/60:.2f} phút. Batch {BATCH_SECONDS//60} phút.")
+            src = root / audio.name; src.write_bytes(audio.getbuffer())
+            dur = ffprobe_duration(src)
+            st.info(f"Thời lượng: {dur/60:.2f} phút. Batch {BATCH_SECONDS//60} phút.")
 
             client = groq_client(groq_key)
-            batch_dir = root / "batches"; batch_dir.mkdir()
-            chunks = chunk_audio(source, batch_dir, BATCH_SECONDS)
-            hand_path = Path("hand.png")
-            batch_videos = []; all_scenes = 0
-            status = st.empty()
+            bd = root / "batches"; bd.mkdir()
+            chunks = chunk_audio(src, bd, BATCH_SECONDS)
+            hp = Path("hand.png")
+            bvids = []; all_s = 0; stt = st.empty()
 
-            valid_chunks = [(bi, ch, ffprobe_duration(ch)) for bi, ch in enumerate(chunks)
-                            if ffprobe_duration(ch) >= 5.0 or bi == 0]
-            if not valid_chunks:
-                st.error("Không có audio hợp lệ."); st.stop()
+            vc = [(bi, ch, ffprobe_duration(ch)) for bi, ch in enumerate(chunks) if ffprobe_duration(ch) >= 5.0 or bi == 0]
+            if not vc: st.error("Không có audio hợp lệ."); st.stop()
 
-            camera_mode = ("random" if "Random" in camera_motion_mode else
-                          f"fixed:{camera_motion_mode.replace('Cố định: ', '').strip()}"
-                          if "Cố định" in camera_motion_mode else "auto")
+            cm_mode = ("random" if "Random" in camera_motion_mode else
+                      f"fixed:{camera_motion_mode.replace('Cố định: ', '').strip()}"
+                      if "Cố định" in camera_motion_mode else "auto")
 
-            for idx, (bi, chunk, bdur) in enumerate(valid_chunks):
+            for idx, (bi, chunk, bdur) in enumerate(vc):
                 bstart = bi * BATCH_SECONDS
-                status.markdown(f"### 🧠 Đợt {idx+1}/{len(valid_chunks)} — STT ({lang_code or 'auto'})...")
-                tr = transcribe_file(client, chunk, stt_model, language=lang_code, cache_dir=cache_dir)
-                if lang_code is None:
-                    detected = detect_language_from_result(tr)
-                    st.info(f"🌐 Whisper: **{detected}**")
+                stt.markdown(f"### 🧠 Đợt {idx+1}/{len(vc)} — STT...")
+                tr = transcribe_file(client, chunk, stt_model, lang_code, cache_dir)
+                if lang_code is None: st.info(f"🌐 Whisper: **{detect_language(tr)}**")
                 segs = normalize_segments(tr, bstart)
-                batch_text = "\n".join(f"[{x['start']:.2f}-{x['end']:.2f}] {x['text']}" for x in segs)
-                if len(batch_text.strip()) < 50:
-                    st.error(f"⚠️ Transcript quá ngắn ({len(batch_text)} ký tự)!")
+                btext = "\n".join(f"[{x['start']:.2f}-{x['end']:.2f}] {x['text']}" for x in segs)
 
-                total_chunks = len(valid_chunks)
-                batch_script = ""
+                tc = len(vc); bscript = ""
                 if script_text and internal_mode in ("combined", "text_only"):
-                    script_lines = [l.strip() for l in script_text.split("\n") if l.strip()]
-                    lines_per = max(1, len(script_lines) // total_chunks + 1)
-                    start_l = idx * lines_per
-                    end_l = min(start_l + lines_per, len(script_lines))
-                    batch_script = "\n".join(script_lines[start_l:end_l])
+                    lines = [l.strip() for l in script_text.split("\n") if l.strip()]
+                    lp = max(1, len(lines)//tc + 1)
+                    s_l = idx*lp; e_l = min(s_l+lp, len(lines))
+                    bscript = "\n".join(lines[s_l:e_l])
 
-                status.markdown(f"### ✂️ Đợt {idx+1}/{len(valid_chunks)} — Lên kịch bản...")
-                scenes = make_scene_plan(client, batch_text, bstart, bdur, planner_model,
-                                         scene_min, scene_max, max_scenes, camera_mode,
+                stt.markdown(f"### ✂️ Đợt {idx+1}/{len(vc)} — Lên kịch bản ({style_mode})...")
+                scenes = make_scene_plan(client, btext, bstart, bdur, planner_model,
+                                         scene_min, scene_max, max_scenes, cm_mode,
                                          language=lang_code or "vi",
                                          enable_rich=enable_rich_overlay,
                                          char_lock=char_lock,
                                          enable_sfx=enable_sfx,
                                          enable_music=enable_music,
-                                         user_script=batch_script,
-                                         use_script_mode=internal_mode)
+                                         user_script=bscript,
+                                         use_script_mode=internal_mode,
+                                         style_mode=style_mode)
                 st.markdown(f"#### 📝 Đợt {idx+1}: {bdur:.1f}s → **{len(scenes)} cảnh**")
-                with st.expander("Chi tiết cảnh", expanded=False):
+                with st.expander("Chi tiết", expanded=False):
                     for si, s in enumerate(scenes, 1):
                         ci = f" | [{s.get('callout_type','').upper()}]: \"{s.get('callout_text','')}\"" if s.get('callout_text') else ""
                         st.caption(f"{si:02d}. {s['start']:.1f}s–{s['end']:.1f}s — {s['title']}{ci} | 🎥 {s.get('camera_motion','?')} | 🔊 {s.get('sfx','none')} | 🎵 {s.get('music_emotion','none')}")
 
-                batch_work = root / f"work_{idx+1:03d}"; batch_work.mkdir()
-                status.markdown(f"### 🎨 Đợt {idx+1}/{len(valid_chunks)} — Tạo ảnh + render...")
-                bv = render_batch(chunk, scenes, batch_work, hand_path, draw_style,
-                                  cf_account, cf_token, hf_token, freetheai_key, together_key,
-                                  nexa_key, agnes_key, pollinations_key, pollinations_model,
-                                  image_timeout, flux_steps, fair_share_enabled,
-                                  circuit_breaker_enabled, prioritize_fast,
-                                  chars={}, char_lock=char_lock,
-                                  enable_arrows=enable_arrows, enable_shadow=enable_shadow,
-                                  enable_sfx=enable_sfx, sfx_volume=sfx_volume,
-                                  enable_music=enable_music, music_volume=music_volume,
-                                  seed_lock=seed_lock)
-                saved = root / f"batch_final_{idx+1:03d}.mp4"
-                shutil.copy2(bv, saved); batch_videos.append(saved)
-                all_scenes += len(scenes)
-                shutil.rmtree(batch_work, ignore_errors=True)
+                bw = root / f"work_{idx+1:03d}"; bw.mkdir()
+                stt.markdown(f"### 🎨 Đợt {idx+1}/{len(vc)} — Tạo ảnh + render...")
+                bvi = render_batch(chunk, scenes, bw, hp, draw_style,
+                                   cf_account, cf_token, hf_token, freetheai_key, together_key,
+                                   nexa_key, agnes_key, pollinations_key, pollinations_model,
+                                   image_timeout, flux_steps, fair_share_enabled, circuit_breaker_enabled,
+                                   prioritize_fast, chars={}, char_lock=char_lock,
+                                   enable_arrows=enable_arrows, enable_shadow=enable_shadow,
+                                   enable_sfx=enable_sfx, sfx_vol=sfx_volume,
+                                   enable_music=enable_music, music_vol=music_volume,
+                                   seed_lock=seed_lock, style_mode=style_mode)
+                sv = root / f"batch_final_{idx+1:03d}.mp4"
+                shutil.copy2(bvi, sv); bvids.append(sv)
+                all_s += len(scenes)
+                shutil.rmtree(bw, ignore_errors=True)
 
-            status.markdown("### 🎬 Ghép video cuối...")
-            final = root / "video_hoan_thien_final.mp4"
-            concat_batches(batch_videos, final)
-            st.success(f"Hoàn thành! {all_scenes} cảnh.")
-            st.video(str(final))
-            st.download_button("⬇️ TẢI VIDEO", data=final.read_bytes(),
-                file_name="video_hoan_thien_final.mp4", mime="video/mp4",
-                use_container_width=True)
+            stt.markdown("### 🎬 Ghép video cuối...")
+            fv = root / "video_final.mp4"
+            concat_batches(bvids, fv)
+            st.success(f"Hoàn thành! {all_s} cảnh ({style_mode} mode).")
+            st.video(str(fv))
+            st.download_button("⬇️ TẢI VIDEO", data=fv.read_bytes(),
+                file_name="video_final.mp4", mime="video/mp4", use_container_width=True)
         except Exception as e:
             st.exception(e)
