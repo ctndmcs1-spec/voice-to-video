@@ -1,15 +1,14 @@
 """
-Xưởng Video Diễn Hoạt Kiến Thức AI — Bản Siêu Cấp V8
-=====================================================
-Tất cả tính năng:
-- Voice + Text combined analysis (AI dùng timestamp voice + nội dung text)
-- Nhạc nền procedural theo cảm xúc (không bản quyền, không cần file)
-- Sound effects tự động
-- Nhân vật đồng nhất (character lock + seed)
-- Song ngữ Việt/Anh
-- Overlay infographic nhiều text box + mũi tên
-- Provider đảo thứ tự + circuit breaker + fair share + parallel
-- Live Dashboard real-time
+Xưởng Video Diễn Hoạt Kiến Thức AI — Bản Siêu Cấp V8.1
+========================================================
+V8.1 FIX & NÂNG CẤP:
+- Font: tự tải Noto Sans Bold/Regular, fallback nhiều lớp → chữ đẹp không lỗi dấu
+- Smart Text Box Layout: 4 vùng riêng biệt, không đè chữ
+- Arrow: bounds check, không vẽ ra ngoài canvas
+- Text Shadow + Background: chữ dễ đọc trên mọi nền
+- Title Underline: gạch chân đỏ accent chuyên nghiệp
+- Callout: shadow nhẹ + viền dày hơn
+- Qwen prompt: giới hạn 2-3 text_boxes, tọa độ cố định 4 vùng
 """
 
 import os, re, io, json, math, time, base64, random, shutil, subprocess, tempfile, threading, wave
@@ -20,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor, wait
 
 import requests
 import streamlit as st
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from groq import Groq
 import cv2
 import numpy as np
@@ -28,7 +27,7 @@ import numpy as np
 # ============================================================
 # CẤU HÌNH
 # ============================================================
-APP_TITLE = "Xưởng Video Diễn Hoạt Kiến Thức AI (Bản Siêu Cấp V8)"
+APP_TITLE = "Xưởng Video Diễn Hoạt Kiến Thức AI (Bản Siêu Cấp V8.1)"
 BATCH_SECONDS = 5 * 60
 FPS = 24
 WIDTH = 1280
@@ -46,6 +45,7 @@ FAIL_SLEEP_SECONDS = 2.0
 SLOW_PROVIDER_THRESHOLD = 10.0
 SLOW_PROVIDER_PENALTY = 0.5
 SFX_SAMPLE_RATE = 22050
+FONT_DIR = Path.home() / ".fonts"
 
 AGNES_API_URL = "https://apihub.agnes-ai.com/v1/images/generations"
 AGNES_MODEL = "agnes-image-2.1-flash"
@@ -62,11 +62,10 @@ POLLINATIONS_BASE = "https://gen.pollinations.ai/image/"
 
 COLOR_MAP = {"red": "#d32f2f", "green": "#2e7d32", "blue": "#1565c0",
     "orange": "#ef6c00", "purple": "#6a1b9a", "black": "#212121",
-    "yellow": "#f9a825", "pink": "#c2185b"}
+    "yellow": "#f9a825", "pink": "#c2185b", "teal": "#00838f", "brown": "#5d4037"}
 SIZE_MAP = {"small": 22, "medium": 30, "large": 44, "huge": 58}
 VALID_SFX = {"none", "whoosh", "pop", "ding", "impact", "sad", "bell", "typing", "sparkle", "swoosh"}
 
-# --- Music ---
 NOTE_FREQ = {
     'C3':130.81,'D3':146.83,'E3':164.81,'F3':174.61,'G3':196.00,'A3':220.00,'B3':246.94,
     'C4':261.63,'D4':293.66,'E4':329.63,'F4':349.23,'G4':392.00,'A4':440.00,'B4':493.88,
@@ -88,8 +87,8 @@ VALID_EMOTIONS = set(EMOTION_CHORDS.keys()) | {"none"}
 # UI
 # ============================================================
 st.set_page_config(page_title=APP_TITLE, page_icon="🎬", layout="wide")
-st.title("🎬 Xưởng Video Diễn Hoạt Kiến Thức AI — Siêu Cấp V8")
-st.caption("Voice+Text combined + Nhạc nền theo cảm xúc + SFX + Nhân vật đồng nhất + Song ngữ")
+st.title("🎬 Xưởng Video Diễn Hoạt Kiến Thức AI — Siêu Cấp V8.1")
+st.caption("Font đẹp + Smart Layout + Voice+Text + Nhạc nền + SFX + Nhân vật đồng nhất")
 
 with st.sidebar:
     st.header("🔑 API Keys")
@@ -124,8 +123,7 @@ with st.sidebar:
     use_script_mode = st.radio(
         "Chế độ phân tích",
         ["Chỉ dùng voice", "Kết hợp voice + text", "Chỉ dùng text"],
-        index=0,
-        help="Kết hợp: timestamp từ voice + nội dung từ text = chia cảnh chuẩn nhất")
+        index=0)
 
     st.header("🌐 Ngôn ngữ")
     language_mode = st.selectbox("Ngôn ngữ video",
@@ -141,14 +139,12 @@ with st.sidebar:
         value="a young Vietnamese woman, long black hair tied in ponytail, wearing an orange hoodie",
         height=60)
     enable_char_lock = st.checkbox("🔒 Khóa ngoại hình nhân vật", value=True)
-    enable_seed_lock = st.checkbox("🎲 Cố định Seed (nhân vật giống hệt)", value=False,
-        help="Bật khi cần nhân vật giống hệt nhau. Chỉ hoạt động với Cloudflare/HF/Pollinations.")
+    enable_seed_lock = st.checkbox("🎲 Cố định Seed", value=False)
 
     st.header("🔊 Âm thanh")
     enable_sfx = st.checkbox("Bật sound effects", value=True)
     sfx_volume = st.slider("Âm lượng SFX (dB)", -30, 0, -12)
-    enable_music = st.checkbox("🎵 Bật nhạc nền theo cảm xúc", value=True,
-        help="Nhạc procedural không bản quyền, tự chọn theo cảm xúc từng cảnh")
+    enable_music = st.checkbox("🎵 Nhạc nền theo cảm xúc", value=True)
     music_volume = st.slider("Âm lượng nhạc nền (dB)", -35, -10, -22)
 
     st.header("🧠 Groq Model")
@@ -167,6 +163,7 @@ with st.sidebar:
     st.header("🎨 Overlay")
     enable_rich_overlay = st.checkbox("Overlay nhiều text box", value=True)
     enable_arrows = st.checkbox("Vẽ mũi tên", value=True)
+    enable_shadow = st.checkbox("Đổ bóng chữ", value=True)
 
     st.header("🎥 Camera")
     camera_motion_mode = st.selectbox("Camera motion", [
@@ -234,13 +231,36 @@ def extract_json(text):
 def groq_client(key):
     return Groq(api_key=key)
 
-def transcribe_file(client, path, model, language=None):
+def transcribe_file(client, path, model, language=None, cache_dir=None):
+    if cache_dir:
+        cache_file = Path(cache_dir) / f"{Path(path).stem}_transcript.json"
+        if cache_file.exists():
+            try:
+                data = json.loads(cache_file.read_text(encoding="utf-8"))
+                st.info(f"💾 Dùng cache: {cache_file.name}")
+                class CachedResult:
+                    def __init__(self, d): self._d = d
+                    def model_dump(self): return self._d
+                    def __getattr__(self, k): return self._d.get(k)
+                return CachedResult(data)
+            except Exception as e:
+                st.warning(f"Cache lỗi: {e}")
+
     with open(path, "rb") as f:
         kwargs = {"file": (Path(path).name, f.read()), "model": model,
                   "response_format": "verbose_json", "timestamp_granularities": ["segment"],
                   "temperature": 0.0}
         if language: kwargs["language"] = language
-        return client.audio.transcriptions.create(**kwargs)
+        result = client.audio.transcriptions.create(**kwargs)
+
+    if cache_dir:
+        try:
+            data = result.model_dump() if hasattr(result, "model_dump") else result
+            cache_file = Path(cache_dir) / f"{Path(path).stem}_transcript.json"
+            cache_file.write_text(json.dumps(data, ensure_ascii=False, default=str), encoding="utf-8")
+        except Exception as e:
+            st.warning(f"Không lưu được cache: {e}")
+    return result
 
 def detect_language_from_result(result):
     try:
@@ -278,9 +298,6 @@ def sanitize_prompt_text(prompt):
         prompt = re.sub(pattern, rep, prompt, flags=re.IGNORECASE)
     return prompt
 
-# ============================================================
-# CHARACTER
-# ============================================================
 def build_character_lock(main_name, main_desc, second_name, second_desc, enabled=True):
     if not enabled: return {}
     lock = {}
@@ -332,46 +349,87 @@ def split_trajectory_into_phases(trajectory, ratios=PHASE_RATIOS):
     return [trajectory[:b1], trajectory[b1:b2], trajectory[b2:]]
 
 # ============================================================
-# FONT
+# FONT — TỰ TẢI NOTO SANS
 # ============================================================
-@st.cache_resource(show_spinner=False)
-def _download_fallback_font():
-    cache_path = Path("/tmp/DejaVuSans-Bold.ttf")
-    if cache_path.exists(): return str(cache_path)
-    for url in [
-        "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans-Bold.ttf",
-        "https://cdn.jsdelivr.net/gh/dejavu-fonts/dejavu-fonts/ttf/DejaVuSans-Bold.ttf",
-    ]:
-        try:
-            r = requests.get(url, timeout=30)
-            if r.status_code == 200 and len(r.content) > 100000:
-                cache_path.write_bytes(r.content); return str(cache_path)
-        except Exception: continue
-    return None
+FONT_URLS = {
+    "NotoSans-Bold.ttf": [
+        "https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSans/NotoSans-Bold.ttf",
+        "https://cdn.jsdelivr.net/gh/googlefonts/noto-fonts@main/hinted/ttf/NotoSans/NotoSans-Bold.ttf",
+    ],
+    "NotoSans-Regular.ttf": [
+        "https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSans/NotoSans-Regular.ttf",
+        "https://cdn.jsdelivr.net/gh/googlefonts/noto-fonts@main/hinted/ttf/NotoSans/NotoSans-Regular.ttf",
+    ],
+}
 
-def font_for(size):
-    for p in [
-        os.path.expanduser("~/.fonts/NotoSans-Bold.ttf"),
+@st.cache_resource(show_spinner=False)
+def _ensure_fonts():
+    """Tải Noto Sans về ~/.fonts nếu chưa có."""
+    FONT_DIR.mkdir(parents=True, exist_ok=True)
+    for fname, urls in FONT_URLS.items():
+        target = FONT_DIR / fname
+        if target.exists() and target.stat().st_size > 50000:
+            continue
+        for url in urls:
+            try:
+                r = requests.get(url, timeout=30)
+                if r.status_code == 200 and len(r.content) > 50000:
+                    target.write_bytes(r.content)
+                    break
+            except Exception:
+                continue
+    # Fallback cache trong /tmp
+    tmp_cache = Path("/tmp/DejaVuSans-Bold.ttf")
+    if not tmp_cache.exists():
+        try:
+            r = requests.get("https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans-Bold.ttf", timeout=30)
+            if r.status_code == 200 and len(r.content) > 100000:
+                tmp_cache.write_bytes(r.content)
+        except Exception:
+            pass
+    return True
+
+def font_for(size, bold=True):
+    try: _ensure_fonts()
+    except Exception: pass
+
+    # Lớp 1: Noto Sans tự tải
+    noto = FONT_DIR / ("NotoSans-Bold.ttf" if bold else "NotoSans-Regular.ttf")
+    if noto.exists():
+        try: return ImageFont.truetype(str(noto), size)
+        except Exception: pass
+
+    # Lớp 2: Font hệ thống
+    candidates = [
         "/data/data/com.termux/files/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+        "/data/data/com.termux/files/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
         "C:/Windows/Fonts/arialbd.ttf",
-    ]:
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+    ]
+    for p in candidates:
         if os.path.exists(p):
             try: return ImageFont.truetype(p, size)
             except Exception: continue
-    for fb in ["arial.ttf", "DejaVuSans.ttf"]:
+
+    # Lớp 3: Pillow default names
+    for fb in ["arial.ttf", "DejaVuSans.ttf", "NotoSans-Bold.ttf"]:
         try: return ImageFont.truetype(fb, size)
         except Exception: continue
-    try:
-        cached = _download_fallback_font()
-        if cached: return ImageFont.truetype(cached, size)
-    except Exception: pass
+
+    # Lớp 4: /tmp cache
+    tmp_cache = Path("/tmp/DejaVuSans-Bold.ttf")
+    if tmp_cache.exists():
+        try: return ImageFont.truetype(str(tmp_cache), size)
+        except Exception: pass
+
+    # Lớp 5: Chịu thua
     return ImageFont.load_default()
 
 # ============================================================
-# SFX + MUSIC GENERATORS
+# SFX + MUSIC
 # ============================================================
 def generate_sfx_wav(sfx_type, duration=0.5, sample_rate=SFX_SAMPLE_RATE):
     t = np.linspace(0, duration, int(sample_rate * duration), False)
@@ -410,22 +468,18 @@ def write_wav(data, path, sample_rate=SFX_SAMPLE_RATE):
         w.writeframes(data_int.tobytes())
 
 def generate_music_track(emotion, duration, sample_rate=SFX_SAMPLE_RATE):
-    """Generate procedural ambient music for given emotion."""
     chords = EMOTION_CHORDS.get(emotion, EMOTION_CHORDS["neutral"])
     total_samples = int(duration * sample_rate)
     if total_samples <= 0: return np.zeros(0, dtype=np.float32)
     track = np.zeros(total_samples, dtype=np.float32)
-
     chord_dur = 2.5
     samples_per_chord = int(chord_dur * sample_rate)
     n_chords = max(1, int(np.ceil(duration / chord_dur)))
-
     t_env = np.linspace(0, 1, samples_per_chord)
     attack = np.minimum(t_env * 8, 1.0)
     decay = np.exp(-t_env * 1.2)
     release = np.minimum((1 - t_env) * 8, 1.0)
     envelope = (attack * decay * release * 0.6).astype(np.float32)
-
     for i in range(n_chords):
         chord = chords[i % len(chords)]
         start = i * samples_per_chord
@@ -441,13 +495,11 @@ def generate_music_track(emotion, duration, sample_rate=SFX_SAMPLE_RATE):
         wave /= len(chord)
         wave *= envelope[:length]
         track[start:end] += wave
-
     delay_samples = int(0.15 * sample_rate)
     reverb = np.zeros_like(track)
     for i in range(delay_samples, len(track)):
         reverb[i] = track[i] + 0.3 * reverb[i - delay_samples]
     track = track * 0.7 + reverb * 0.3
-
     max_val = np.max(np.abs(track))
     if max_val > 0: track = track / max_val * 0.4
     return track.astype(np.float32)
@@ -481,7 +533,6 @@ def build_music_track(scenes, output_path, sample_rate=SFX_SAMPLE_RATE, volume_d
     total_samples = int(total_duration * sample_rate)
     full_track = np.zeros(total_samples, dtype=np.float32)
     cache = {}; has_any = False
-
     for s in scenes:
         emotion = s.get("music_emotion", "neutral")
         if emotion not in VALID_EMOTIONS or emotion == "none": continue
@@ -501,15 +552,12 @@ def build_music_track(scenes, output_path, sample_rate=SFX_SAMPLE_RATE, volume_d
         env = np.minimum(fade_in, fade_out).astype(np.float32)
         full_track[s_start:s_end] += music[:length] * env
         has_any = True
-
-    if not has_any or np.max(np.abs(full_track)) == 0:
-        return None
+    if not has_any or np.max(np.abs(full_track)) == 0: return None
     full_track *= 10 ** (volume_db / 20.0)
     write_wav(full_track, output_path, sample_rate)
     return output_path
 
 def mix_audio_tracks(voice_path, sfx_path, music_path, output_path):
-    """Mix voice + sfx + music."""
     inputs = ["-i", str(voice_path)]
     filters = ["[0:a]"]
     n = 1
@@ -517,17 +565,15 @@ def mix_audio_tracks(voice_path, sfx_path, music_path, output_path):
         inputs += ["-i", str(sfx_path)]; filters.append(f"[{n}:a]"); n += 1
     if music_path and Path(music_path).exists():
         inputs += ["-i", str(music_path)]; filters.append(f"[{n}:a]"); n += 1
-
     if n == 1:
         shutil.copy2(voice_path, output_path); return output_path
-
     mix = "".join(filters) + f"amix=inputs={n}:duration=first:dropout_transition=2[aout]"
     run_cmd(["ffmpeg", "-y"] + inputs + ["-filter_complex", mix, "-map", "[aout]",
              "-c:a", "aac", "-b:a", "128k", str(output_path)], timeout=600)
     return output_path
 
 # ============================================================
-# SCENE PLANNER (with script + emotion)
+# SCENE PLANNER
 # ============================================================
 def make_scene_plan(client, transcript_text, batch_start, batch_duration, model,
                     min_s, max_s, max_scenes, camera_mode="auto",
@@ -541,69 +587,62 @@ def make_scene_plan(client, transcript_text, batch_start, batch_duration, model,
     char_note = ""
     if char_lock:
         char_lines = [f"  - {name}: {desc}" for name, desc in char_lock.items()]
-        char_note = "DANH SÁCH NHÂN VẬT CỐ ĐỊNH (mọi cảnh có nhân vật đều phải mô tả y hệt):\n" + "\n".join(char_lines) + "\n"
+        char_note = "DANH SÁCH NHÂN VẬT CỐ ĐỊNH:\n" + "\n".join(char_lines) + "\n"
 
     rich_note = ""
     if enable_rich:
         rich_note = """
-QUY TẮC OVERLAY ("text_boxes"): Tạo 2-4 text_boxes chú thích infographic:
-{"text":"...","x":0.15,"y":0.20,"color":"red","size":"large","style":"outlined","arrow":null}
-- x,y tương đối 0.0-1.0, color: red/green/blue/orange/purple/black/yellow/pink
-- size: small/medium/large, style: plain/outlined/highlighted
-- arrow: null hoặc {"to_x":0.5,"to_y":0.6}
-- KHÔNG đè khuôn mặt nhân vật (tránh x 0.35-0.65, y 0.3-0.7)
-""" if enable_rich else ""
+QUY TẮC OVERLAY INFOGRAPHIC ("text_boxes"):
+Ngoài "title" và "callout", tạo ĐÚNG 2-3 "text_boxes" (KHÔNG nhiều hơn).
+Vị trí PHẢI ở 1 trong 4 vùng sau, cách xa nhau tối thiểu 0.3 đơn vị:
+- Vùng A (góc trên trái): x=0.10, y=0.25
+- Vùng B (góc trên phải): x=0.75, y=0.25  
+- Vùng C (góc dưới trái): x=0.15, y=0.80
+- Vùng D (góc dưới phải): x=0.75, y=0.80
+TUYỆT ĐỐI KHÔNG đặt y < 0.20 (đè title) hoặc x 0.3-0.7 & y 0.3-0.7 (đè nhân vật).
+Format: {"text":"...","x":0.15,"y":0.25,"color":"red","size":"large","style":"outlined","arrow":null}
+- color: red/green/blue/orange/purple/black/yellow/pink
+- size: small/medium/large
+- style: plain/outlined/highlighted
+- arrow: null hoặc {"to_x":0.5,"to_y":0.6} (chỉ 1-2 boxes có arrow, KHÔNG tất cả)
+"""
 
     sfx_note = ""
     if enable_sfx:
         sfx_note = """
-QUY TẮC SFX ("sfx"): Chọn 1 hiệu ứng phù hợp:
-- "whoosh": chuyển cảnh | "pop": bong bóng | "ding": phát hiện
-- "impact": gay cấn | "sad": buồn | "bell": quan trọng
-- "typing": gõ phím | "sparkle": kỳ diệu | "swoosh": trượt
-- "none": không cần SFX
-LUÂN PHIÊN, tránh lặp liên tiếp.
+QUY TẮC SFX ("sfx"): Chọn 1: whoosh/pop/ding/impact/sad/bell/typing/sparkle/swoosh/none. LUÂN PHIÊN.
 """ if enable_sfx else ""
 
     music_note = ""
     if enable_music:
         music_note = """
-QUY TẮC NHẠC NỀN ("music_emotion"): Chọn 1 cảm xúc cho nhạc nền của cảnh:
-- "happy": vui vẻ, tích cực | "sad": buồn, thất vọng
-- "epic": hào hùng, mạnh mẽ | "calm": bình yên, nhẹ nhàng
-- "tense": căng thẳng, hồi hộp | "inspirational": truyền cảm hứng
-- "neutral": trung tính | "none": không nhạc
-LUÂN PHIÊN theo nội dung. Tránh lặp cùng 1 cảm xúc cho nhiều cảnh liên tiếp.
-""" if enable_music else ""
+QUY TẮC NHẠC NỀN ("music_emotion"): Chọn 1: happy/sad/epic/calm/tense/inspirational/neutral/none. LUÂN PHIÊN.
+"""
 
     system = f"""
 Bạn là giám đốc sáng tạo kịch bản cho kênh hoạt họa kiến thức phong cách "Kiến Thức Thú Vị".
-NGÔN NGỮ OUTPUT: {lang_name}. TẤT CẢ title, callout_text, text_boxes phải viết bằng {lang_name}.
+NGÔN NGỮ OUTPUT: {lang_name}.
 Nhiệm vụ: Chia đoạn âm thanh {batch_duration:.0f}s thành khoảng {expected_scenes} cảnh lớn ({min_s}-{max_s}s/cảnh).
 
 {char_note}
-QUY TẮC VỀ TIÊU ĐỀ ("title"):
-- {"English: natural, 3-6 words, UPPERCASE" if is_english else "Tiếng Việt tự nhiên, 3-6 từ, VIẾT HOA"}
+QUY TẮC TIÊU ĐỀ ("title"):
+- {"English: 3-6 words, UPPERCASE" if is_english else "Tiếng Việt tự nhiên, 3-6 từ, VIẾT HOA"}
 
-QUY TẮC VỀ CHỮ TRÊN TRANH ("callout_type", "callout_text"):
-- "speech": bong bóng thoại. "thought": đám mây suy nghĩ. "sticker": nhãn dán. "none": không chữ.
+QUY TẮC CHỮ TRÊN TRANH ("callout_type", "callout_text"):
+- "speech": bong bóng thoại. "thought": đám mây. "sticker": nhãn dán. "none": không chữ.
 - LUÂN PHIÊN.
 
-QUY TẮC QUAN TRỌNG NHẤT — MÔ TẢ TRANH ("visual_prompt") PHẢI SÁNG TẠO:
-MỖI CẢNH LÀ MỘT "SÂN KHẤU" KHÁC NHAU. TUYỆT ĐỐI KHÔNG lặp bố cục.
+QUY TẮC QUAN TRỌNG NHẤT — "visual_prompt" PHẢI SÁNG TẠO:
+MỖI CẢNH LÀ MỘT "SÂN KHẤU" KHÁC NHAU. KHÔNG lặp bố cục.
 Bao gồm: nhân vật + tư thế, hành động, bối cảnh, đồ vật ẩn dụ, cảm xúc, màu nhấn.
-VÍ DỤ TỐT: "2D comic doodle: a young man standing at the edge of a cliff at sunset, red sunset, blue waves, white background, bold black outlines, no text"
-VÍ DỤ XẤU: "a man sitting at a desk with papers on the left"
 
-QUY TẮC NHÂN VẬT: Ghi rõ "male character"/"female character". KHÔNG dùng "two friends" chung chung.
+QUY TẮC NHÂN VẬT: Ghi rõ "male character"/"female character". KHÔNG dùng "two friends".
 
-RÀNG BUỘC PHONG CÁCH: 2D comic doodle, nét mực đen dày, nền TRẮNG TINH, KHÔNG chữ/số trong ảnh AI vẽ (tool sẽ overlay chữ sau).
+RÀNG BUỘC: 2D comic doodle, nét mực đen dày, nền TRẮNG TINH, KHÔNG chữ/số trong ảnh AI vẽ.
 {rich_note}
 {sfx_note}
 {music_note}
-QUY TẮC CAMERA ("camera_motion"): Chọn 1 trong: "zoom_in_center", "zoom_out_center",
-"pan_left_to_right", "pan_right_to_left", "zoom_in_top_left", "zoom_in_bottom_right",
-"ken_burns_slow", "static". LUÂN PHIÊN.
+QUY TẮC CAMERA ("camera_motion"): Chọn 1: zoom_in_center/zoom_out_center/pan_left_to_right/pan_right_to_left/zoom_in_top_left/zoom_in_bottom_right/ken_burns_slow/static. LUÂN PHIÊN.
 
 JSON FORMAT:
 {{
@@ -616,35 +655,36 @@ JSON FORMAT:
       "sfx": "sparkle",
       "music_emotion": "inspirational",
       "visual_prompt": "2D comic doodle: ...",
-      "text_boxes": [{{"text":"...","x":0.2,"y":0.15,"color":"red","size":"large","style":"outlined","arrow":null}}]
+      "text_boxes": [{{"text":"...","x":0.15,"y":0.25,"color":"red","size":"large","style":"outlined","arrow":null}}]
     }}
   ]
 }}
 """
 
-    # User prompt with combined mode
     if use_script_mode == "combined" and user_script.strip():
-        user = (f"Audio length: {batch_duration:.2f}s.\n"
-                f"MAX {expected_scenes} SCENES ({min_s}-{max_s}s each).\n\n"
-                f"USER SCRIPT (accurate content, use THIS for scene meaning):\n{user_script}\n\n"
-                f"WHISPER TRANSCRIPT (accurate timing, use THIS for timestamps):\n{transcript_text}\n\n"
-                f"CRITICAL: Match script sentences to whisper timestamps by semantic similarity. "
-                f"Scene start/end MUST align with actual audio timing from whisper. "
-                f"If whisper has STT errors, ignore them and use script content.")
+        user = (f"Audio length: {batch_duration:.2f}s.\nMAX {expected_scenes} SCENES ({min_s}-{max_s}s each).\n\n"
+                f"USER SCRIPT (accurate content):\n{user_script}\n\n"
+                f"WHISPER TRANSCRIPT (accurate timing):\n{transcript_text}\n\n"
+                f"CRITICAL: Match script to whisper timestamps. Scene start/end MUST align with whisper timing.")
     elif use_script_mode == "text_only" and user_script.strip():
-        user = (f"Audio length: {batch_duration:.2f}s.\n"
-                f"MAX {expected_scenes} SCENES ({min_s}-{max_s}s each).\n\n"
-                f"SCRIPT:\n{user_script}\n\n"
-                f"Divide script into scenes by semantic meaning. Distribute {batch_duration:.2f}s evenly.")
+        user = (f"Audio length: {batch_duration:.2f}s.\nMAX {expected_scenes} SCENES.\n\n"
+                f"SCRIPT:\n{user_script}\n\nDivide evenly.")
     else:
-        user = (f"Audio length: {batch_duration:.2f}s.\n"
-                f"MAX {expected_scenes} SCENES ({min_s}-{max_s}s each).\n\n"
+        user = (f"Audio length: {batch_duration:.2f}s.\nMAX {expected_scenes} SCENES.\n\n"
                 f"TRANSCRIPT:\n{transcript_text}")
+
+    # Dynamic max_tokens
+    MODEL_TOKEN_CAP = {
+        "qwen/qwen3.8-27b": 16000,
+        "openai/gpt-oss-120b": 12000,
+        "openai/gpt-oss-20b": 8000,
+    }
+    dynamic_max = min(MODEL_TOKEN_CAP.get(model, 12000), max(4000, int(expected_scenes * 500 * 1.3)))
 
     raw_response = ""
     try:
         r = client.chat.completions.create(
-            model=model, temperature=0.15, max_tokens=16000,
+            model=model, temperature=0.15, max_tokens=dynamic_max,
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}])
         raw_response = r.choices[0].message.content or ""
         obj = extract_json(raw_response)
@@ -653,19 +693,18 @@ JSON FORMAT:
             st.warning(f"⚠️ Qwen trả JSON nhưng không có scenes. Preview: {raw_response[:200]}")
     except Exception as e:
         st.error(f"❌ Qwen/Parse fail: {str(e)[:200]}")
-        if raw_response:
-            st.code(raw_response[:1000], language="text")
+        if raw_response: st.code(raw_response[:1000], language="text")
         raw_scenes = []
 
     valid_motions = {"zoom_in_center", "zoom_out_center", "pan_left_to_right", "pan_right_to_left",
                      "zoom_in_top_left", "zoom_in_bottom_right", "ken_burns_slow", "static"}
-    valid_colors = {"red", "green", "blue", "orange", "purple", "black", "yellow", "pink"}
+    valid_colors = set(COLOR_MAP.keys())
     valid_sizes = {"small", "medium", "large", "huge"}
     valid_styles = {"plain", "outlined", "highlighted"}
 
     def clean_text_boxes(tbs):
         out = []
-        for tb in (tbs or [])[:6]:
+        for tb in (tbs or [])[:4]:
             try:
                 text = str(tb.get("text", "")).strip()
                 if not text or len(text) > 40: continue
@@ -726,12 +765,7 @@ JSON FORMAT:
             "2D comic doodle: a person holding a glowing light bulb above head, idea concept, yellow sparkles, white background, no text",
             "2D comic doodle: a person climbing a mountain, determination, red flag at peak, white background, no text",
             "2D comic doodle: a person trapped inside a giant hourglass, sand falling, blue accents, white background, no text",
-            "2D comic doodle: a person looking at their reflection in a cracked mirror, red accents, white background, no text",
-            "2D comic doodle: a person planting a small tree, growth concept, green accents, white background, no text",
-            "2D comic doodle: a person surrounded by floating books, learning concept, blue accents, white background, no text",
-            "2D comic doodle: a person opening a mysterious door with light coming through, orange glow, white background, no text",
         ]
-        emotions_pool = ["neutral", "calm", "inspirational", "tense", "epic"]
         clean = []
         for i in range(n_fb):
             clean.append({
@@ -740,13 +774,12 @@ JSON FORMAT:
                 "callout_type": "none", "callout_text": "", "callout_side": "right",
                 "camera_motion": random.choice(list(valid_motions - {"static"})),
                 "sfx": random.choice(["whoosh", "pop", "ding", "sparkle", "swoosh"]),
-                "music_emotion": random.choice(emotions_pool),
+                "music_emotion": random.choice(["neutral", "calm", "inspirational"]),
                 "visual_prompt": fb_prompts[i % len(fb_prompts)],
                 "text_boxes": [],
             })
         st.error(f"❌ Qwen fail — dùng {n_fb} fallback scenes (~{scene_dur:.0f}s/cảnh)")
 
-    # Merge short scenes
     merged = []
     for s in clean:
         if not merged: merged.append(s)
@@ -969,95 +1002,201 @@ def save_image_from_bytes(data, output_path):
         raise RuntimeError(f"Ảnh không hợp lệ: {e}")
 
 # ============================================================
-# OVERLAY
+# OVERLAY — V8.1 NÂNG CẤP
 # ============================================================
-def draw_arrow(draw, start_xy, end_xy, color_hex, width=4):
+def draw_arrow(draw, start_xy, end_xy, color_hex, width=5):
+    """Vẽ mũi tên với đầu to rõ nét."""
     draw.line([start_xy, end_xy], fill=color_hex, width=width)
     angle = math.atan2(end_xy[1] - start_xy[1], end_xy[0] - start_xy[0])
-    arrow_len = 16; arrow_angle = math.pi / 6
+    arrow_len = 20; arrow_angle = math.pi / 5
     p1 = (end_xy[0] - arrow_len * math.cos(angle - arrow_angle),
           end_xy[1] - arrow_len * math.sin(angle - arrow_angle))
     p2 = (end_xy[0] - arrow_len * math.cos(angle + arrow_angle),
           end_xy[1] - arrow_len * math.sin(angle + arrow_angle))
     draw.polygon([end_xy, p1, p2], fill=color_hex)
 
-def draw_rich_text_box(img, draw, tb):
+def draw_text_with_shadow(draw, xy, text, font, fill, stroke_width=0, stroke_fill=None, shadow=True):
+    """Vẽ text có shadow nhẹ để dễ đọc."""
+    x, y = xy
+    if shadow:
+        # Shadow đen mờ phía sau
+        draw.text((x + 2, y + 2), text, font=font, fill=(0, 0, 0, 80))
+    if stroke_width > 0 and stroke_fill:
+        draw.text((x, y), text, font=font, fill=fill, stroke_width=stroke_width, stroke_fill=stroke_fill)
+    else:
+        draw.text((x, y), text, font=font, fill=fill)
+
+def draw_rich_text_box(img, draw, tb, enable_shadow=True):
+    """Vẽ text box chuyên nghiệp với background + shadow."""
     try:
         x = int(tb["x"] * WIDTH); y = int(tb["y"] * HEIGHT)
         text = tb["text"]; color = COLOR_MAP.get(tb["color"], "#212121")
         f_size = SIZE_MAP.get(tb["size"], 30); style = tb["style"]
-        f = font_for(f_size)
+        f = font_for(f_size, bold=True)
         bbox = draw.textbbox((0, 0), text, font=f)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+
         if style == "highlighted":
-            pad_x, pad_y = 14, 8
+            # Box nền màu đậm, chữ trắng
+            pad_x, pad_y = 16, 10
             rect = [x - pad_x, y - pad_y, x + tw + pad_x, y + th + pad_y + 6]
+            if enable_shadow:
+                draw.rounded_rectangle([rect[0]+3, rect[1]+3, rect[2]+3, rect[3]+3],
+                                       radius=10, fill=(0,0,0,60))
             draw.rounded_rectangle(rect, radius=10, fill=color, outline="white", width=3)
             draw.text((x, y), text, fill="white", font=f)
+
         elif style == "outlined":
-            draw.text((x, y), text, fill=color, font=f, stroke_width=2, stroke_fill="white")
-        else:
+            # Chữ có viền trắng dày
+            draw_text_with_shadow(draw, (x, y), text, f, fill=color,
+                                   stroke_width=3, stroke_fill="white", shadow=enable_shadow)
+
+        else:  # plain
+            # Chữ có background trắng mờ
+            pad_x, pad_y = 10, 6
+            rect = [x - pad_x, y - pad_y, x + tw + pad_x, y + th + pad_y + 4]
+            bg = Image.new("RGBA", (rect[2]-rect[0], rect[3]-rect[1]), (255,255,255,200))
+            img.paste(bg, (rect[0], rect[1]), bg)
             draw.text((x, y), text, fill=color, font=f)
-    except Exception: pass
+    except Exception:
+        pass
+
+def smart_filter_text_boxes(text_boxes, callout_text, callout_type, callout_side):
+    """Lọc text_boxes để không đè title, không đè nhân vật, không đè callout, không đè nhau."""
+    filtered = []
+    min_dist = 0.20  # khoảng cách tối thiểu giữa các box
+    for tb in text_boxes:
+        x, y = tb["x"], tb["y"]
+        # Loại bỏ nếu đè title band (y < 0.20)
+        if y < 0.20:
+            continue
+        # Loại bỏ nếu đè mặt nhân vật (vùng giữa)
+        if 0.30 < x < 0.70 and 0.35 < y < 0.70:
+            continue
+        # Loại bỏ nếu đè callout speech bubble
+        if callout_text and callout_type != "none":
+            if callout_side == "left":
+                if x < 0.45 and 0.35 < y < 0.55:
+                    continue
+            else:
+                if x > 0.55 and 0.35 < y < 0.55:
+                    continue
+        # Loại bỏ nếu quá gần box khác
+        too_close = False
+        for ex in filtered:
+            if abs(ex["x"] - x) < min_dist and abs(ex["y"] - y) < min_dist:
+                too_close = True; break
+        if not too_close:
+            filtered.append(tb)
+        if len(filtered) >= 3:  # tối đa 3 box
+            break
+    return filtered
 
 def add_comic_overlays(image_path, title, callout_type, callout_text, callout_side,
-                        output_path, text_boxes=None, enable_arrows=True):
+                        output_path, text_boxes=None, enable_arrows=True,
+                        enable_shadow=True):
     img = Image.open(image_path).convert("RGB").resize((WIDTH, HEIGHT))
     draw = ImageDraw.Draw(img)
+
+    # --- 1. TITLE ---
     if title:
         draw.rectangle([0, 0, WIDTH, TITLE_BAND_H], fill="white")
-        f_size = 36; f_title = font_for(f_size)
-        while f_size > 18:
+        f_size = 38
+        f_title = font_for(f_size, bold=True)
+        while f_size > 20:
             box = draw.textbbox((0, 0), title, font=f_title)
-            if box[2] - box[0] <= 850: break
-            f_size -= 2; f_title = font_for(f_size)
+            if box[2] - box[0] <= 900:
+                break
+            f_size -= 2
+            f_title = font_for(f_size, bold=True)
         box = draw.textbbox((0, 0), title, font=f_title)
         tw = box[2] - box[0]
-        draw.text(((WIDTH - tw) / 2, 26), title, fill="black", font=f_title)
+        # Vẽ title với gạch chân đỏ accent
+        draw.text(((WIDTH - tw) / 2, 22), title, fill="#111111", font=f_title)
+        # Gạch chân
+        underline_y = 22 + (box[3] - box[1]) + 8
+        draw.line([(WIDTH/2 - tw/2, underline_y), (WIDTH/2 + tw/2, underline_y)],
+                  fill="#d32f2f", width=4)
 
+    # --- 2. CALLOUT ---
     if callout_text and callout_type != "none":
-        f_text = font_for(25)
+        f_text = font_for(26, bold=True)
         bb = draw.textbbox((0, 0), callout_text, font=f_text)
         bw, bh = bb[2] - bb[0], bb[3] - bb[1]
         cx, cy = (int(WIDTH * 0.28), int(HEIGHT * 0.45)) if callout_side == "left" else (int(WIDTH * 0.74), int(HEIGHT * 0.42))
+
         if callout_type == "speech":
-            pad_x, pad_y = 18, 12
+            pad_x, pad_y = 20, 14
             rect = [cx - bw // 2 - pad_x, cy - bh // 2 - pad_y, cx + bw // 2 + pad_x, cy + bh // 2 + pad_y]
-            draw.rounded_rectangle(rect, radius=14, fill="white", outline="black", width=4)
-            tail_tip = (cx - 20, cy + bh // 2 + pad_y + 18)
-            draw.polygon([(cx - 32, cy + bh // 2 + pad_y - 2), (cx - 8, cy + bh // 2 + pad_y - 2), tail_tip],
+            # Shadow cho bubble
+            if enable_shadow:
+                draw.rounded_rectangle([rect[0]+4, rect[1]+4, rect[2]+4, rect[3]+4],
+                                       radius=16, fill=(0,0,0,50))
+            draw.rounded_rectangle(rect, radius=16, fill="white", outline="black", width=4)
+            tail_tip = (cx - 20, cy + bh // 2 + pad_y + 22)
+            draw.polygon([(cx - 34, cy + bh // 2 + pad_y - 2), (cx - 8, cy + bh // 2 + pad_y - 2), tail_tip],
                          fill="white", outline="black")
-            draw.line([(cx - 30, cy + bh // 2 + pad_y), (cx - 10, cy + bh // 2 + pad_y)], fill="white", width=5)
+            draw.line([(cx - 32, cy + bh // 2 + pad_y), (cx - 10, cy + bh // 2 + pad_y)], fill="white", width=5)
             draw.text((cx - bw // 2, cy - bh // 2 - 2), callout_text, fill="#1b5e20", font=f_text)
         elif callout_type == "thought":
-            pad_x, pad_y = 22, 14
+            pad_x, pad_y = 24, 16
             rect = [cx - bw // 2 - pad_x, cy - bh // 2 - pad_y, cx + bw // 2 + pad_x, cy + bh // 2 + pad_y]
-            draw.rounded_rectangle(rect, radius=24, fill="white", outline="black", width=3)
-            draw.ellipse([cx - 20, cy + bh // 2 + pad_y + 4, cx - 10, cy + bh // 2 + pad_y + 14], fill="white", outline="black", width=3)
-            draw.ellipse([cx - 28, cy + bh // 2 + pad_y + 17, cx - 22, cy + bh // 2 + pad_y + 23], fill="white", outline="black", width=2)
+            if enable_shadow:
+                draw.rounded_rectangle([rect[0]+4, rect[1]+4, rect[2]+4, rect[3]+4],
+                                       radius=26, fill=(0,0,0,50))
+            draw.rounded_rectangle(rect, radius=26, fill="white", outline="black", width=3)
+            draw.ellipse([cx - 22, cy + bh // 2 + pad_y + 6, cx - 12, cy + bh // 2 + pad_y + 16], fill="white", outline="black", width=3)
+            draw.ellipse([cx - 30, cy + bh // 2 + pad_y + 19, cx - 24, cy + bh // 2 + pad_y + 25], fill="white", outline="black", width=2)
+            draw.ellipse([cx - 36, cy + bh // 2 + pad_y + 28, cx - 32, cy + bh // 2 + pad_y + 32], fill="white", outline="black", width=2)
             draw.text((cx - bw // 2, cy - bh // 2 - 2), callout_text, fill="#0d47a1", font=f_text)
-        else:
-            pad_x, pad_y = 16, 9
+        else:  # sticker
+            pad_x, pad_y = 18, 11
             bx, by = int(WIDTH * 0.75), int(HEIGHT * 0.88)
             b_rect = [bx - bw // 2 - pad_x, by - bh // 2 - pad_y, bx + bw // 2 + pad_x, by + bh // 2 + pad_y]
-            draw.rounded_rectangle(b_rect, radius=8, fill="white", outline="#b71c1c", width=4)
+            if enable_shadow:
+                draw.rounded_rectangle([b_rect[0]+3, b_rect[1]+3, b_rect[2]+3, b_rect[3]+3],
+                                       radius=10, fill=(0,0,0,60))
+            draw.rounded_rectangle(b_rect, radius=10, fill="white", outline="#b71c1c", width=4)
             draw.text((bx - bw // 2, by - bh // 2 - 2), callout_text, fill="#b71c1c", font=f_text)
 
+    # --- 3. RICH TEXT BOXES (V8.1: smart filter + arrow bounds) ---
     if text_boxes:
+        filtered = smart_filter_text_boxes(text_boxes, callout_text, callout_type, callout_side)
+
+        # Vẽ arrows trước (dưới text boxes)
         if enable_arrows:
-            for tb in text_boxes:
+            for tb in filtered:
                 arrow = tb.get("arrow")
-                if arrow:
-                    sx = int(tb["x"] * WIDTH) + 40; sy = int(tb["y"] * HEIGHT) + 20
-                    ex = int(arrow["to_x"] * WIDTH); ey = int(arrow["to_y"] * HEIGHT)
+                if not arrow:
+                    continue
+                try:
+                    f = font_for(SIZE_MAP.get(tb["size"], 30), bold=True)
+                    bbox = draw.textbbox((0, 0), tb["text"], font=f)
+                    tw = bbox[2] - bbox[0]
+                    th = bbox[3] - bbox[1]
+                    sx = int(tb["x"] * WIDTH) + tw // 2
+                    sy = int(tb["y"] * HEIGHT) + th // 2
+                    ex = int(arrow["to_x"] * WIDTH)
+                    ey = int(arrow["to_y"] * HEIGHT)
+                    # Bỏ nếu điểm đến quá gần
+                    if abs(ex - sx) < 50 and abs(ey - sy) < 50:
+                        continue
+                    # Bỏ nếu điểm đến ngoài vùng an toàn
+                    if ex < 60 or ex > WIDTH - 60 or ey < 150 or ey > HEIGHT - 60:
+                        continue
                     color_hex = COLOR_MAP.get(tb["color"], "#212121")
-                    try: draw_arrow(draw, (sx, sy), (ex, ey), color_hex, width=4)
-                    except Exception: pass
-        for tb in text_boxes: draw_rich_text_box(img, draw, tb)
+                    draw_arrow(draw, (sx, sy), (ex, ey), color_hex, width=5)
+                except Exception:
+                    pass
+
+        # Vẽ text boxes
+        for tb in filtered:
+            draw_rich_text_box(img, draw, tb, enable_shadow)
+
     img.save(output_path, quality=95)
 
 # ============================================================
-# HAND ASSET
+# HAND ASSET + TRAJECTORY
 # ============================================================
 def generate_fallback_hand():
     S = 320
@@ -1394,7 +1533,8 @@ def render_scene_classic_hand(image_path, duration, output_path, hand_path, moti
 def create_placeholder_image(output_path, title):
     img = Image.new("RGB", (WIDTH, HEIGHT), "white")
     draw = ImageDraw.Draw(img)
-    f = font_for(48); text = "ẢNH KHÔNG TẠO ĐƯỢC"
+    f = font_for(48)
+    text = "ẢNH KHÔNG TẠO ĐƯỢC"
     box = draw.textbbox((0, 0), text, font=f)
     tw, th = box[2] - box[0], box[3] - box[1]
     draw.text(((WIDTH - tw) / 2, (HEIGHT - th) / 2), text, fill="#cccccc", font=f)
@@ -1406,7 +1546,7 @@ def create_placeholder_image(output_path, title):
 def parallel_generate_images(scenes, batch_dir, providers, image_timeout,
                               progress_state, flux_steps=4, fair_share_enabled=True,
                               circuit_breaker_enabled=True, prioritize_fast=True,
-                              enable_arrows=True):
+                              enable_arrows=True, enable_shadow=True):
     if not providers: raise RuntimeError("Không có provider nào.")
     total_scenes = len(scenes)
     if fair_share_enabled:
@@ -1453,7 +1593,7 @@ def parallel_generate_images(scenes, batch_dir, providers, image_timeout,
                 create_placeholder_image(img, scene["title"])
                 add_comic_overlays(img, scene["title"], scene.get("callout_type", "speech"),
                                    scene.get("callout_text", ""), scene.get("callout_side", "right"),
-                                   img, scene.get("text_boxes", []), enable_arrows)
+                                   img, scene.get("text_boxes", []), enable_arrows, enable_shadow)
                 with results_lock:
                     results[idx] = "placeholder"; progress_state["done"] += 1
                     progress_state["scene_status"][idx] = {"status": "placeholder",
@@ -1472,7 +1612,7 @@ def parallel_generate_images(scenes, batch_dir, providers, image_timeout,
                 save_image_from_bytes(data, img_raw)
                 add_comic_overlays(img_raw, scene["title"], scene.get("callout_type", "speech"),
                                    scene.get("callout_text", ""), scene.get("callout_side", "right"),
-                                   img, scene.get("text_boxes", []), enable_arrows)
+                                   img, scene.get("text_boxes", []), enable_arrows, enable_shadow)
                 elapsed = time.time() - t_start
                 my_count += 1; local_ok += 1; local_time += elapsed; consecutive_fails = 0
                 with results_lock:
@@ -1502,7 +1642,7 @@ def parallel_generate_images(scenes, batch_dir, providers, image_timeout,
                     create_placeholder_image(img, scene["title"])
                     add_comic_overlays(img, scene["title"], scene.get("callout_type", "speech"),
                                        scene.get("callout_text", ""), scene.get("callout_side", "right"),
-                                       img, scene.get("text_boxes", []), enable_arrows)
+                                       img, scene.get("text_boxes", []), enable_arrows, enable_shadow)
                     with results_lock:
                         results[idx] = "placeholder"; progress_state["done"] += 1
                         progress_state["scene_status"][idx] = {"status": "placeholder",
@@ -1530,7 +1670,7 @@ def parallel_generate_images(scenes, batch_dir, providers, image_timeout,
                         save_image_from_bytes(data, img_raw)
                         add_comic_overlays(img_raw, scene["title"], scene.get("callout_type", "speech"),
                                            scene.get("callout_text", ""), scene.get("callout_side", "right"),
-                                           img, scene.get("text_boxes", []), enable_arrows)
+                                           img, scene.get("text_boxes", []), enable_arrows, enable_shadow)
                         with results_lock:
                             results[idx] = cfg["name"]
                             provider_stats[cfg["name"]]["ok"] += 1
@@ -1544,7 +1684,7 @@ def parallel_generate_images(scenes, batch_dir, providers, image_timeout,
                 create_placeholder_image(img, scene["title"])
                 add_comic_overlays(img, scene["title"], scene.get("callout_type", "speech"),
                                    scene.get("callout_text", ""), scene.get("callout_side", "right"),
-                                   img, scene.get("text_boxes", []), enable_arrows)
+                                   img, scene.get("text_boxes", []), enable_arrows, enable_shadow)
                 with results_lock:
                     results[idx] = "placeholder"; progress_state["done"] += 1
                     progress_state["scene_status"][idx] = {"status": "placeholder",
@@ -1561,7 +1701,7 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
                  nexa_key, agnes_key, pollinations_key, pollinations_model,
                  image_timeout, flux_steps=4, fair_share_enabled=True,
                  circuit_breaker_enabled=True, prioritize_fast=True,
-                 chars=None, char_lock=None, enable_arrows=True,
+                 chars=None, char_lock=None, enable_arrows=True, enable_shadow=True,
                  enable_sfx=True, sfx_volume=-12,
                  enable_music=True, music_volume=-22, seed_lock=None):
     total = len(scenes)
@@ -1584,7 +1724,7 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
     if enable_music:
         music_count = sum(1 for s in scenes if s.get("music_emotion", "none") != "none")
         emotions = Counter(s.get("music_emotion", "neutral") for s in scenes if s.get("music_emotion") != "none")
-        st.info(f"🎵 Nhạc nền: {music_count}/{total} cảnh — {dict(emotions)}")
+        st.info(f"🎵 Nhạc nền: {music_count}/{total} — {dict(emotions)}")
 
     st.markdown("### 🎨 Tạo ảnh song song")
     progress_state = {"done": 0, "scene_status": {},
@@ -1641,7 +1781,7 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
         try:
             r, _ = parallel_generate_images(scenes, batch_dir, providers, image_timeout,
                 progress_state, flux_steps, fair_share_enabled, circuit_breaker_enabled,
-                prioritize_fast, enable_arrows)
+                prioritize_fast, enable_arrows, enable_shadow)
             result_container["result"] = r
         except Exception as e: result_container["error"] = e
     t = threading.Thread(target=run_parallel, daemon=True)
@@ -1687,7 +1827,7 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
         st.markdown("### 🔊 Tạo SFX track")
         sfx_track = build_sfx_track(scenes, batch_dir / "sfx.wav", SFX_SAMPLE_RATE, sfx_volume)
     if enable_music:
-        st.markdown("### 🎵 Tạo nhạc nền theo cảm xúc")
+        st.markdown("### 🎵 Tạo nhạc nền")
         music_track = build_music_track(scenes, batch_dir / "music.wav", SFX_SAMPLE_RATE, music_volume)
 
     if sfx_track or music_track:
@@ -1759,7 +1899,6 @@ if audio:
         elif language_mode == "English": lang_code = "en"
         st.info(f"🌐 Ngôn ngữ: **{language_mode}**")
 
-        # Map script mode
         if use_script_mode == "Kết hợp voice + text": internal_mode = "combined"
         elif use_script_mode == "Chỉ dùng text": internal_mode = "text_only"
         else: internal_mode = "voice_only"
@@ -1771,7 +1910,11 @@ if audio:
         seed_lock = random.randint(1, 2**31 - 1) if enable_seed_lock else None
         if seed_lock: st.info(f"🎲 Seed lock: {seed_lock}")
 
-        root = Path(tempfile.mkdtemp(prefix="wb_v8_"))
+        # Cache dir cố định cho transcript
+        cache_dir = Path.home() / ".wb_cache"
+        cache_dir.mkdir(exist_ok=True)
+
+        root = Path(tempfile.mkdtemp(prefix="wb_v81_"))
         try:
             source = root / audio.name
             source.write_bytes(audio.getbuffer())
@@ -1797,16 +1940,15 @@ if audio:
             for idx, (bi, chunk, bdur) in enumerate(valid_chunks):
                 bstart = bi * BATCH_SECONDS
                 status.markdown(f"### 🧠 Đợt {idx+1}/{len(valid_chunks)} — STT ({lang_code or 'auto'})...")
-                tr = transcribe_file(client, chunk, stt_model, language=lang_code)
+                tr = transcribe_file(client, chunk, stt_model, language=lang_code, cache_dir=cache_dir)
                 if lang_code is None:
                     detected = detect_language_from_result(tr)
-                    st.info(f"🌐 Whisper phát hiện: **{detected}**")
+                    st.info(f"🌐 Whisper: **{detected}**")
                 segs = normalize_segments(tr, bstart)
                 batch_text = "\n".join(f"[{x['start']:.2f}-{x['end']:.2f}] {x['text']}" for x in segs)
                 if len(batch_text.strip()) < 50:
                     st.error(f"⚠️ Transcript quá ngắn ({len(batch_text)} ký tự)!")
 
-                # Prepare script chunk
                 total_chunks = len(valid_chunks)
                 batch_script = ""
                 if script_text and internal_mode in ("combined", "text_only"):
@@ -1839,7 +1981,8 @@ if audio:
                                   nexa_key, agnes_key, pollinations_key, pollinations_model,
                                   image_timeout, flux_steps, fair_share_enabled,
                                   circuit_breaker_enabled, prioritize_fast,
-                                  chars={}, char_lock=char_lock, enable_arrows=enable_arrows,
+                                  chars={}, char_lock=char_lock,
+                                  enable_arrows=enable_arrows, enable_shadow=enable_shadow,
                                   enable_sfx=enable_sfx, sfx_volume=sfx_volume,
                                   enable_music=enable_music, music_volume=music_volume,
                                   seed_lock=seed_lock)
