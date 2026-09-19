@@ -1,15 +1,11 @@
 """
-Xưởng Video Diễn Hoạt Kiến Thức AI — Bản Siêu Cấp V10.1
+Xưởng Video Diễn Hoạt Kiến Thức AI — Bản Siêu Cấp V10.2
 =======================================================
-V10.1 FIX:
-- Sticker-style title: chữ trắng/yellow viền đen, KHÔNG band nền
-- Cấm AI vẽ rectangular banner / black bar
-- Title hòa vào tranh tự nhiên như thumbnail Neon Rush
-
-Kế thừa V10.0:
-- English mode: AI tự vẽ chữ + màu tự nhiên
-- Vietnamese mode: Pillow overlay + nền trắng
-- Preset nhân vật + Global Lock + Horror 5-10s
+V10.2 FIX:
+- MODEL_CAP Qwen lên 14000 (tránh cắt JSON)
+- English mode: KHÔNG tách title band, camera motion áp dụng full 720px
+- English zoom nhẹ hơn (1.12) tránh cắt title
+- VI/Horror giữ nguyên title band 95px + Pillow overlay
 """
 
 import os, re, io, json, math, time, base64, random, shutil, subprocess, tempfile, threading, wave
@@ -28,7 +24,7 @@ import numpy as np
 # ============================================================
 # CẤU HÌNH
 # ============================================================
-APP_TITLE = "Xưởng Video Diễn Hoạt Kiến Thức AI (V10.1)"
+APP_TITLE = "Xưởng Video Diễn Hoạt Kiến Thức AI (V10.2)"
 BATCH_SECONDS = 5 * 60
 FPS = 24
 WIDTH = 1280
@@ -99,6 +95,7 @@ EMOTION_CHORDS = {
     "panic":         [('D4','F4','A4'),('Eb4','G4','Bb4'),('D4','F4','A4'),('C4','Eb4','G4')],
     "eerie":         [('C3','Eb3','G3'),('Db3','F3','Ab3'),('C3','Eb3','G3'),('B2','D3','F3')],
     "ominous":       [('C3','G3','C4'),('Bb3','F4','Bb4'),('Ab3','Eb4','Ab4'),('G3','D4','G4')],
+    "mysterious":    [('A3','C4','E4'),('F3','A3','C4'),('D4','F4','A4'),('E4','G4','B4')],
 }
 VALID_EMOTIONS = set(EMOTION_CHORDS.keys()) | {"none"}
 
@@ -148,8 +145,8 @@ def horror_sanitize(text):
 # UI
 # ============================================================
 st.set_page_config(page_title=APP_TITLE, page_icon="🎬", layout="wide")
-st.title("🎬 Xưởng Video Diễn Hoạt Kiến Thức AI — V10.1")
-st.caption("Sticker title + English AI vẽ chữ + Vietnamese Pillow overlay")
+st.title("🎬 Xưởng Video Diễn Hoạt Kiến Thức AI — V10.2")
+st.caption("Qwen 14k tokens + English full-frame camera + sticker title")
 
 with st.sidebar:
     st.header("🎨 Style Mode")
@@ -160,7 +157,7 @@ with st.sidebar:
     st.header("🌐 Ngôn ngữ")
     language_mode = st.selectbox("Ngôn ngữ video",
         ["Auto Detect", "Tiếng Việt", "English"], index=0,
-        help="English: AI vẽ chữ + màu tự nhiên + sticker title. Vietnamese: Pillow overlay.")
+        help="English: AI vẽ chữ + full-frame camera. Vietnamese: Pillow overlay.")
 
     effective_lang = "vi"
     if language_mode == "English": effective_lang = "en"
@@ -168,9 +165,9 @@ with st.sidebar:
 
     if style_mode == "comic":
         if effective_lang == "en":
-            st.success("🇬🇧 English comic: AI vẽ sticker title + màu nâu đất")
+            st.success("🇬🇧 English: AI vẽ sticker title + full-frame camera (không title band)")
         else:
-            st.info("🇻🇳 Vietnamese comic: Pillow overlay + nền trắng")
+            st.info("🇻🇳 Vietnamese: Pillow overlay + title band 95px")
     else:
         st.warning("⚠️ Horror mode: nhịp 5-10s/cảnh. Khuyên dùng Pollinations flux-pro.")
 
@@ -651,29 +648,24 @@ def make_scene_plan(client, transcript_text, batch_start, batch_duration, model,
             char_note += f"\n⭐ NHÂN VẬT CHÍNH (PHẢI xuất hiện trong MỌI cảnh, mô tả y hệt): {char_lock['__global__']}\n"
 
     if is_horror:
-        style_rule = """RÀNG BUỘC PHONG CÁCH HORROR:
-- Dark atmospheric illustration, cinematic horror mood, deep shadows
-- NO text, letters, numbers in the image
-- Use soft keywords."""
+        style_rule = """RÀNG BUỘC HORROR: Dark atmospheric, cinematic, deep shadows. NO text."""
         title_rule = f"- {'English: 3-6 words, mysterious, UPPERCASE' if is_en else 'Tiếng Việt: 3-6 từ, bí ẩn, VIẾT HOA'}"
-        visual_rule = """MỖI CẢNH LÀ SÂN KHẤU KINH DỊ KHÁC NHAU.
-NHỊP HORROR 5-10s/CẢNH."""
+        visual_rule = """MỖI CẢNH LÀ SÂN KHẤU KINH DỊ KHÁC NHAU."""
         rich_note = """OVERLAY: 1-2 text_boxes. 4 góc.""" if enable_rich else ""
         sfx_note = """SFX: creak/whisper/scream/heartbeat/thunder/silence_break/whoosh/impact/swoosh/none.""" if enable_sfx else ""
         music_note = """NHẠC: dread/panic/eerie/ominous/sad/tense/neutral/none.""" if enable_music else ""
         camera_rule = """slow_zoom_in/slow_zoom_out/creepy_pan_left/creepy_pan_right/dramatic_zoom_face/static_dread."""
     else:
         if native_text:
-            style_rule = """RÀNG BUỘC PHONG CÁCH ENGLISH COMIC:
-- COLORED cartoon illustration with NATURAL WARM EARTH TONES (brown, tan, orange, yellow, beige, warm gray)
-- Soft textures, warm firelight glow, cinematic lighting
-- NOT pure white background
+            style_rule = """RÀNG BUỘC ENGLISH COMIC:
+- COLORED cartoon with WARM EARTH TONES (brown, tan, orange, yellow, beige)
+- Soft textures, warm firelight, cinematic lighting
+- NOT white background
 - Thick black outlines, hand-drawn doodle style
-- RENDER ENGLISH TEXT VISIBLY: title, speech bubbles, labels
-- Title as STICKER-STYLE: bold letters with thick outline, NO rectangular banner
+- Title as STICKER-STYLE: bold letters + thick outline, NO rectangular banner
 - Wide 16:9 cinematic composition"""
         else:
-            style_rule = "RÀNG BUỘC: 2D comic doodle, nét mực đen dày, nền TRẮNG TINH, KHÔNG chữ/số trong ảnh."
+            style_rule = "RÀNG BUỘC: 2D comic doodle, nét mực đen dày, nền TRẮNG TINH, KHÔNG chữ/số."
         title_rule = f"- {'English: 3-6 words, UPPERCASE' if is_en else 'Tiếng Việt: 3-6 từ, VIẾT HOA'}"
         visual_rule = """MỖI CẢNH LÀ SÂN KHẤU KHÁC NHAU. KHÔNG lặp bố cục.
 Bao gồm: nhân vật + tư thế, hành động, bối cảnh, đồ vật ẩn dụ, cảm xúc, màu nhấn."""
@@ -688,16 +680,11 @@ Bao gồm: nhân vật + tư thế, hành động, bối cảnh, đồ vật ẩ
 
     if native_text:
         native_note = """
-⭐ NATIVE TEXT RENDERING:
-- AI sẽ TỰ VẼ chữ vào ảnh. Trong "visual_prompt", MÔ TẢ vị trí chữ:
-  * "Title text 'XXX' as sticker-style bold letters with thick outline, NO banner"
-  * "Speech bubble with text 'YYY'"
-- KHÔNG cần cấm text. YÊU CẦU AI vẽ chữ sticker rõ ràng.
+⭐ NATIVE TEXT: Mô tả ngắn gọn vị trí title + callout trong visual_prompt.
+Ví dụ: "... Title 'XXX' as sticker text top center. Speech bubble 'YYY' near character."
 """
     else:
-        native_note = """
-QUY TẮC NHÂN VẬT: Ghi rõ "male character"/"female character".
-"""
+        native_note = """QUY TẮC NHÂN VẬT: Ghi rõ "male character"/"female character"."""
 
     system = f"""Bạn là giám đốc sáng tạo kịch bản cho kênh {("KINH DỊ" if is_horror else "hoạt họa kiến thức")}.
 NGÔN NGỮ OUTPUT: {lang_name}.
@@ -747,8 +734,9 @@ JSON FORMAT:
     else:
         user = f"Audio length: {batch_duration:.2f}s.\nMAX {expected} SCENES.\n\nTRANSCRIPT:\n{transcript_text}"
 
-    MODEL_CAP = {"qwen/qwen3.8-27b": 14000, "openai/gpt-oss-120b": 7000, "openai/gpt-oss-20b": 5000}
-    dyn_max = min(MODEL_CAP.get(model, 7000), max(4000, int(expected * 500 * 1.3)))
+    # V10.2: Qwen cap 14000
+    MODEL_CAP = {"qwen/qwen3.8-27b": 14000, "openai/gpt-oss-120b": 14000, "openai/gpt-oss-20b": 9000}
+    dyn_max = min(MODEL_CAP.get(model, 14000), max(5000, int(expected * 600 * 1.3)))
 
     raw = ""
     try:
@@ -868,7 +856,7 @@ JSON FORMAT:
     return final
 
 # ============================================================
-# IMAGE PROVIDERS — V10.1 với sticker title
+# IMAGE PROVIDERS
 # ============================================================
 def _build_full_prompt(prompt, chars=None, char_lock=None, style_mode="comic",
                        language="vi", title="", callout_text=""):
@@ -878,55 +866,50 @@ def _build_full_prompt(prompt, chars=None, char_lock=None, style_mode="comic",
     if style_mode == "horror":
         safe = horror_sanitize(prompt)
         style = """Dramatic dark illustration, cinematic horror atmosphere, deep shadows.
-Rich moody backgrounds: dark rooms, moonlit forests.
-Expressive characters showing fear, tension, dread.
-Color palette: deep blacks, blood reds, cool blues, muted greens.
+Rich moody backgrounds, dramatic lighting.
 Absolutely NO text, letters, numbers, captions.
 Wide 16:9 cinematic composition.
 CHARACTER GENDER: male = MALE, female = FEMALE."""
     elif native_text:
-        # V10.1: Sticker-style title + KHÔNG band nền
         safe = prompt
         style = """COLORED CARTOON ILLUSTRATION with natural warm earth tones.
 Color palette: brown, tan, orange, yellow, beige, warm gray, olive, deep green.
-Soft textures on rocks, wood, fabric, ground. Warm firelight glow, soft shadows, cinematic lighting.
-NOT pure white background. Outdoor scenes: natural sky. Indoor scenes: warm cave/room tones.
+Soft textures, warm firelight glow, soft shadows, cinematic lighting.
+NOT pure white background. Outdoor: natural sky. Indoor: warm cave/room tones.
 Thick black outlines, hand-drawn doodle style.
 EXPRESSIVE CARTOON CHARACTERS with clear emotions.
 
-⭐ TITLE STYLE RULE (CRITICAL):
-- Title must be STICKER-STYLE text: bold letters with THICK contrasting outline.
-- Example: white letters with thick black outline, OR yellow letters with thick black outline.
-- Title is placed DIRECTLY on the illustration, floating over the scene naturally.
-- ABSOLUTELY NO rectangular background band, NO banner, NO black bar, NO frame around title.
-- Title can be anywhere natural (top, angled, left, right) as long as it reads well.
-- Think "comic book title sticker" NOT "YouTube channel banner".
-- FORBIDDEN: drawing any rectangle, band, bar, or frame behind the title text.
+⭐ TITLE STYLE (CRITICAL):
+- STICKER-STYLE: bold letters with THICK contrasting outline.
+- Example: white letters with thick black outline, OR yellow with thick black outline.
+- Title placed DIRECTLY on illustration, floating over the scene naturally.
+- ABSOLUTELY NO rectangular band, NO banner, NO black bar, NO frame behind title.
+- Think "comic book title sticker" NOT "YouTube banner".
+- FORBIDDEN: any rectangle, band, bar, or frame behind the title text.
 
-RENDER TEXT VISIBLY: title, speech bubbles, labels. Text MUST be correctly spelled in English.
+RENDER TEXT VISIBLY: title, speech bubbles, labels. Text MUST be correctly spelled.
 Wide 16:9 cinematic composition.
 CHARACTER GENDER: male = MALE, female = FEMALE."""
     else:
         safe = sanitize_prompt_text(prompt)
-        style = """Authentic 2D comic doodle art style, thick black ink contour outlines, hand-drawn wobbly lines.
-Pure solid flat white background OR simple scene background.
-Vivid expressive cartoon character with clear emotion.
-Selective vibrant spot colors (red, blue, orange, green) ONLY on key symbolic elements.
+        style = """Authentic 2D comic doodle art style, thick black ink contour outlines.
+Pure solid flat white background.
+Vivid expressive cartoon character.
+Selective vibrant spot colors on key elements.
 Absolutely NO text, letters, numbers, captions, or empty speech balloons.
 Wide 16:9 cinematic composition.
 CHARACTER GENDER: male = MALE, female = FEMALE."""
 
     if char_lock: safe = enforce_character_lock(safe, char_lock)
     if char_lock and char_lock.get("__global__"):
-        safe += "\n\nIMPORTANT: The MAIN CHARACTER MUST be visible and identical to the description above."
+        safe += "\n\nIMPORTANT: The MAIN CHARACTER MUST be visible and identical."
 
-    # V10.1: Sticker title instructions
     if native_text:
         text_instructions = []
         if title:
             text_instructions.append(
                 f'Title "{title}" as sticker-style text: bold letters with thick contrasting outline '
-                f'(white or yellow fill, thick black outline), integrated into the scene naturally, '
+                f'(white or yellow fill, thick black outline), integrated into scene naturally, '
                 f'NO rectangular banner, NO black background bar, NO frame behind text'
             )
         if callout_text and callout_text.strip():
@@ -1188,7 +1171,6 @@ def add_comic_overlays(image_path, title, callout_type, callout_text, callout_si
                         style_mode="comic", language="vi"):
     img = Image.open(image_path).convert("RGB").resize((WIDTH, HEIGHT))
 
-    # V10.1: English comic → SKIP hoàn toàn
     if language == "en" and style_mode == "comic":
         img.save(output_path, quality=95)
         return
@@ -1376,6 +1358,18 @@ COMIC_MOTIONS = {
     "static": [(0.0, 1.00, WIDTH*0.5, HEIGHT*0.5), (1.0, 1.00, WIDTH*0.5, HEIGHT*0.5)],
 }
 
+# English comic: zoom nhẹ để không cắt title
+EN_COMIC_MOTIONS = {
+    "zoom_in_center": [(0.0, 1.00, WIDTH*0.5, HEIGHT*0.5), (1.0, 1.12, WIDTH*0.5, HEIGHT*0.5)],
+    "zoom_out_center": [(0.0, 1.12, WIDTH*0.5, HEIGHT*0.5), (1.0, 1.00, WIDTH*0.5, HEIGHT*0.5)],
+    "pan_left_to_right": [(0.0, 1.08, WIDTH*0.40, HEIGHT*0.5), (1.0, 1.08, WIDTH*0.60, HEIGHT*0.5)],
+    "pan_right_to_left": [(0.0, 1.08, WIDTH*0.60, HEIGHT*0.5), (1.0, 1.08, WIDTH*0.40, HEIGHT*0.5)],
+    "zoom_in_top_left": [(0.0, 1.00, WIDTH*0.5, HEIGHT*0.5), (1.0, 1.12, WIDTH*0.35, HEIGHT*0.40)],
+    "zoom_in_bottom_right": [(0.0, 1.00, WIDTH*0.5, HEIGHT*0.5), (1.0, 1.12, WIDTH*0.65, HEIGHT*0.60)],
+    "ken_burns_slow": [(0.0, 1.02, WIDTH*0.47, HEIGHT*0.49), (1.0, 1.10, WIDTH*0.53, HEIGHT*0.51)],
+    "static": [(0.0, 1.00, WIDTH*0.5, HEIGHT*0.5), (1.0, 1.00, WIDTH*0.5, HEIGHT*0.5)],
+}
+
 HORROR_MOTIONS = {
     "slow_zoom_in": [(0.0, 1.00, WIDTH*0.5, HEIGHT*0.5), (1.0, 1.15, WIDTH*0.5, HEIGHT*0.5)],
     "slow_zoom_out": [(0.0, 1.15, WIDTH*0.5, HEIGHT*0.5), (1.0, 1.00, WIDTH*0.5, HEIGHT*0.5)],
@@ -1385,8 +1379,13 @@ HORROR_MOTIONS = {
     "static_dread": [(0.0, 1.05, WIDTH*0.5, HEIGHT*0.5), (1.0, 1.05, WIDTH*0.5, HEIGHT*0.5)],
 }
 
-def get_motion_kfs(motion, style_mode="comic"):
-    src = HORROR_MOTIONS if style_mode == "horror" else COMIC_MOTIONS
+def get_motion_kfs(motion, style_mode="comic", language="vi"):
+    if style_mode == "horror":
+        src = HORROR_MOTIONS
+    elif language == "en":
+        src = EN_COMIC_MOTIONS
+    else:
+        src = COMIC_MOTIONS
     return src.get(motion, list(src.values())[0])
 
 def interp_motion(kfs, p):
@@ -1401,21 +1400,42 @@ def interp_motion(kfs, p):
             return (k0[1] + (k1[1]-k0[1])*e, k0[2] + (k1[2]-k0[2])*e, k0[3] + (k1[3]-k0[3])*e)
     _, s, cx, cy = kfs[-1]; return s, cx, cy
 
+def crop_full_frame(frame_bgr, scale, cx, cy):
+    """Crop full frame (không tách title band) — dùng cho English mode."""
+    ch, cw = frame_bgr.shape[:2]
+    w = max(1, min(cw, int(cw / max(0.5, scale))))
+    h = max(1, min(ch, int(ch / max(0.5, scale))))
+    x1 = max(0, min(cw - w, int(cx - w / 2)))
+    y1 = max(0, min(ch - h, int(cy - h / 2)))
+    return cv2.resize(frame_bgr[y1:y1+h, x1:x1+w], (WIDTH, HEIGHT), interpolation=cv2.INTER_LINEAR)
+
 # ============================================================
-# RENDER 4 STYLES
+# RENDER 4 STYLES — V10.2: English full-frame, VI/Horror title band
 # ============================================================
-def render_kttv(image_path, duration, output_path, hand_path, motion="zoom_in_center", style_mode="comic"):
+def render_kttv(image_path, duration, output_path, hand_path, motion="zoom_in_center",
+                style_mode="comic", language="vi"):
     tf = max(1, round(duration * FPS))
     dd = max(1.5, min(duration - 0.8, duration * DRAW_DURATION_RATIO))
     df = int(dd * FPS); rf = int(0.35 * FPS)
     of = cv2.imread(str(image_path))
     if of is None: raise RuntimeError(f"Không đọc được ảnh: {image_path}")
     of = cv2.resize(of, (WIDTH, HEIGHT))
-    tb, cb = split_title_band(of)
-    wc = np.full_like(cb, 255); rm = np.zeros((CONTENT_H, WIDTH), dtype=np.uint8)
+
+    use_full_frame = (language == "en" and style_mode == "comic")
+    if use_full_frame:
+        tb = None; cb = of
+    else:
+        tb, cb = split_title_band(of)
+
+    ch_use = cb.shape[0]
+    wc = np.full_like(cb, 255); rm = np.zeros((ch_use, WIDTH), dtype=np.uint8)
+
     zt = extract_stag_traj(image_path)
     ap_full = [p for z in zt for p in z] or [(WIDTH//2, HEIGHT//2)]
-    ap = traj_to_content(ap_full)
+    if use_full_frame:
+        ap = [(px, py) for (px, py) in ap_full]
+    else:
+        ap = traj_to_content(ap_full)
     ph = split_traj_phases(ap)
     pf = [int(df*PHASE_RATIOS[0]), int(df*(PHASE_RATIOS[0]+PHASE_RATIOS[1])), df]
     hb, ha, tx, ty = load_hand(hand_path, 320)
@@ -1423,8 +1443,9 @@ def render_kttv(image_path, duration, output_path, hand_path, motion="zoom_in_ce
            "-pix_fmt", "bgr24", "-r", str(FPS), "-i", "-", "-an", "-c:v", "libx264",
            "-preset", "veryfast", "-pix_fmt", "yuv420p", str(output_path)]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-    lt = ap[0] if ap else (WIDTH//2, CONTENT_H//2)
-    kfs = get_motion_kfs(motion, style_mode)
+    lt = ap[0] if ap else (WIDTH//2, ch_use//2)
+    kfs = get_motion_kfs(motion, style_mode, language)
+
     for fi in range(tf):
         hv = False; hx = hy = 0
         if fi < df:
@@ -1443,34 +1464,49 @@ def render_kttv(image_path, duration, output_path, hand_path, motion="zoom_in_ce
             lt = (hx, hy); hv = True
         elif fi < df+rf:
             rm[:, :] = 255; pr = (fi-df)/max(1,rf)
-            hx = int(lt[0]+(WIDTH+180-lt[0])*pr); hy = int(lt[1]+(CONTENT_H+180-lt[1])*pr); hv = True
+            hx = int(lt[0]+(WIDTH+180-lt[0])*pr); hy = int(lt[1]+(ch_use+180-lt[1])*pr); hv = True
         else: rm[:, :] = 255
         a = (cv2.GaussianBlur(rm, (13, 13), 0).astype(np.float32)/255.0)[:, :, None]
         fc = (cb*a + wc*(1.0-a)).astype(np.uint8)
         if hv: paste_hand(fc, hb, ha, hx-tx, hy-ty)
-        if fi < df+rf: sc, cu, cyu = 1.0, WIDTH*0.5, CONTENT_H*0.5
+        if fi < df+rf:
+            sc, cu, cyu = 1.0, WIDTH*0.5, ch_use*0.5
         else:
             op = (fi-df-rf)/max(1, tf-df-rf)
             st_, cx_, cy_ = interp_motion(kfs, op)
-            cyc = (cy_/HEIGHT)*CONTENT_H; bl = ease(min(1.0, op*1.8))
+            # cy_ được tính theo HEIGHT gốc → scale theo ch_use
+            cyc = (cy_/HEIGHT)*ch_use
+            bl = ease(min(1.0, op*1.8))
             sc = 1.0 + (st_-1.0)*bl
             cu = WIDTH*0.5 + (cx_-WIDTH*0.5)*bl
-            cyu = CONTENT_H*0.5 + (cyc-CONTENT_H*0.5)*bl
-        fo = compose_frame(tb, crop_content_motion(fc, sc, cu, cyu))
+            cyu = ch_use*0.5 + (cyc-ch_use*0.5)*bl
+        if use_full_frame:
+            fo = crop_full_frame(fc, sc, cu, cyu)
+        else:
+            fo = compose_frame(tb, crop_content_motion(fc, sc, cu, cyu))
         proc.stdin.write(fo.tobytes())
     proc.stdin.close(); proc.wait()
     if proc.returncode != 0: raise RuntimeError("FFmpeg fail (style 1)")
 
-def render_hybrid(image_path, duration, output_path, hand_path, motion="zoom_in_center", style_mode="comic"):
+def render_hybrid(image_path, duration, output_path, hand_path, motion="zoom_in_center",
+                  style_mode="comic", language="vi"):
     tf = max(1, round(duration * FPS))
     dd = max(1.5, min(duration - 0.8, duration * DRAW_DURATION_RATIO))
     df = int(dd*FPS); rf = int(0.35*FPS)
     of = cv2.imread(str(image_path))
     if of is None: raise RuntimeError(f"Không đọc được ảnh: {image_path}")
     of = cv2.resize(of, (WIDTH, HEIGHT))
-    tb, cb = split_title_band(of)
-    wc = np.full_like(cb, 255); rm = np.zeros((CONTENT_H, WIDTH), dtype=np.uint8)
-    tr_full = extract_cont_traj(image_path); tr = traj_to_content(tr_full)
+
+    use_full_frame = (language == "en" and style_mode == "comic")
+    if use_full_frame:
+        tb = None; cb = of
+    else:
+        tb, cb = split_title_band(of)
+
+    ch_use = cb.shape[0]
+    wc = np.full_like(cb, 255); rm = np.zeros((ch_use, WIDTH), dtype=np.uint8)
+    tr_full = extract_cont_traj(image_path)
+    tr = [(px, py) for (px, py) in tr_full] if use_full_frame else traj_to_content(tr_full)
     ph = split_traj_phases(tr)
     pf = [int(df*PHASE_RATIOS[0]), int(df*(PHASE_RATIOS[0]+PHASE_RATIOS[1])), df]
     hb, ha, tx, ty = load_hand(hand_path, 320)
@@ -1478,9 +1514,10 @@ def render_hybrid(image_path, duration, output_path, hand_path, motion="zoom_in_
            "-pix_fmt", "bgr24", "-r", str(FPS), "-i", "-", "-an", "-c:v", "libx264",
            "-preset", "veryfast", "-pix_fmt", "yuv420p", str(output_path)]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-    lt = tr[0] if tr else (WIDTH//2, CONTENT_H//2)
+    lt = tr[0] if tr else (WIDTH//2, ch_use//2)
     scx, scy = float(lt[0]), float(lt[1])
-    kfs = get_motion_kfs(motion, style_mode)
+    kfs = get_motion_kfs(motion, style_mode, language)
+
     for fi in range(tf):
         hv = False; hx = hy = 0
         if fi < df:
@@ -1499,7 +1536,7 @@ def render_hybrid(image_path, duration, output_path, hand_path, motion="zoom_in_
             lt = (hx, hy); hv = True
         elif fi < df+rf:
             rm[:, :] = 255; pr = (fi-df)/max(1,rf)
-            hx = int(lt[0]+(WIDTH+180-lt[0])*pr); hy = int(lt[1]+(CONTENT_H+180-lt[1])*pr); hv = True
+            hx = int(lt[0]+(WIDTH+180-lt[0])*pr); hy = int(lt[1]+(ch_use+180-lt[1])*pr); hv = True
         else: rm[:, :] = 255
         a = (cv2.GaussianBlur(rm, (13, 13), 0).astype(np.float32)/255.0)[:, :, None]
         fc = (cb*a + wc*(1.0-a)).astype(np.uint8)
@@ -1511,39 +1548,59 @@ def render_hybrid(image_path, duration, output_path, hand_path, motion="zoom_in_
         elif fi < df+rf: sc, cu, cyu = 1.0, scx, scy
         else:
             op = (fi-df-rf)/max(1, tf-df-rf)
-            st_, cx_, cy_ = interp_motion(kfs, op); cyc = (cy_/HEIGHT)*CONTENT_H
+            st_, cx_, cy_ = interp_motion(kfs, op); cyc = (cy_/HEIGHT)*ch_use
             bl = ease(min(1.0, op*1.8)); sc = 1.0 + (st_-1.0)*bl
             cu = scx + (cx_-scx)*bl; cyu = scy + (cyc-scy)*bl
-        cw = int(WIDTH/sc); chh = int(CONTENT_H/sc)
-        ccx = max(cw//2, min(WIDTH-cw//2, int(cu))); ccy = max(chh//2, min(CONTENT_H-chh//2, int(cyu)))
-        fo = compose_frame(tb, crop_content_motion(fc, sc, ccx, ccy))
+        if use_full_frame:
+            fo = crop_full_frame(fc, sc, cu, cyu)
+        else:
+            cw = int(WIDTH/sc); chh = int(ch_use/sc)
+            ccx = max(cw//2, min(WIDTH-cw//2, int(cu))); ccy = max(chh//2, min(ch_use-chh//2, int(cyu)))
+            fo = compose_frame(tb, crop_content_motion(fc, sc, ccx, ccy))
         proc.stdin.write(fo.tobytes())
     proc.stdin.close(); proc.wait()
     if proc.returncode != 0: raise RuntimeError("FFmpeg fail (style 2)")
 
-def render_pure(image_path, duration, output_path, motion="zoom_in_center", style_mode="comic"):
+def render_pure(image_path, duration, output_path, motion="zoom_in_center",
+                style_mode="comic", language="vi"):
     tf = max(1, round(duration * FPS))
     of = cv2.resize(cv2.imread(str(image_path)), (WIDTH, HEIGHT))
-    tb, cb = split_title_band(of)
+    use_full_frame = (language == "en" and style_mode == "comic")
+    if use_full_frame:
+        tb = None; cb = of
+    else:
+        tb, cb = split_title_band(of)
     cmd = ["ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo", "-s", f"{WIDTH}x{HEIGHT}",
            "-pix_fmt", "bgr24", "-r", str(FPS), "-i", "-", "-an", "-c:v", "libx264",
            "-preset", "veryfast", "-pix_fmt", "yuv420p", str(output_path)]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-    kfs = get_motion_kfs(motion, style_mode)
+    kfs = get_motion_kfs(motion, style_mode, language)
+    ch_use = cb.shape[0]
     for fi in range(tf):
         p = fi / max(1, tf-1)
-        s, cx, cyf = interp_motion(kfs, p); cy = (cyf/HEIGHT)*CONTENT_H
-        fo = compose_frame(tb, crop_content_motion(cb, s, cx, cy))
+        s, cx, cyf = interp_motion(kfs, p)
+        cy = (cyf/HEIGHT)*ch_use
+        if use_full_frame:
+            fo = crop_full_frame(cb, s, cx, cy)
+        else:
+            fo = compose_frame(tb, crop_content_motion(cb, s, cx, cy))
         proc.stdin.write(fo.tobytes())
     proc.stdin.close(); proc.wait()
 
-def render_classic(image_path, duration, output_path, hand_path, motion="zoom_in_center", style_mode="comic"):
+def render_classic(image_path, duration, output_path, hand_path, motion="zoom_in_center",
+                   style_mode="comic", language="vi"):
     tf = max(1, round(duration * FPS))
     df = int(max(1.5, min(duration-0.8, duration*DRAW_DURATION_RATIO))*FPS); rf = int(0.35*FPS)
     of = cv2.resize(cv2.imread(str(image_path)), (WIDTH, HEIGHT))
-    tb, cb = split_title_band(of)
-    wc = np.full_like(cb, 255); rm = np.zeros((CONTENT_H, WIDTH), dtype=np.uint8)
-    tr_full = extract_cont_traj(image_path); tr = traj_to_content(tr_full)
+    use_full_frame = (language == "en" and style_mode == "comic")
+    if use_full_frame:
+        tb = None; cb = of
+    else:
+        tb, cb = split_title_band(of)
+    ch_use = cb.shape[0]
+    wc = np.full_like(cb, 255); rm = np.zeros((ch_use, WIDTH), dtype=np.uint8)
+    tr_full = extract_cont_traj(image_path)
+    tr = [(px, py) for (px, py) in tr_full] if use_full_frame else traj_to_content(tr_full)
     ph = split_traj_phases(tr)
     pf = [int(df*PHASE_RATIOS[0]), int(df*(PHASE_RATIOS[0]+PHASE_RATIOS[1])), df]
     hb, ha, tx, ty = load_hand(hand_path)
@@ -1551,7 +1608,7 @@ def render_classic(image_path, duration, output_path, hand_path, motion="zoom_in
            "-pix_fmt", "bgr24", "-r", str(FPS), "-i", "-", "-an", "-c:v", "libx264",
            "-preset", "veryfast", "-pix_fmt", "yuv420p", str(output_path)]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-    lt = tr[0] if tr else (WIDTH//2, CONTENT_H//2)
+    lt = tr[0] if tr else (WIDTH//2, ch_use//2)
     for fi in range(tf):
         hv = False
         if fi < df:
@@ -1570,12 +1627,15 @@ def render_classic(image_path, duration, output_path, hand_path, motion="zoom_in
             lt = (hx, hy); hv = True
         elif fi < df+rf:
             rm[:, :] = 255; pr = (fi-df)/max(1,rf)
-            hx = int(lt[0]+(WIDTH+180-lt[0])*pr); hy = int(lt[1]+(CONTENT_H+180-lt[1])*pr); hv = True
+            hx = int(lt[0]+(WIDTH+180-lt[0])*pr); hy = int(lt[1]+(ch_use+180-lt[1])*pr); hv = True
         else: rm[:, :] = 255
         a = (cv2.GaussianBlur(rm, (13, 13), 0).astype(np.float32)/255.0)[:, :, None]
         fc = (cb*a + wc*(1.0-a)).astype(np.uint8)
         if hv: paste_hand(fc, hb, ha, hx-tx, hy-ty)
-        fo = compose_frame(tb, fc)
+        if use_full_frame:
+            fo = fc
+        else:
+            fo = compose_frame(tb, fc)
         proc.stdin.write(fo.tobytes())
     proc.stdin.close(); proc.wait()
 
@@ -1725,7 +1785,7 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
     if not providers: raise RuntimeError("Chưa cấu hình provider.")
 
     native_text = (language == "en" and style_mode == "comic")
-    mode_label = '👻 Horror' if style_mode=='horror' else ('🇬🇧 English Comic (sticker title)' if native_text else '📚 Comic VI (Pillow overlay)')
+    mode_label = '👻 Horror' if style_mode=='horror' else ('🇬🇧 English full-frame' if native_text else '📚 Comic VI (title band)')
     st.markdown(f"### 🔗 {len(providers)} Provider ({mode_label})")
     pc = st.columns(min(4, len(providers)))
     for i, p in enumerate(providers):
@@ -1795,10 +1855,10 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
         if not im.exists(): raise RuntimeError(f"Thiếu ảnh scene {i}")
         dur = max(1.0, float(s["end"]) - float(s["start"]))
         mo = s.get("camera_motion", "zoom_in_center")
-        if "1." in style or "Vẽ 3 phase" in style: render_kttv(im, dur, vd, hand_path, mo, style_mode)
-        elif "2." in style or "Hybrid" in style: render_hybrid(im, dur, vd, hand_path, mo, style_mode)
-        elif "3." in style or "Chỉ Camera" in style: render_pure(im, dur, vd, mo, style_mode)
-        else: render_classic(im, dur, vd, hand_path, mo, style_mode)
+        if "1." in style or "Vẽ 3 phase" in style: render_kttv(im, dur, vd, hand_path, mo, style_mode, language)
+        elif "2." in style or "Hybrid" in style: render_hybrid(im, dur, vd, hand_path, mo, style_mode, language)
+        elif "3." in style or "Chỉ Camera" in style: render_pure(im, dur, vd, mo, style_mode, language)
+        else: render_classic(im, dur, vd, hand_path, mo, style_mode, language)
         vids.append(vd)
         rb.progress(i/total); rt.markdown(f"**🎬 Render: {i}/{total}** — {s['title']}")
 
@@ -1900,7 +1960,7 @@ if audio:
 
         cache_dir = Path.home() / ".wb_cache"; cache_dir.mkdir(exist_ok=True)
 
-        root = Path(tempfile.mkdtemp(prefix=f"wb_v101_{style_mode}_"))
+        root = Path(tempfile.mkdtemp(prefix=f"wb_v102_{style_mode}_"))
         try:
             src = root / audio.name; src.write_bytes(audio.getbuffer())
             dur = ffprobe_duration(src)
