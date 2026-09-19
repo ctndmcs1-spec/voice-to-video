@@ -1,16 +1,15 @@
 """
-Xưởng Video Diễn Hoạt Kiến Thức AI — Bản Siêu Cấp V9.1
+Xưởng Video Diễn Hoạt Kiến Thức AI — Bản Siêu Cấp V9.2
 =====================================================
-V9.1 MỚI:
-- Nhịp horror 5-10s/cảnh (patch 5 chỗ)
-- Slider nhịp linh hoạt 5-25s min, 10-35s max
-- Merge/split threshold động theo style_mode
-- Prompt Qwen dạy nhịp horror nhanh
+V9.2 MỚI:
+- Global Character Lock: nhân vật chính xuất hiện trong MỌI cảnh
+- Per-name lock (giữ nguyên): chèn khi tên xuất hiện
+- 2 lớp lock độc lập, có thể bật cả 2
 
-Kế thừa V9:
+Kế thừa V9.1:
+- Nhịp horror 5-10s
 - Style Mode: Comic + Horror
-- Horror Sanitize: 30+ từ khóa
-- Horror Camera + SFX + Music
+- Horror Sanitize + Camera + SFX + Music
 - Fix text box mép + arrow dài
 """
 
@@ -30,7 +29,7 @@ import numpy as np
 # ============================================================
 # CẤU HÌNH
 # ============================================================
-APP_TITLE = "Xưởng Video Diễn Hoạt Kiến Thức AI (V9.1)"
+APP_TITLE = "Xưởng Video Diễn Hoạt Kiến Thức AI (V9.2)"
 BATCH_SECONDS = 5 * 60
 FPS = 24
 WIDTH = 1280
@@ -139,8 +138,8 @@ def horror_sanitize(text):
 # UI
 # ============================================================
 st.set_page_config(page_title=APP_TITLE, page_icon="🎬", layout="wide")
-st.title("🎬 Xưởng Video Diễn Hoạt Kiến Thức AI — V9.1")
-st.caption("Comic + Horror 5-10s + Voice+Text + Nhạc nền + SFX + Nhân vật đồng nhất + Font đẹp")
+st.title("🎬 Xưởng Video Diễn Hoạt Kiến Thức AI — V9.2")
+st.caption("Global Character Lock + Comic/Horror 5-10s + Voice+Text + Nhạc nền + SFX + Font đẹp")
 
 with st.sidebar:
     st.header("🎨 Style Mode")
@@ -148,7 +147,6 @@ with st.sidebar:
         "Phong cách video",
         ["📚 Kiến Thức (Comic)", "👻 Kinh Dị (Horror)"],
         index=0,
-        help="Horror mode: nhịp 5-10s/cảnh, từ khóa tự biến hóa tránh AI filter.",
     )
     style_mode = "horror" if "Horror" in style_mode_ui else "comic"
 
@@ -198,8 +196,20 @@ with st.sidebar:
     char_second_desc = st.text_area("Mô tả ngoại hình (English)",
         value="a young Vietnamese woman, long black hair tied in ponytail, wearing an orange hoodie",
         height=60)
-    enable_char_lock = st.checkbox("🔒 Khóa ngoại hình nhân vật", value=True)
+    enable_char_lock = st.checkbox("🔒 Khóa ngoại hình theo tên", value=True,
+        help="Chèn mô tả nhân vật khi tên xuất hiện trong prompt.")
     enable_seed_lock = st.checkbox("🎲 Cố định Seed", value=False)
+
+    # ===== V9.2: GLOBAL CHARACTER LOCK =====
+    st.markdown("---")
+    st.subheader("🌍 Global Character Lock")
+    enable_global_char = st.checkbox("Bật Global Lock", value=False,
+        help="MỌI cảnh đều có nhân vật chính, bất kể có nhắc tên hay không.")
+    global_char_desc = st.text_area("Mô tả nhân vật chính toàn cục (English)",
+        value="a young Vietnamese man, short black hair, brown eyes, wearing a blue hoodie and dark jeans",
+        height=60,
+        help="Nhân vật này sẽ xuất hiện trong MỌI cảnh, kể cả cảnh phong cảnh.")
+    # =======================================
 
     st.header("🔊 Âm thanh")
     enable_sfx = st.checkbox("Bật sound effects", value=True)
@@ -210,7 +220,7 @@ with st.sidebar:
     st.header("🧠 Groq Model")
     stt_model = st.selectbox("STT Model", ["whisper-large-v3", "whisper-large-v3-turbo"], index=0)
     planner_model = st.selectbox("Biên kịch Model",
-        ["qwen/qwen3.8-27b", "openai/gpt-oss-120b", "openai/gpt-oss-20b"], index=0)
+        ["qwen/qwen3.8-27b", "openai/gpt-oss-120b", "openai/gpt-oss-20b"], index=1)
 
     st.header("🎬 Phong cách diễn hoạt")
     draw_style = st.selectbox("Render style", [
@@ -234,7 +244,6 @@ with st.sidebar:
     ], index=0)
 
     st.header("⏱️ Nhịp cảnh")
-    # PATCH 1: Slider linh hoạt cho Horror 5-10s
     if style_mode == "horror":
         default_min, default_max = 6, 10
     else:
@@ -247,9 +256,8 @@ with st.sidebar:
         scene_max = scene_min
 
     st.header("⚙️ Khác")
-    max_scenes = st.slider("Số cảnh tối đa/batch", 5, 60, 
-        35 if style_mode == "horror" else 25,
-        help="Horror 5-10s: cần 30-40. Comic: 20-25.")
+    max_scenes = st.slider("Số cảnh tối đa/batch", 5, 60,
+        35 if style_mode == "horror" else 25)
     image_timeout = st.slider("Timeout ảnh (giây)", 20, 90, 45)
     flux_steps = st.slider("Số bước FLUX", 4, 8, 4)
     fair_share_enabled = st.checkbox("Fair share cap", value=True)
@@ -363,13 +371,25 @@ def build_character_lock(mn, md, sn, sd, enabled=True):
     if sn.strip() and sd.strip(): lock[sn.strip().lower()] = sd.strip()
     return lock
 
+# ===== V9.2: GLOBAL CHARACTER LOCK =====
 def enforce_character_lock(prompt, char_lock):
     if not char_lock: return prompt
-    pl = prompt.lower(); result = prompt
+    pl = prompt.lower()
+    result = prompt
+
+    # 1. GLOBAL LOCK
+    global_desc = char_lock.get("__global__")
+    if global_desc:
+        result = f"[MAIN CHARACTER (MUST appear in this scene): {global_desc}] " + result
+
+    # 2. PER-NAME LOCK
     for name, desc in char_lock.items():
+        if name == "__global__": continue
         if name in pl and desc not in pl:
-            result = f"[CHARACTER CONSISTENCY: {name} = {desc}] " + result
+            result = f"[CHARACTER: {name} = {desc}] " + result
+
     return result
+# ========================================
 
 # ============================================================
 # TITLE BAND
@@ -603,14 +623,13 @@ def mix_audio_tracks(voice, sfx, music, out):
     return out
 
 # ============================================================
-# SCENE PLANNER — V9.1 with nhịp horror 5-10s
+# SCENE PLANNER
 # ============================================================
 def make_scene_plan(client, transcript_text, batch_start, batch_duration, model,
                     min_s, max_s, max_scenes, camera_mode="auto",
                     language="vi", enable_rich=True, char_lock=None,
                     enable_sfx=True, enable_music=True,
                     user_script="", use_script_mode="voice_only", style_mode="comic"):
-    # PATCH 2: expected_scenes theo avg duration
     avg_dur = (min_s + max_s) / 2.0
     expected = max(1, round(batch_duration / avg_dur))
 
@@ -618,9 +637,15 @@ def make_scene_plan(client, transcript_text, batch_start, batch_duration, model,
     lang_name = "English" if is_en else "Tiếng Việt"
     is_horror = (style_mode == "horror")
 
+    # ===== V9.2: Build char_note có Global =====
     char_note = ""
     if char_lock:
-        char_note = "NHÂN VẬT CỐ ĐỊNH:\n" + "\n".join(f"  - {n}: {d}" for n, d in char_lock.items()) + "\n"
+        items = [(n, d) for n, d in char_lock.items() if n != "__global__"]
+        if items:
+            char_note = "NHÂN VẬT CỐ ĐỊNH:\n" + "\n".join(f"  - {n}: {d}" for n, d in items) + "\n"
+        if "__global__" in char_lock:
+            char_note += f"\n⭐ NHÂN VẬT CHÍNH (PHẢI xuất hiện trong MỌI cảnh, mô tả y hệt): {char_lock['__global__']}\n"
+    # =========================================
 
     if is_horror:
         style_rule = """
@@ -633,7 +658,6 @@ RÀNG BUỘC PHONG CÁCH HORROR:
 - NO text, letters, numbers in the image
 - IMPORTANT: Use soft keywords. Prefer "crimson liquid", "dark red", "motionless figure", "sharp blade", "silhouette", "shadow"."""
         title_rule = f"- {'English: 3-6 words, mysterious, unsettling, UPPERCASE' if is_en else 'Tiếng Việt: 3-6 từ, bí ẩn, đáng sợ, VIẾT HOA'}"
-        # PATCH 5: Thêm quy tắc nhịp horror
         visual_rule = f"""
 MỖI CẢNH LÀ MỘT "SÂN KHẤU KINH DỊ" KHÁC NHAU:
 - Bối cảnh đa dạng: hành lang tối, nghĩa địa, rừng sương mù, căn phòng bỏ hoang, nhà vệ sinh trường học cũ, gầm cầu thang, phòng ngủ đêm khuya, trong gương, trên mái nhà...
@@ -642,28 +666,17 @@ MỖI CẢNH LÀ MỘT "SÂN KHẤU KINH DỊ" KHÁC NHAU:
 - Cảm xúc: sợ hãi, hoảng loạn, tuyệt vọng, cô đơn, bị theo dõi...
 
 NHỊP HORROR 5-10s/CẢNH:
-- Mỗi cảnh chỉ 5-10s để tạo căng thẳng. Cảnh ngắn = giật mình, cảnh dài = chờ đợi.
+- Mỗi cảnh chỉ 5-10s để tạo căng thẳng.
 - Thỉnh thoảng có cảnh cực ngắn (5-6s) với hình ảnh đột ngột (jump scare).
-- Xen kẽ cảnh ngắn và cảnh dài để tạo nhịp điệu không đều, gây bất an."""
+- Xen kẽ cảnh ngắn và cảnh dài để tạo nhịp điệu không đều."""
         rich_note = """
-QUY TẮC OVERLAY ("text_boxes"): Tạo ĐÚNG 2-3 text_boxes. Tọa độ từ 0.10-0.85.
-- Vùng A (trên trái): x=0.12, y=0.25
-- Vùng B (trên phải): x=0.72, y=0.25
-- Vùng C (dưới trái): x=0.12, y=0.80
-- Vùng D (dưới phải): x=0.72, y=0.80
-KHÔNG đặt gần title (y<0.20) hoặc đè mặt nhân vật.
-Arrow chỉ dùng khi khoảng cách < 0.30 đơn vị.""" if enable_rich else ""
+QUY TẮC OVERLAY ("text_boxes"): Tạo ĐÚNG 1-2 text_boxes. Tọa độ từ 0.10-0.85.
+KHÔNG đặt gần title (y<0.20) hoặc đè mặt nhân vật.""" if enable_rich else ""
         sfx_note = """
-QUY TẮC SFX ("sfx"): Chọn 1: creak/whisper/scream/heartbeat/thunder/silence_break/whoosh/impact/sad/swoosh/none.
-- creak: cửa kẽo kẹt | whisper: thì thầm | scream: tiếng hét
-- heartbeat: tim đập | thunder: sấm | silence_break: cắt im lặng
-LUÂN PHIÊN, ưu tiên creak/whisper/heartbeat.""" if enable_sfx else ""
+QUY TẮC SFX ("sfx"): Chọn 1: creak/whisper/scream/heartbeat/thunder/silence_break/whoosh/impact/sad/swoosh/none.""" if enable_sfx else ""
         music_note = """
-QUY TẮC NHẠC NỀN ("music_emotion"): Chọn 1: dread/panic/eerie/ominous/sad/tense/neutral/none.
-- dread: sợ hãi âm ỉ | panic: hoảng loạn | eerie: rùng rợn
-- ominous: điềm gở | sad: buồn | tense: căng
-LUÂN PHIÊN, ưu tiên dread/eerie/ominous.""" if enable_music else ""
-        camera_rule = """Chọn 1: slow_zoom_in/slow_zoom_out/creepy_pan_left/creepy_pan_right/dramatic_zoom_face/static_dread. LUÂN PHIÊN, ưu tiên slow_zoom_in/dramatic_zoom_face."""
+QUY TẮC NHẠC NỀN ("music_emotion"): Chọn 1: dread/panic/eerie/ominous/sad/tense/neutral/none.""" if enable_music else ""
+        camera_rule = """Chọn 1: slow_zoom_in/slow_zoom_out/creepy_pan_left/creepy_pan_right/dramatic_zoom_face/static_dread. LUÂN PHIÊN."""
     else:
         style_rule = "RÀNG BUỘC: 2D comic doodle, nét mực đen dày, nền TRẮNG TINH, KHÔNG chữ/số trong ảnh AI vẽ."
         title_rule = f"- {'English: 3-6 words, UPPERCASE' if is_en else 'Tiếng Việt: 3-6 từ, VIẾT HOA'}"
@@ -672,10 +685,7 @@ MỖI CẢNH LÀ MỘT "SÂN KHẤU" KHÁC NHAU. KHÔNG lặp bố cục.
 Bao gồm: nhân vật + tư thế, hành động, bối cảnh, đồ vật ẩn dụ, cảm xúc, màu nhấn."""
         rich_note = """
 QUY TẮC OVERLAY ("text_boxes"): Tạo ĐÚNG 2-3 text_boxes. Tọa độ từ 0.10-0.85.
-- Vùng A: x=0.12, y=0.25 | Vùng B: x=0.72, y=0.25
-- Vùng C: x=0.12, y=0.80 | Vùng D: x=0.72, y=0.80
-KHÔNG đặt gần title (y<0.20) hoặc đè mặt nhân vật.
-Arrow chỉ dùng khi khoảng cách < 0.30 đơn vị.""" if enable_rich else ""
+KHÔNG đặt gần title (y<0.20) hoặc đè mặt nhân vật.""" if enable_rich else ""
         sfx_note = """
 QUY TẮC SFX ("sfx"): Chọn 1: whoosh/pop/ding/impact/sad/bell/typing/sparkle/swoosh/none. LUÂN PHIÊN.""" if enable_sfx else ""
         music_note = """
@@ -739,8 +749,8 @@ JSON FORMAT:
     else:
         user = (f"Audio length: {batch_duration:.2f}s.\nMAX {expected} SCENES.\n\nTRANSCRIPT:\n{transcript_text}")
 
-    MODEL_CAP = {"qwen/qwen3.8-27b": 12000, "openai/gpt-oss-120b": 12000, "openai/gpt-oss-20b": 8000}
-    dyn_max = min(MODEL_CAP.get(model, 12000), max(4000, int(expected * 500 * 1.3)))
+    MODEL_CAP = {"qwen/qwen3.8-27b": 3500, "openai/gpt-oss-120b": 7000, "openai/gpt-oss-20b": 5000}
+    dyn_max = min(MODEL_CAP.get(model, 7000), max(4000, int(expected * 500 * 1.3)))
 
     raw = ""
     try:
@@ -822,7 +832,6 @@ JSON FORMAT:
                 "2D dark horror illustration: a person staring at their own reflection in a cracked mirror, fear in eyes, no text",
                 "2D dark horror illustration: a figure standing at the end of a long corridor, back turned, shadow stretching, no text",
                 "2D dark horror illustration: an old bedroom at 3am, curtains moving, moonlight through window, no text",
-                "2D dark horror illustration: a person hiding under a bed, eyes wide, dark surroundings, red glow, no text",
             ]
             emotions_pool = ["dread", "eerie", "ominous", "panic", "tense"]
             sfx_pool = ["creak", "whisper", "heartbeat", "thunder", "silence_break"]
@@ -848,7 +857,6 @@ JSON FORMAT:
                 "text_boxes": []})
         st.error(f"❌ Qwen fail — {n} fallback scenes (~{sd:.0f}s/cảnh)")
 
-    # PATCH 3: Merge threshold động theo min_s
     merge_threshold = max(min_s * 0.7, 5.0)
     merged = []
     for s in clean:
@@ -865,7 +873,6 @@ JSON FORMAT:
     for i in range(len(clean) - 1): clean[i]["end"] = clean[i + 1]["start"]
     clean[-1]["end"] = batch_duration
 
-    # PATCH 4: Split threshold động theo max_s
     split_threshold = max(max_s * 1.3, 15.0)
     final = []
     for s in clean:
@@ -912,6 +919,11 @@ Do not draw desk, table, markers, pens UNLESS explicitly mentioned.
 Wide 16:9 cinematic composition.
 CHARACTER GENDER: male character = MALE, female character = FEMALE. NEVER swap."""
     if char_lock: safe = enforce_character_lock(safe, char_lock)
+
+    # V9.2: Tăng cường cho Global Lock
+    if char_lock and char_lock.get("__global__"):
+        safe += "\n\nIMPORTANT: The MAIN CHARACTER MUST be visible in this scene and identical to the description above. Do NOT omit the character."
+
     return f"{safe}.\n\nSTYLE CONSTRAINTS:\n{style}"
 
 def _validate(data, name):
@@ -1662,7 +1674,12 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
     pc = st.columns(min(4, len(providers)))
     for i, p in enumerate(providers):
         with pc[i % len(pc)]: st.markdown(f"**{i+1}.** {p['name']}")
-    if char_lock: st.success(f"🔒 Khóa {len(char_lock)} nhân vật")
+    if char_lock:
+        if "__global__" in char_lock:
+            st.success(f"🌍 Global Lock: {char_lock['__global__'][:60]}...")
+        others = [k for k in char_lock.keys() if k != "__global__"]
+        if others:
+            st.success(f"🔒 Per-name lock: {others}")
     if seed_lock is not None: st.info(f"🎲 Seed: {seed_lock}")
     if enable_sfx:
         cnt = sum(1 for s in scenes if s.get("sfx", "none") != "none")
@@ -1777,12 +1794,16 @@ st.sidebar.divider()
 
 if st.sidebar.button("🔎 KIỂM TRA PROVIDER", use_container_width=True):
     char_lock = build_character_lock(char_main_name, char_main_desc, char_second_name, char_second_desc, enable_char_lock)
+    if enable_global_char and global_char_desc.strip():
+        char_lock["__global__"] = global_char_desc.strip()
     providers = build_provider_list(cf_account, cf_token, hf_token, freetheai_key, together_key, nexa_key, agnes_key,
                                     pollinations_key, pollinations_model, flux_steps, {}, char_lock, None, style_mode)
     if not providers: st.error("Chưa có provider.")
     else:
         st.write(f"**{len(providers)} provider ({style_mode} mode):**")
         for i, p in enumerate(providers, 1): st.write(f"{i}. {p['name']}")
+        if char_lock:
+            st.info(f"Char lock keys: {list(char_lock.keys())}")
         if st.button("▶️ Test 1 ảnh"):
             if style_mode == "horror":
                 tp = "2D dark horror illustration: a lone figure in a foggy hallway, moonlight, deep shadows, no text"
@@ -1818,21 +1839,27 @@ if audio:
         else: internal_mode = "voice_only"
 
         char_lock = build_character_lock(char_main_name, char_main_desc, char_second_name, char_second_desc, enable_char_lock)
-        if char_lock: st.success(f"🔒 Khóa {len(char_lock)} nhân vật")
+        if enable_global_char and global_char_desc.strip():
+            char_lock["__global__"] = global_char_desc.strip()
+            st.success(f"🌍 Global Lock: {global_char_desc[:60]}...")
+        if char_lock and len([k for k in char_lock.keys() if k != '__global__']) > 0:
+            st.success(f"🔒 Per-name lock: {[k for k in char_lock.keys() if k != '__global__']}")
         seed_lock = random.randint(1, 2**31 - 1) if enable_seed_lock else None
         if seed_lock: st.info(f"🎲 Seed: {seed_lock}")
 
         cache_dir = Path.home() / ".wb_cache"; cache_dir.mkdir(exist_ok=True)
 
-        root = Path(tempfile.mkdtemp(prefix=f"wb_v91_{style_mode}_"))
+        root = Path(tempfile.mkdtemp(prefix=f"wb_v92_{style_mode}_"))
         try:
             src = root / audio.name; src.write_bytes(audio.getbuffer())
             dur = ffprobe_duration(src)
-            st.info(f"Thời lượng: {dur/60:.2f} phút. Batch {BATCH_SECONDS//60} phút.")
+
+            effective_batch = 2 * 60 if style_mode == "horror" else BATCH_SECONDS
+            st.info(f"Thời lượng: {dur/60:.2f} phút. Batch {effective_batch//60} phút (style={style_mode}).")
 
             client = groq_client(groq_key)
             bd = root / "batches"; bd.mkdir()
-            chunks = chunk_audio(src, bd, BATCH_SECONDS)
+            chunks = chunk_audio(src, bd, effective_batch)
             hp = Path("hand.png")
             bvids = []; all_s = 0; stt = st.empty()
 
@@ -1844,7 +1871,7 @@ if audio:
                       if "Cố định" in camera_motion_mode else "auto")
 
             for idx, (bi, chunk, bdur) in enumerate(vc):
-                bstart = bi * BATCH_SECONDS
+                bstart = bi * effective_batch
                 stt.markdown(f"### 🧠 Đợt {idx+1}/{len(vc)} — STT...")
                 tr = transcribe_file(client, chunk, stt_model, lang_code, cache_dir)
                 if lang_code is None: st.info(f"🌐 Whisper: **{detect_language(tr)}**")
