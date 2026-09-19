@@ -1,16 +1,15 @@
 """
-Xưởng Video Diễn Hoạt Kiến Thức AI — Bản Siêu Cấp V9.3
-=====================================================
-V9.3 FIX:
-- Fix gạch chân title đè lên chữ (tính underline_y sai)
-- Fix text box đè nhân vật giữa (smart_filter + auto-downgrade)
-- Preset nhân vật cổ đại / Ai Cập / Trung cổ / Tiền sử
-- Auto downgrade size chữ dài > 20 ký tự
+Xưởng Video Diễn Hoạt Kiến Thức AI — Bản Siêu Cấp V10.0
+=======================================================
+V10.0 MỚI:
+- English mode: AI tự vẽ chữ (native text) + màu tự nhiên (earth tones)
+- Vietnamese mode: giữ Pillow overlay (tránh AI sai dấu)
+- 2 style prompt khác nhau theo ngôn ngữ
 
-Kế thừa V9.2:
-- Global Character Lock
-- Horror 5-10s + Comic
-- Nhạc nền + SFX + Voice+Text combined
+Kế thừa V9.3:
+- Preset nhân vật cổ đại + Global Lock
+- Fix gạch chân title + text box đè nhân vật
+- Horror 5-10s + Comic + Voice+Text + Nhạc nền + SFX
 """
 
 import os, re, io, json, math, time, base64, random, shutil, subprocess, tempfile, threading, wave
@@ -29,7 +28,7 @@ import numpy as np
 # ============================================================
 # CẤU HÌNH
 # ============================================================
-APP_TITLE = "Xưởng Video Diễn Hoạt Kiến Thức AI (V9.3)"
+APP_TITLE = "Xưởng Video Diễn Hoạt Kiến Thức AI (V10.0)"
 BATCH_SECONDS = 5 * 60
 FPS = 24
 WIDTH = 1280
@@ -70,16 +69,15 @@ VALID_SFX = {"none", "whoosh", "pop", "ding", "impact", "sad", "bell", "typing",
 HORROR_SFX = {"none", "whoosh", "impact", "sad", "typing", "swoosh",
               "creak", "whisper", "scream", "heartbeat", "thunder", "silence_break"}
 
-# ===== PRESET NHÂN VẬT =====
 CHAR_PRESETS = {
     "Custom (tự nhập)": "",
     "🏹 Cổ đại / Cave man": "a cartoon caveman character with simple line art, big expressive eyes, messy wild hair, wearing a rough animal-skin tunic, barefoot, thin stick-figure body with slightly rounded head, hand-drawn doodle style, thick black outlines, funny and expressive face",
-    "🐫 Ai Cập cổ": "a cartoon ancient Egyptian character with simple line art, big expressive eyes, wearing a white shendyt kilt and gold collar, black bob hairstyle, thin stick-figure body, thick black outlines, hand-drawn doodle style, expressive funny face",
-    "⚔️ Trung cổ / Medieval": "a cartoon medieval peasant character with simple line art, big expressive eyes, wearing a rough brown tunic and rope belt, messy hair, thin stick-figure body, thick black outlines, hand-drawn doodle style, funny face",
-    "🦴 Tiền sử / Prehistoric": "a cartoon prehistoric human character with simple line art, big expressive eyes, long messy hair, wearing a ragged animal fur, barefoot, thin stick-figure body, thick black outlines, hand-drawn doodle style, curious expression",
-    "🔬 Nhà khoa học điên": "a cartoon mad scientist character with simple line art, big expressive eyes, wild messy hair, wearing a white lab coat and goggles on forehead, thin stick-figure body, thick black outlines, hand-drawn doodle style, excited expression",
-    "👑 Vua / Hoàng đế": "a cartoon king character with simple line art, big expressive eyes, wearing a golden crown and purple royal robe with fur trim, thin stick-figure body, thick black outlines, hand-drawn doodle style, proud expression",
-    "🧙 Phù thủy": "a cartoon wizard character with simple line art, big expressive eyes, long white beard, wearing a tall pointed hat and long starry robe, thin stick-figure body, thick black outlines, hand-drawn doodle style, wise expression",
+    "🐫 Ai Cập cổ": "a cartoon ancient Egyptian character with simple line art, big expressive eyes, wearing a white shendyt kilt and gold collar, black bob hairstyle, thin stick-figure body, thick black outlines, hand-drawn doodle style",
+    "⚔️ Trung cổ / Medieval": "a cartoon medieval peasant character with simple line art, big expressive eyes, wearing a rough brown tunic and rope belt, messy hair, thin stick-figure body, thick black outlines, hand-drawn doodle style",
+    "🦴 Tiền sử / Prehistoric": "a cartoon prehistoric human character with simple line art, big expressive eyes, long messy hair, wearing a ragged animal fur, barefoot, thin stick-figure body, thick black outlines, hand-drawn doodle style",
+    "🔬 Nhà khoa học điên": "a cartoon mad scientist character with simple line art, big expressive eyes, wild messy hair, wearing a white lab coat and goggles on forehead, thin stick-figure body, thick black outlines, hand-drawn doodle style",
+    "👑 Vua / Hoàng đế": "a cartoon king character with simple line art, big expressive eyes, wearing a golden crown and purple royal robe with fur trim, thin stick-figure body, thick black outlines, hand-drawn doodle style",
+    "🧙 Phù thủy": "a cartoon wizard character with simple line art, big expressive eyes, long white beard, wearing a tall pointed hat and long starry robe, thin stick-figure body, thick black outlines, hand-drawn doodle style",
 }
 
 NOTE_FREQ = {
@@ -150,19 +148,32 @@ def horror_sanitize(text):
 # UI
 # ============================================================
 st.set_page_config(page_title=APP_TITLE, page_icon="🎬", layout="wide")
-st.title("🎬 Xưởng Video Diễn Hoạt Kiến Thức AI — V9.3")
-st.caption("Preset nhân vật cổ đại + Fix gạch chân title + Global Lock + Horror 5-10s")
+st.title("🎬 Xưởng Video Diễn Hoạt Kiến Thức AI — V10.0")
+st.caption("English: AI vẽ chữ + màu tự nhiên | Vietnamese: Pillow overlay + nền trắng")
 
 with st.sidebar:
     st.header("🎨 Style Mode")
-    style_mode_ui = st.radio(
-        "Phong cách video",
-        ["📚 Kiến Thức (Comic)", "👻 Kinh Dị (Horror)"],
-        index=0,
-    )
+    style_mode_ui = st.radio("Phong cách video",
+        ["📚 Kiến Thức (Comic)", "👻 Kinh Dị (Horror)"], index=0)
     style_mode = "horror" if "Horror" in style_mode_ui else "comic"
 
-    if style_mode == "horror":
+    st.header("🌐 Ngôn ngữ")
+    language_mode = st.selectbox("Ngôn ngữ video",
+        ["Auto Detect", "Tiếng Việt", "English"], index=0,
+        help="English: AI tự vẽ chữ + màu tự nhiên. Vietnamese: Pillow overlay + nền trắng.")
+
+    # Detect effective language (Auto = vi mặc định)
+    effective_lang = "vi"
+    if language_mode == "English": effective_lang = "en"
+    elif language_mode == "Tiếng Việt": effective_lang = "vi"
+    elif language_mode == "Auto Detect": effective_lang = "vi"  # sẽ update sau STT
+
+    if style_mode == "comic":
+        if effective_lang == "en":
+            st.success("🇬🇧 English comic: AI vẽ chữ + màu nâu đất tự nhiên")
+        else:
+            st.info("🇻🇳 Vietnamese comic: Pillow overlay + nền trắng")
+    else:
         st.warning("⚠️ Horror mode: nhịp 5-10s/cảnh. Khuyên dùng Pollinations flux-pro.")
 
     st.header("🔑 API Keys")
@@ -195,10 +206,6 @@ with st.sidebar:
     use_script_mode = st.radio("Chế độ phân tích",
         ["Chỉ dùng voice", "Kết hợp voice + text", "Chỉ dùng text"], index=0)
 
-    st.header("🌐 Ngôn ngữ")
-    language_mode = st.selectbox("Ngôn ngữ video",
-        ["Auto Detect", "Tiếng Việt", "English"], index=0)
-
     st.header("👥 Nhân vật")
     char_main_name = st.text_input("Tên nhân vật chính", value="Tôi")
     char_main_desc = st.text_area("Mô tả ngoại hình (English)",
@@ -208,31 +215,19 @@ with st.sidebar:
     char_second_desc = st.text_area("Mô tả ngoại hình (English)",
         value="a young Vietnamese woman, long black hair tied in ponytail, wearing an orange hoodie",
         height=60)
-    enable_char_lock = st.checkbox("🔒 Khóa ngoại hình theo tên", value=True,
-        help="Chèn mô tả nhân vật khi tên xuất hiện trong prompt.")
+    enable_char_lock = st.checkbox("🔒 Khóa ngoại hình theo tên", value=True)
     enable_seed_lock = st.checkbox("🎲 Cố định Seed", value=False)
 
-    # ===== GLOBAL CHARACTER LOCK với PRESET =====
     st.markdown("---")
     st.subheader("🌍 Global Character Lock")
-    enable_global_char = st.checkbox("Bật Global Lock", value=False,
-        help="MỌI cảnh đều có nhân vật chính, bất kể có nhắc tên hay không.")
-
-    # Preset dropdown
-    preset_choice = st.selectbox("🎨 Preset nhân vật", list(CHAR_PRESETS.keys()),
-        index=1, help="Chọn preset để tự động điền mô tả nhân vật.")
-
-    # Auto-fill preset vào textarea
+    enable_global_char = st.checkbox("Bật Global Lock", value=False)
+    preset_choice = st.selectbox("🎨 Preset nhân vật", list(CHAR_PRESETS.keys()), index=1)
     if preset_choice != "Custom (tự nhập)" and CHAR_PRESETS[preset_choice]:
         default_global = CHAR_PRESETS[preset_choice]
     else:
-        default_global = "a young Vietnamese man, short black hair, brown eyes, wearing a blue hoodie and dark jeans"
-
+        default_global = "a young Vietnamese man, short black hair, brown eyes, wearing a blue hoodie"
     global_char_desc = st.text_area("Mô tả nhân vật chính toàn cục (English)",
-        value=default_global,
-        height=100,
-        help="Nhân vật này sẽ xuất hiện trong MỌI cảnh. Chọn preset hoặc tự nhập.")
-    # =========================================
+        value=default_global, height=100)
 
     st.header("🔊 Âm thanh")
     enable_sfx = st.checkbox("Bật sound effects", value=True)
@@ -254,7 +249,8 @@ with st.sidebar:
     ], index=0)
 
     st.header("🎨 Overlay")
-    enable_rich_overlay = st.checkbox("Overlay nhiều text box", value=True)
+    enable_rich_overlay = st.checkbox("Overlay nhiều text box", value=True,
+        help="Chỉ áp dụng cho Vietnamese mode")
     enable_arrows = st.checkbox("Vẽ mũi tên", value=True)
     enable_shadow = st.checkbox("Đổ bóng chữ", value=True)
 
@@ -648,6 +644,9 @@ def make_scene_plan(client, transcript_text, batch_start, batch_duration, model,
     lang_name = "English" if is_en else "Tiếng Việt"
     is_horror = (style_mode == "horror")
 
+    # LƯU Ý: Native text rendering khi English + Comic
+    native_text = is_en and not is_horror
+
     char_note = ""
     if char_lock:
         items = [(n, d) for n, d in char_lock.items() if n != "__global__"]
@@ -659,42 +658,63 @@ def make_scene_plan(client, transcript_text, batch_start, batch_duration, model,
     if is_horror:
         style_rule = """RÀNG BUỘC PHONG CÁCH HORROR:
 - Dark atmospheric illustration, cinematic horror mood, deep shadows
-- Rich moody backgrounds: dark rooms, moonlit forests, foggy streets
-- Dramatic lighting: blue moonlight, red ambient, harsh shadows
-- Characters show fear, tension, dread, horror
-- Color palette: deep blacks, blood reds, cool blues, muted greens
+- Rich moody backgrounds, dramatic lighting
 - NO text, letters, numbers in the image
-- IMPORTANT: Use soft keywords. Prefer "crimson liquid", "motionless figure", "silhouette"."""
+- Use soft keywords: "crimson liquid", "motionless figure", "silhouette"."""
         title_rule = f"- {'English: 3-6 words, mysterious, UPPERCASE' if is_en else 'Tiếng Việt: 3-6 từ, bí ẩn, VIẾT HOA'}"
-        visual_rule = """MỖI CẢNH LÀ SÂN KHẤU KINH DỊ KHÁC NHAU:
-- Bối cảnh: hành lang tối, nghĩa địa, rừng sương mù, phòng bỏ hoang...
-- Nhân vật: nhân vật chính + bóng đen/mắt đỏ/hình thù kỳ dị
-- Đồ vật ẩn dụ: đèn nhấp nháy, cửa hé mở, gương nứt, búp bê cũ
-- Cảm xúc: sợ hãi, hoảng loạn, bị theo dõi
-NHỊP HORROR 5-10s/CẢNH: cảnh ngắn = giật mình, cảnh dài = chờ đợi."""
-        rich_note = """QUY TẮC OVERLAY ("text_boxes"): Tạo ĐÚNG 1-2 text_boxes.
-Vị trí PHẢI ở 4 góc: (0.10,0.28) (0.72,0.28) (0.10,0.78) (0.72,0.78).
-CẤM ĐẶT ở vùng trung tâm (x 0.25-0.75, y 0.30-0.75).
-Text NGẮN: tối đa 4 từ.""" if enable_rich else ""
-        sfx_note = """QUY TẮC SFX ("sfx"): Chọn 1: creak/whisper/scream/heartbeat/thunder/silence_break/whoosh/impact/swoosh/none.""" if enable_sfx else ""
-        music_note = """QUY TẮC NHẠC NỀN ("music_emotion"): Chọn 1: dread/panic/eerie/ominous/sad/tense/neutral/none.""" if enable_music else ""
-        camera_rule = """Chọn 1: slow_zoom_in/slow_zoom_out/creepy_pan_left/creepy_pan_right/dramatic_zoom_face/static_dread."""
+        visual_rule = """MỖI CẢNH LÀ SÂN KHẤU KINH DỊ KHÁC NHAU.
+NHỊP HORROR 5-10s/CẢNH: cảnh ngắn = giật mình."""
+        rich_note = """QUY TẮC OVERLAY: Tạo ĐÚNG 1-2 text_boxes. 4 góc.
+CẤM ĐẶT ở vùng trung tâm.""" if enable_rich else ""
+        sfx_note = """SFX: creak/whisper/scream/heartbeat/thunder/silence_break/whoosh/impact/swoosh/none.""" if enable_sfx else ""
+        music_note = """NHẠC: dread/panic/eerie/ominous/sad/tense/neutral/none.""" if enable_music else ""
+        camera_rule = """slow_zoom_in/slow_zoom_out/creepy_pan_left/creepy_pan_right/dramatic_zoom_face/static_dread."""
     else:
-        style_rule = "RÀNG BUỘC: 2D comic doodle, nét mực đen dày, nền TRẮNG TINH, KHÔNG chữ/số trong ảnh."
+        if native_text:
+            # English comic: AI vẽ chữ + màu tự nhiên
+            style_rule = """RÀNG BUỘC PHONG CÁCH ENGLISH COMIC:
+- COLORED cartoon illustration with NATURAL WARM EARTH TONES (brown, tan, orange, yellow, beige, warm gray)
+- Soft textures on rocks, wood, fabric, ground
+- Warm firelight glow, soft shadows, cinematic lighting
+- NOT pure white background. If scene is outdoors: natural sky (blue, orange sunset, gray cloudy). If indoors: warm cave/room tones.
+- Thick black outlines, hand-drawn doodle style
+- EXPRESSIVE CARTOON CHARACTERS with clear emotions
+- RENDER ENGLISH TEXT in the image: title at top, speech bubbles with text, labels. Text MUST be in English and correctly spelled.
+- Wide 16:9 cinematic composition
+- CHARACTER GENDER: male = MALE, female = FEMALE."""
+        else:
+            # Vietnamese comic: nền trắng, Pillow overlay
+            style_rule = "RÀNG BUỘC: 2D comic doodle, nét mực đen dày, nền TRẮNG TINH, KHÔNG chữ/số trong ảnh."
         title_rule = f"- {'English: 3-6 words, UPPERCASE' if is_en else 'Tiếng Việt: 3-6 từ, VIẾT HOA'}"
         visual_rule = """MỖI CẢNH LÀ SÂN KHẤU KHÁC NHAU. KHÔNG lặp bố cục.
 Bao gồm: nhân vật + tư thế, hành động, bối cảnh, đồ vật ẩn dụ, cảm xúc, màu nhấn."""
-        rich_note = """QUY TẮC OVERLAY ("text_boxes"): Tạo ĐÚNG 2-3 text_boxes.
-Vị trí PHẢI ở 4 góc: (0.10,0.28) (0.72,0.28) (0.10,0.78) (0.72,0.78).
-CẤM ĐẶT ở vùng trung tâm (x 0.25-0.75, y 0.30-0.75) vì đó là chỗ nhân vật.
+        rich_note = """QUY TẮC OVERLAY: Tạo ĐÚNG 2-3 text_boxes. 4 góc.
 Text NGẮN: tối đa 4-5 từ.""" if enable_rich else ""
-        sfx_note = """QUY TẮC SFX ("sfx"): Chọn 1: whoosh/pop/ding/impact/sad/bell/typing/sparkle/swoosh/none.""" if enable_sfx else ""
-        music_note = """QUY TẮC NHẠC NỀN ("music_emotion"): Chọn 1: happy/sad/epic/calm/tense/inspirational/neutral/none.""" if enable_music else ""
-        camera_rule = """Chọn 1: zoom_in_center/zoom_out_center/pan_left_to_right/pan_right_to_left/zoom_in_top_left/zoom_in_bottom_right/ken_burns_slow/static."""
+        sfx_note = """SFX: whoosh/pop/ding/impact/sad/bell/typing/sparkle/swoosh/none.""" if enable_sfx else ""
+        music_note = """NHẠC: happy/sad/epic/calm/tense/inspirational/neutral/none.""" if enable_music else ""
+        camera_rule = """zoom_in_center/zoom_out_center/pan_left_to_right/pan_right_to_left/zoom_in_top_left/zoom_in_bottom_right/ken_burns_slow/static."""
 
     sample_motion = "slow_zoom_in" if is_horror else "zoom_in_center"
     sample_sfx = "creak" if is_horror else "sparkle"
     sample_music = "dread" if is_horror else "inspirational"
+
+    # Hướng dẫn native text (chỉ cho English comic)
+    if native_text:
+        native_note = f"""
+⭐ QUAN TRỌNG — NATIVE TEXT RENDERING:
+Vì đây là English mode, AI sẽ TỰ VẼ chữ vào ảnh. Do đó:
+- "title": viết tiếng Anh, 3-6 từ, IN HOA
+- "callout_text": viết tiếng Anh, ngắn gọn
+- Trong "visual_prompt", MÔ TẢ vị trí chữ sẽ xuất hiện:
+  * "Title text 'XXX' at top center"
+  * "Speech bubble with text 'YYY' near the character"
+  * KHÔNG cần cấm text nữa. Ngược lại, YÊU CẦU AI vẽ chữ rõ ràng.
+- Ví dụ visual_prompt: "Colored cartoon illustration with natural warm earth tones. A caveman stands in a cave holding a stone axe, campfire nearby, cave paintings on walls. Title text 'FIRST TOOL?' at top center. Speech bubble 'WHAT IS THIS?' near the character. Earth tones, brown and orange, warm firelight."
+"""
+    else:
+        native_note = """
+QUY TẮC NHÂN VẬT: Ghi rõ "male character"/"female character".
+"""
 
     system = f"""Bạn là giám đốc sáng tạo kịch bản cho kênh {("KINH DỊ" if is_horror else "hoạt họa kiến thức")}.
 NGÔN NGỮ OUTPUT: {lang_name}.
@@ -707,10 +727,10 @@ QUY TẮC TIÊU ĐỀ ("title"):
 QUY TẮC CHỮ TRÊN TRANH ("callout_type", "callout_text"):
 - "speech": bong bóng thoại. "thought": đám mây. "sticker": nhãn dán. "none": không chữ.
 
-QUY TẮC QUAN TRỌNG NHẤT — "visual_prompt":
+QUY TẮC "visual_prompt":
 {visual_rule}
 
-QUY TẮC NHÂN VẬT: Ghi rõ "male character"/"female character".
+{native_note}
 
 {style_rule}
 {rich_note}
@@ -738,10 +758,9 @@ JSON FORMAT:
 
     if use_script_mode == "combined" and user_script.strip():
         user = (f"Audio length: {batch_duration:.2f}s.\nMAX {expected} SCENES.\n\n"
-                f"USER SCRIPT:\n{user_script}\n\nWHISPER TIMING:\n{transcript_text}\n\n"
-                f"CRITICAL: Match script to whisper timestamps.")
+                f"USER SCRIPT:\n{user_script}\n\nWHISPER TIMING:\n{transcript_text}")
     elif use_script_mode == "text_only" and user_script.strip():
-        user = f"Audio length: {batch_duration:.2f}s.\nMAX {expected} SCENES.\n\nSCRIPT:\n{user_script}\n\nDivide evenly."
+        user = f"Audio length: {batch_duration:.2f}s.\nMAX {expected} SCENES.\n\nSCRIPT:\n{user_script}"
     else:
         user = f"Audio length: {batch_duration:.2f}s.\nMAX {expected} SCENES.\n\nTRANSCRIPT:\n{transcript_text}"
 
@@ -754,7 +773,6 @@ JSON FORMAT:
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}])
         raw = r.choices[0].message.content or ""
         obj = extract_json(raw); raw_scenes = obj.get("scenes", [])
-        if not raw_scenes: st.warning(f"⚠️ Không có scenes. Preview: {raw[:200]}")
     except Exception as e:
         st.error(f"❌ Qwen fail: {str(e)[:200]}")
         if raw: st.code(raw[:1000], language="text")
@@ -800,7 +818,7 @@ JSON FORMAT:
             vp = str(s.get("visual_prompt", "")).strip()
             if not vp or len(vp) < 10: continue
             if is_horror: vp = horror_sanitize(vp)
-            else: vp = sanitize_prompt_text(vp)
+            elif not native_text: vp = sanitize_prompt_text(vp)
             ct = str(s.get("callout_type", "speech")).strip().lower()
             if ct not in ("speech", "thought", "sticker", "none"): ct = "speech"
             cm = str(s.get("camera_motion", list(valid_motions)[0])).strip().lower()
@@ -818,35 +836,18 @@ JSON FORMAT:
         except Exception: continue
 
     if not clean:
-        n = max(3, int(batch_duration / avg_dur))
-        sd = batch_duration / n
+        n = max(3, int(batch_duration / avg_dur)); sd = batch_duration / n
         fb_t = "SCENE" if is_en else "CẢNH"
-        if is_horror:
-            fb_prompts = [
-                "2D dark horror illustration: a lone figure in a foggy hallway, moonlight, deep shadows, no text",
-                "2D dark horror illustration: a figure staring at their reflection in a cracked mirror, no text",
-                "2D dark horror illustration: an old bedroom at 3am, curtains moving, no text",
-            ]
-            emotions_pool = ["dread", "eerie", "ominous", "tense"]
-            sfx_pool = ["creak", "whisper", "heartbeat", "thunder"]
-        else:
-            fb_prompts = [
-                "2D comic doodle: a person at the edge of a cliff at sunset, red sunset, white background, no text",
-                "2D comic doodle: a person sitting alone on a bench, thinking, white background, no text",
-            ]
-            emotions_pool = ["neutral", "calm", "inspirational"]
-            sfx_pool = ["whoosh", "pop", "ding"]
+        fb_prompts = ["Colored cartoon illustration with warm earth tones, a character in a natural scene, no text",
+                      "Colored cartoon illustration, dramatic lighting, a character, no text"]
         clean = []
         for i in range(n):
-            clean.append({"start": i * sd, "end": (i + 1) * sd,
-                "title": f"{fb_t} {i+1:02d}",
+            clean.append({"start": i * sd, "end": (i + 1) * sd, "title": f"{fb_t} {i+1:02d}",
                 "callout_type": "none", "callout_text": "", "callout_side": "right",
                 "camera_motion": random.choice(list(valid_motions)),
-                "sfx": random.choice(sfx_pool),
-                "music_emotion": random.choice(emotions_pool),
-                "visual_prompt": fb_prompts[i % len(fb_prompts)],
-                "text_boxes": []})
-        st.error(f"❌ Qwen fail — {n} fallback scenes")
+                "sfx": random.choice(list(valid_sfx_set - {"none"})),
+                "music_emotion": random.choice(list(VALID_EMOTIONS - {"none"})),
+                "visual_prompt": fb_prompts[i % len(fb_prompts)], "text_boxes": []})
 
     merge_threshold = max(min_s * 0.7, 5.0)
     merged = []
@@ -884,22 +885,37 @@ JSON FORMAT:
     return final
 
 # ============================================================
-# IMAGE PROVIDERS
+# IMAGE PROVIDERS — V10: nhận thêm language, title, callout_text
 # ============================================================
-def _build_full_prompt(prompt, chars=None, char_lock=None, style_mode="comic"):
+def _build_full_prompt(prompt, chars=None, char_lock=None, style_mode="comic",
+                       language="vi", title="", callout_text=""):
     chars = chars or {}
+    native_text = (language == "en" and style_mode == "comic")
+
     if style_mode == "horror":
         safe = horror_sanitize(prompt)
         style = """Dramatic dark illustration, cinematic horror atmosphere, deep shadows.
-Rich moody backgrounds: dark rooms, moonlit forests, foggy streets.
-Dramatic lighting: blue moonlight, red ambient, harsh shadows.
+Rich moody backgrounds: dark rooms, moonlit forests.
 Expressive characters showing fear, tension, dread.
 Color palette: deep blacks, blood reds, cool blues, muted greens.
-Soft keywords only: "crimson liquid", "motionless figure", "silhouette".
 Absolutely NO text, letters, numbers, captions.
 Wide 16:9 cinematic composition.
 CHARACTER GENDER: male = MALE, female = FEMALE."""
+    elif native_text:
+        # English comic: AI vẽ chữ + màu tự nhiên
+        safe = prompt  # KHÔNG sanitize text
+        style = """COLORED CARTOON ILLUSTRATION with natural warm earth tones.
+Color palette: brown, tan, orange, yellow, beige, warm gray, olive, deep green.
+Soft textures on rocks, wood, fabric, ground. Warm firelight glow, soft shadows, cinematic lighting.
+NOT pure white background. Outdoor scenes: natural sky (blue, orange sunset, gray cloudy).
+Indoor scenes: warm cave/room tones (brown, orange, tan).
+Thick black outlines, hand-drawn doodle style.
+EXPRESSIVE CARTOON CHARACTERS with clear emotions.
+RENDER ENGLISH TEXT VISIBLY: title at top, speech bubbles, labels. Text MUST be correctly spelled in English.
+Wide 16:9 cinematic composition.
+CHARACTER GENDER: male = MALE, female = FEMALE."""
     else:
+        # Vietnamese comic: nền trắng, Pillow overlay
         safe = sanitize_prompt_text(prompt)
         style = """Authentic 2D comic doodle art style, thick black ink contour outlines, hand-drawn wobbly lines.
 Pure solid flat white background OR simple scene background.
@@ -908,9 +924,21 @@ Selective vibrant spot colors (red, blue, orange, green) ONLY on key symbolic el
 Absolutely NO text, letters, numbers, captions, or empty speech balloons.
 Wide 16:9 cinematic composition.
 CHARACTER GENDER: male = MALE, female = FEMALE."""
+
     if char_lock: safe = enforce_character_lock(safe, char_lock)
     if char_lock and char_lock.get("__global__"):
-        safe += "\n\nIMPORTANT: The MAIN CHARACTER MUST be visible in this scene and identical to the description above. Do NOT omit the character."
+        safe += "\n\nIMPORTANT: The MAIN CHARACTER MUST be visible and identical to the description above."
+
+    # V10: chèn yêu cầu text cho English mode
+    if native_text:
+        text_instructions = []
+        if title:
+            text_instructions.append(f'Title text "{title}" at top center in bold black font')
+        if callout_text and callout_text.strip():
+            text_instructions.append(f'Speech bubble with text "{callout_text}"')
+        if text_instructions:
+            safe += "\n\nTEXT TO RENDER IN IMAGE: " + ". ".join(text_instructions) + "."
+
     return f"{safe}.\n\nSTYLE CONSTRAINTS:\n{style}"
 
 def _validate(data, name):
@@ -921,11 +949,13 @@ def _validate(data, name):
         raise RuntimeError(f"{name}: không phải ảnh")
     return data
 
-def agnes_image_request(prompt, api_key, timeout=45, chars=None, char_lock=None, seed=None, style_mode="comic"):
+def agnes_image_request(prompt, api_key, timeout=45, chars=None, char_lock=None, seed=None,
+                        style_mode="comic", language="vi", title="", callout_text=""):
     api_key = (api_key or "").strip()
     if not api_key: raise RuntimeError("Agnes: chưa có key")
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {"model": AGNES_MODEL, "prompt": _build_full_prompt(prompt, chars, char_lock, style_mode),
+    payload = {"model": AGNES_MODEL,
+               "prompt": _build_full_prompt(prompt, chars, char_lock, style_mode, language, title, callout_text),
                "size": "1280x720", "extra_body": {"response_format": "b64_json"}}
     r = requests.post(AGNES_API_URL, headers=headers, json=payload, timeout=timeout)
     if r.status_code == 429: raise RuntimeError("Agnes: rate limit")
@@ -938,12 +968,15 @@ def agnes_image_request(prompt, api_key, timeout=45, chars=None, char_lock=None,
         return _validate(img.content, "Agnes")
     raise RuntimeError("Agnes: no image")
 
-def cloudflare_image_request(prompt, account_id, api_token, timeout=45, steps=4, chars=None, char_lock=None, seed=None, style_mode="comic"):
+def cloudflare_image_request(prompt, account_id, api_token, timeout=45, steps=4, chars=None,
+                              char_lock=None, seed=None, style_mode="comic",
+                              language="vi", title="", callout_text=""):
     account_id = (account_id or "").strip(); api_token = (api_token or "").strip()
     if not account_id or not api_token: raise RuntimeError("Cloudflare: thiếu thông tin")
     url = f"{CLOUDFLARE_BASE}{account_id}/ai/run/{CLOUDFLARE_MODEL}"
     headers = {"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"}
-    payload = {"prompt": _build_full_prompt(prompt, chars, char_lock, style_mode), "steps": steps}
+    payload = {"prompt": _build_full_prompt(prompt, chars, char_lock, style_mode, language, title, callout_text),
+               "steps": steps}
     if seed is not None: payload["seed"] = int(seed)
     r = requests.post(url, headers=headers, json=payload, timeout=timeout)
     if r.status_code == 429: raise RuntimeError("Cloudflare: hết quota")
@@ -954,12 +987,13 @@ def cloudflare_image_request(prompt, account_id, api_token, timeout=45, steps=4,
     if not b64: raise RuntimeError("Cloudflare: no image")
     return _validate(base64.b64decode(b64), "Cloudflare")
 
-def hf_image_request(prompt, token, timeout=45, chars=None, char_lock=None, seed=None, style_mode="comic"):
+def hf_image_request(prompt, token, timeout=45, chars=None, char_lock=None, seed=None,
+                     style_mode="comic", language="vi", title="", callout_text=""):
     token = (token or "").strip()
     if not token: raise RuntimeError("HF: chưa có token")
     url = f"{HF_API_URL}{HF_MODEL}"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    payload = {"inputs": _build_full_prompt(prompt, chars, char_lock, style_mode)}
+    payload = {"inputs": _build_full_prompt(prompt, chars, char_lock, style_mode, language, title, callout_text)}
     if seed is not None: payload["parameters"] = {"seed": int(seed)}
     r = requests.post(url, headers=headers, json=payload, timeout=timeout)
     if r.status_code == 503: raise RuntimeError("HF: model loading")
@@ -967,11 +1001,14 @@ def hf_image_request(prompt, token, timeout=45, chars=None, char_lock=None, seed
     if r.status_code >= 400: raise RuntimeError(f"HF HTTP {r.status_code}")
     return _validate(r.content, "HF")
 
-def freetheai_image_request(prompt, api_key, timeout=45, chars=None, char_lock=None, seed=None, style_mode="comic"):
+def freetheai_image_request(prompt, api_key, timeout=45, chars=None, char_lock=None, seed=None,
+                             style_mode="comic", language="vi", title="", callout_text=""):
     api_key = (api_key or "").strip()
     if not api_key: raise RuntimeError("FreeTheAi: chưa có key")
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {"model": "flux", "prompt": _build_full_prompt(prompt, chars, char_lock, style_mode), "n": 1, "size": "1280x720"}
+    payload = {"model": "flux",
+               "prompt": _build_full_prompt(prompt, chars, char_lock, style_mode, language, title, callout_text),
+               "n": 1, "size": "1280x720"}
     if seed is not None: payload["seed"] = int(seed)
     r = requests.post(FREETHEAI_BASE, headers=headers, json=payload, timeout=timeout)
     if r.status_code == 429: raise RuntimeError("FreeTheAi: rate limit")
@@ -983,11 +1020,13 @@ def freetheai_image_request(prompt, api_key, timeout=45, chars=None, char_lock=N
         return _validate(img.content, "FreeTheAi")
     raise RuntimeError("FreeTheAi: no image")
 
-def together_image_request(prompt, api_key, timeout=45, chars=None, char_lock=None, seed=None, style_mode="comic"):
+def together_image_request(prompt, api_key, timeout=45, chars=None, char_lock=None, seed=None,
+                            style_mode="comic", language="vi", title="", callout_text=""):
     api_key = (api_key or "").strip()
     if not api_key: raise RuntimeError("Together: chưa có key")
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {"model": TOGETHER_MODEL, "prompt": _build_full_prompt(prompt, chars, char_lock, style_mode),
+    payload = {"model": TOGETHER_MODEL,
+               "prompt": _build_full_prompt(prompt, chars, char_lock, style_mode, language, title, callout_text),
                "width": WIDTH, "height": HEIGHT, "steps": 4, "n": 1, "response_format": "b64_json"}
     r = requests.post(TOGETHER_BASE, headers=headers, json=payload, timeout=timeout)
     if r.status_code == 429: raise RuntimeError("Together: rate limit")
@@ -999,11 +1038,13 @@ def together_image_request(prompt, api_key, timeout=45, chars=None, char_lock=No
         return _validate(img.content, "Together")
     raise RuntimeError("Together: no image")
 
-def nexa_image_request(prompt, api_key, timeout=45, chars=None, char_lock=None, seed=None, style_mode="comic"):
+def nexa_image_request(prompt, api_key, timeout=45, chars=None, char_lock=None, seed=None,
+                        style_mode="comic", language="vi", title="", callout_text=""):
     api_key = (api_key or "").strip()
     if not api_key: raise RuntimeError("NexaAPI: chưa có key")
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {"model": NEXA_MODEL, "prompt": _build_full_prompt(prompt, chars, char_lock, style_mode),
+    payload = {"model": NEXA_MODEL,
+               "prompt": _build_full_prompt(prompt, chars, char_lock, style_mode, language, title, callout_text),
                "width": WIDTH, "height": HEIGHT, "n": 1}
     if seed is not None: payload["seed"] = int(seed)
     r = requests.post(NEXA_BASE, headers=headers, json=payload, timeout=timeout)
@@ -1016,10 +1057,12 @@ def nexa_image_request(prompt, api_key, timeout=45, chars=None, char_lock=None, 
         return _validate(img.content, "NexaAPI")
     raise RuntimeError("NexaAPI: no image")
 
-def pollinations_image_request(prompt, api_key, model="flux-pro", timeout=45, seed=None, chars=None, char_lock=None, style_mode="comic"):
+def pollinations_image_request(prompt, api_key, model="flux-pro", timeout=45, seed=None, chars=None,
+                                char_lock=None, style_mode="comic", language="vi", title="", callout_text=""):
     api_key = (api_key or "").strip()
     if not api_key: raise RuntimeError("Pollinations: chưa có key")
-    encoded = requests.utils.quote(_build_full_prompt(prompt, chars, char_lock, style_mode), safe="")
+    encoded = requests.utils.quote(
+        _build_full_prompt(prompt, chars, char_lock, style_mode, language, title, callout_text), safe="")
     url = f"{POLLINATIONS_BASE}{encoded}"
     params = {"width": WIDTH, "height": HEIGHT, "model": model,
               "nologo": "true", "enhance": "true", "safe": "false"}
@@ -1069,7 +1112,7 @@ def save_image(data, output_path):
         raise RuntimeError(f"Ảnh invalid: {e}")
 
 # ============================================================
-# OVERLAY — V9.3 với FIX
+# OVERLAY
 # ============================================================
 def draw_arrow(draw, s, e, color, w=5):
     draw.line([s, e], fill=color, width=w)
@@ -1086,42 +1129,29 @@ def draw_text_shadow(draw, xy, text, font, fill, sw=0, sf=None, shadow=True):
     else: draw.text((x, y), text, font=font, fill=fill)
 
 def draw_rich_text_box(img, draw, tb, enable_shadow=True):
-    """V9.3: Auto-downgrade size + skip nếu tràn vào vùng nhân vật."""
     try:
         x = int(tb["x"] * WIDTH); y = int(tb["y"] * HEIGHT)
         text = tb["text"]; color = COLOR_MAP.get(tb["color"], "#212121")
         stl = tb["style"]
-
-        # Auto downgrade size nếu text dài
         size_key = tb["size"]
-        if len(text) > 20 and size_key in ("large", "huge"):
-            size_key = "medium"
-        if len(text) > 30 and size_key == "medium":
-            size_key = "small"
+        if len(text) > 20 and size_key in ("large", "huge"): size_key = "medium"
+        if len(text) > 30 and size_key == "medium": size_key = "small"
         f_size = SIZE_MAP.get(size_key, 30)
         f = font_for(f_size, bold=True)
-
         bbox = draw.textbbox((0, 0), text, font=f)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-
-        # SKIP nếu tràn vào vùng trung tâm (nhân vật) — V9.3 fix
-        text_end_x = x + tw
-        text_end_y = y + th
+        text_end_x = x + tw; text_end_y = y + th
         if text_end_x > WIDTH * 0.30 and x < WIDTH * 0.70:
             if text_end_y > HEIGHT * 0.30 and y < HEIGHT * 0.75:
-                return  # Chữ đang đè vùng trung tâm → bỏ
-
-        # Clamp không tràn mép
+                return
         if x + tw + 20 > WIDTH: x = max(10, WIDTH - tw - 20)
         if y + th + 20 > HEIGHT: y = max(TITLE_BAND_H + 10, HEIGHT - th - 20)
         if x < 10: x = 10
         if y < TITLE_BAND_H + 10: y = TITLE_BAND_H + 10
-
         if stl == "highlighted":
             px, py = 16, 10
             rect = [x - px, y - py, x + tw + px, y + th + py + 6]
-            if enable_shadow:
-                draw.rounded_rectangle([rect[0]+3, rect[1]+3, rect[2]+3, rect[3]+3], radius=10, fill=(0,0,0,60))
+            if enable_shadow: draw.rounded_rectangle([rect[0]+3, rect[1]+3, rect[2]+3, rect[3]+3], radius=10, fill=(0,0,0,60))
             draw.rounded_rectangle(rect, radius=10, fill=color, outline="white", width=3)
             draw.text((x, y), text, fill="white", font=f)
         elif stl == "outlined":
@@ -1135,26 +1165,20 @@ def draw_rich_text_box(img, draw, tb, enable_shadow=True):
     except Exception: pass
 
 def smart_filter_tbs(tbs, callout_text, callout_type, callout_side):
-    """V9.3: Chỉ cho phép 4 góc."""
     filtered = []; min_dist = 0.20
     for tb in tbs:
         x, y = tb["x"], tb["y"]
         if y < 0.25: continue
-        # Chỉ cho phép 4 góc
         in_corners = (
-            (x < 0.30 and y < 0.40) or
-            (x > 0.65 and y < 0.40) or
-            (x < 0.30 and y > 0.72) or
-            (x > 0.65 and y > 0.72)
+            (x < 0.30 and y < 0.40) or (x > 0.65 and y < 0.40) or
+            (x < 0.30 and y > 0.72) or (x > 0.65 and y > 0.72)
         )
         if not in_corners: continue
-        # Bỏ nếu đè callout
         if callout_text and callout_type != "none":
             if callout_side == "left":
                 if x < 0.45 and 0.35 < y < 0.55: continue
             else:
                 if x > 0.55 and 0.35 < y < 0.55: continue
-        # Bỏ nếu quá gần box khác
         close = False
         for ex in filtered:
             if abs(ex["x"] - x) < min_dist and abs(ex["y"] - y) < min_dist:
@@ -1164,8 +1188,19 @@ def smart_filter_tbs(tbs, callout_text, callout_type, callout_side):
     return filtered
 
 def add_comic_overlays(image_path, title, callout_type, callout_text, callout_side, output_path,
-                        text_boxes=None, enable_arrows=True, enable_shadow=True, style_mode="comic"):
+                        text_boxes=None, enable_arrows=True, enable_shadow=True,
+                        style_mode="comic", language="vi"):
+    """
+    V10: Nếu language=EN + comic → SKIP hoàn toàn (AI đã vẽ chữ + màu rồi).
+    Nếu VI hoặc Horror → vẽ Pillow overlay như cũ.
+    """
     img = Image.open(image_path).convert("RGB").resize((WIDTH, HEIGHT))
+
+    # V10: English comic → không overlay (AI tự vẽ)
+    if language == "en" and style_mode == "comic":
+        img.save(output_path, quality=95)
+        return
+
     draw = ImageDraw.Draw(img)
     is_horror = (style_mode == "horror")
     title_color = "#1a0000" if is_horror else "#111111"
@@ -1173,7 +1208,6 @@ def add_comic_overlays(image_path, title, callout_type, callout_text, callout_si
     bubble_text_color = "#6a0000" if is_horror else "#1b5e20"
     thought_text_color = "#1a0033" if is_horror else "#0d47a1"
 
-    # ===== TITLE với FIX GẠCH CHÂN =====
     if title:
         band_bg = "#0a0a0a" if is_horror else "white"
         draw.rectangle([0, 0, WIDTH, TITLE_BAND_H], fill=band_bg)
@@ -1184,22 +1218,16 @@ def add_comic_overlays(image_path, title, callout_type, callout_text, callout_si
             f_size -= 2; f_title = font_for(f_size, bold=True)
         box = draw.textbbox((0, 0), title, font=f_title)
         tw = box[2] - box[0]
-        text_x = (WIDTH - tw) / 2
-        text_y = 22
+        text_x = (WIDTH - tw) / 2; text_y = 22
         draw.text((text_x, text_y), title, fill=title_color, font=f_title)
-        # V9.3 FIX: underline_y = text_y + box[3] + padding (KHÔNG phải + height)
         underline_y = text_y + box[3] + 10
-        # Vẽ gạch chân bên dưới chữ, không đè
-        draw.line([(text_x, underline_y), (text_x + tw, underline_y)],
-                  fill=underline_color, width=4)
-    # =====================================
+        draw.line([(text_x, underline_y), (text_x + tw, underline_y)], fill=underline_color, width=4)
 
     if callout_text and callout_type != "none":
         f_text = font_for(26, bold=True)
         bb = draw.textbbox((0, 0), callout_text, font=f_text)
         bw, bh = bb[2] - bb[0], bb[3] - bb[1]
         cx, cy = (int(WIDTH * 0.28), int(HEIGHT * 0.45)) if callout_side == "left" else (int(WIDTH * 0.74), int(HEIGHT * 0.42))
-
         if callout_type == "speech":
             px, py = 20, 14
             rect = [cx - bw // 2 - px, cy - bh // 2 - py, cx + bw // 2 + px, cy + bh // 2 + py]
@@ -1567,11 +1595,11 @@ def create_placeholder(out, title):
     img.save(out, quality=95)
 
 # ============================================================
-# PARALLEL
+# PARALLEL — V10: nhận language
 # ============================================================
 def parallel_gen(scenes, batch_dir, providers, image_timeout, progress_state,
                  flux_steps=4, fair_share=True, circuit=True, prio_fast=True,
-                 enable_arrows=True, enable_shadow=True, style_mode="comic"):
+                 enable_arrows=True, enable_shadow=True, style_mode="comic", language="vi"):
     if not providers: raise RuntimeError("Không có provider nào.")
     total_s = len(scenes)
     if fair_share:
@@ -1608,7 +1636,8 @@ def parallel_gen(scenes, batch_dir, providers, image_timeout, progress_state,
             if ca >= MAX_ATTEMPTS_PER_SCENE:
                 create_placeholder(im, s["title"])
                 add_comic_overlays(im, s["title"], s.get("callout_type", "speech"), s.get("callout_text", ""),
-                                   s.get("callout_side", "right"), im, s.get("text_boxes", []), enable_arrows, enable_shadow, style_mode)
+                                   s.get("callout_side", "right"), im, s.get("text_boxes", []),
+                                   enable_arrows, enable_shadow, style_mode, language)
                 with rlock:
                     results[idx] = "placeholder"; progress_state["done"] += 1
                     progress_state["scene_status"][idx] = {"status": "placeholder", "provider": "placeholder", "started": None, "elapsed": 0.0, "attempts": ca}
@@ -1618,11 +1647,14 @@ def parallel_gen(scenes, batch_dir, providers, image_timeout, progress_state,
                 progress_state["scene_status"][idx] = {"status": "working", "provider": n, "started": t0, "elapsed": 0.0, "attempts": ca+1}
             try:
                 kw = pc.get("kwargs", {}).copy()
-                data = pc["fn"](s["visual_prompt"], *pc.get("args", []), timeout=image_timeout, **kw)
+                data = pc["fn"](s["visual_prompt"], *pc.get("args", []), timeout=image_timeout,
+                                title=s.get("title", ""), callout_text=s.get("callout_text", ""),
+                                language=language, **kw)
                 if not data or len(data) < 500: raise RuntimeError("empty")
                 save_image(data, ir)
                 add_comic_overlays(ir, s["title"], s.get("callout_type", "speech"), s.get("callout_text", ""),
-                                   s.get("callout_side", "right"), im, s.get("text_boxes", []), enable_arrows, enable_shadow, style_mode)
+                                   s.get("callout_side", "right"), im, s.get("text_boxes", []),
+                                   enable_arrows, enable_shadow, style_mode, language)
                 el = time.time() - t0; my += 1; lok += 1; ltime += el; cf = 0
                 with rlock:
                     results[idx] = n; pstats[n]["ok"] += 1; pstats[n]["total_time"] += el; pstats[n]["last_scene"] = idx+1
@@ -1639,7 +1671,8 @@ def parallel_gen(scenes, batch_dir, providers, image_timeout, progress_state,
                 else:
                     create_placeholder(im, s["title"])
                     add_comic_overlays(im, s["title"], s.get("callout_type", "speech"), s.get("callout_text", ""),
-                                       s.get("callout_side", "right"), im, s.get("text_boxes", []), enable_arrows, enable_shadow, style_mode)
+                                       s.get("callout_side", "right"), im, s.get("text_boxes", []),
+                                       enable_arrows, enable_shadow, style_mode, language)
                     with rlock:
                         results[idx] = "placeholder"; progress_state["done"] += 1
                         progress_state["scene_status"][idx] = {"status": "placeholder", "provider": "placeholder", "started": None, "elapsed": el, "attempts": attempts[idx]}
@@ -1659,11 +1692,14 @@ def parallel_gen(scenes, batch_dir, providers, image_timeout, progress_state,
             for pc in providers:
                 try:
                     kw = pc.get("kwargs", {}).copy()
-                    data = pc["fn"](s["visual_prompt"], *pc.get("args", []), timeout=min(image_timeout, 45), **kw)
+                    data = pc["fn"](s["visual_prompt"], *pc.get("args", []), timeout=min(image_timeout, 45),
+                                    title=s.get("title", ""), callout_text=s.get("callout_text", ""),
+                                    language=language, **kw)
                     if data and len(data) > 500:
                         save_image(data, ir)
                         add_comic_overlays(ir, s["title"], s.get("callout_type", "speech"), s.get("callout_text", ""),
-                                           s.get("callout_side", "right"), im, s.get("text_boxes", []), enable_arrows, enable_shadow, style_mode)
+                                           s.get("callout_side", "right"), im, s.get("text_boxes", []),
+                                           enable_arrows, enable_shadow, style_mode, language)
                         with rlock:
                             results[idx] = pc["name"]; pstats[pc["name"]]["ok"] += 1; progress_state["done"] += 1
                             progress_state["scene_status"][idx] = {"status": "done", "provider": pc["name"]+" (fb)", "started": None, "elapsed": 0.0, "attempts": attempts.get(idx, 0)}
@@ -1672,7 +1708,8 @@ def parallel_gen(scenes, batch_dir, providers, image_timeout, progress_state,
             if not ok:
                 create_placeholder(im, s["title"])
                 add_comic_overlays(im, s["title"], s.get("callout_type", "speech"), s.get("callout_text", ""),
-                                   s.get("callout_side", "right"), im, s.get("text_boxes", []), enable_arrows, enable_shadow, style_mode)
+                                   s.get("callout_side", "right"), im, s.get("text_boxes", []),
+                                   enable_arrows, enable_shadow, style_mode, language)
                 with rlock:
                     results[idx] = "placeholder"; progress_state["done"] += 1
                     progress_state["scene_status"][idx] = {"status": "placeholder", "provider": "placeholder", "started": None, "elapsed": 0.0, "attempts": attempts.get(idx, 0)}
@@ -1687,7 +1724,7 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
                  image_timeout, flux_steps=4, fair_share=True, circuit=True, prio_fast=True,
                  chars=None, char_lock=None, enable_arrows=True, enable_shadow=True,
                  enable_sfx=True, sfx_vol=-12, enable_music=True, music_vol=-22,
-                 seed_lock=None, style_mode="comic"):
+                 seed_lock=None, style_mode="comic", language="vi"):
     total = len(scenes)
     if total == 0: raise RuntimeError("Không có cảnh nào.")
     chars = chars or {}; char_lock = char_lock or {}
@@ -1695,7 +1732,8 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
                                     pol_key, pol_mod, flux_steps, chars, char_lock, seed_lock, style_mode)
     if not providers: raise RuntimeError("Chưa cấu hình provider.")
 
-    st.markdown(f"### 🔗 {len(providers)} Provider ({'👻 Horror' if style_mode=='horror' else '📚 Comic'} mode)")
+    native_text = (language == "en" and style_mode == "comic")
+    st.markdown(f"### 🔗 {len(providers)} Provider ({'👻 Horror' if style_mode=='horror' else '🇬🇧 English Comic (native text)' if native_text else '📚 Comic VI (Pillow overlay)'})")
     pc = st.columns(min(4, len(providers)))
     for i, p in enumerate(providers):
         with pc[i % len(pc)]: st.markdown(f"**{i+1}.** {p['name']}")
@@ -1703,8 +1741,7 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
         if "__global__" in char_lock:
             st.success(f"🌍 Global Lock: {char_lock['__global__'][:60]}...")
         others = [k for k in char_lock.keys() if k != "__global__"]
-        if others:
-            st.success(f"🔒 Per-name lock: {others}")
+        if others: st.success(f"🔒 Per-name lock: {others}")
     if seed_lock is not None: st.info(f"🎲 Seed: {seed_lock}")
 
     st.markdown("### 🎨 Tạo ảnh song song")
@@ -1746,7 +1783,7 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
     def run_p():
         try:
             r, _ = parallel_gen(scenes, batch_dir, providers, image_timeout, ps, flux_steps,
-                                fair_share, circuit, prio_fast, enable_arrows, enable_shadow, style_mode)
+                                fair_share, circuit, prio_fast, enable_arrows, enable_shadow, style_mode, language)
             rc["r"] = r
         except Exception as e: rc["e"] = e
     t = threading.Thread(target=run_p, daemon=True); t.start()
@@ -1820,17 +1857,20 @@ if st.sidebar.button("🔎 KIỂM TRA PROVIDER", use_container_width=True):
     else:
         st.write(f"**{len(providers)} provider ({style_mode} mode):**")
         for i, p in enumerate(providers, 1): st.write(f"{i}. {p['name']}")
-        if char_lock: st.info(f"Char lock keys: {list(char_lock.keys())}")
         if st.button("▶️ Test 1 ảnh"):
             if style_mode == "horror":
-                tp = "2D dark horror illustration: a lone figure in a foggy hallway, moonlight, deep shadows, no text"
+                tp = "2D dark horror illustration: a lone figure in a foggy hallway, moonlight, no text"
+            elif effective_lang == "en":
+                tp = "Colored cartoon illustration with warm earth tones, a caveman in a cave with campfire, cave paintings on walls, brown and orange palette"
             else:
-                tp = "2D comic doodle: a person at desk with laptop, thinking, red accents, white background, no text"
+                tp = "2D comic doodle: a person at desk with laptop, white background, no text"
             for pc in providers:
                 try:
                     with st.spinner(f"Test {pc['name']}..."):
                         t0 = time.time()
-                        d = pc["fn"](tp, *pc.get("args", []), timeout=45, **pc.get("kwargs", {}))
+                        d = pc["fn"](tp, *pc.get("args", []), timeout=45,
+                                    title="TEST TITLE", callout_text="HELLO WORLD",
+                                    language=effective_lang, **pc.get("kwargs", {}))
                         el = time.time() - t0
                     if d and len(d) > 500:
                         img = Image.open(io.BytesIO(d)).convert("RGB").resize((WIDTH, HEIGHT))
@@ -1847,8 +1887,9 @@ if audio:
         if not groq_key: st.error("Cần Groq API Key."); st.stop()
 
         lang_code = None
-        if language_mode == "Tiếng Việt": lang_code = "vi"
-        elif language_mode == "English": lang_code = "en"
+        if language_mode == "Tiếng Việt": lang_code = "vi"; effective_lang = "vi"
+        elif language_mode == "English": lang_code = "en"; effective_lang = "en"
+        else: lang_code = None  # Auto detect
         st.info(f"🌐 Ngôn ngữ: **{language_mode}** | 🎨 Style: **{style_mode.upper()}** | ⏱️ Nhịp: **{scene_min}-{scene_max}s**")
 
         if use_script_mode == "Kết hợp voice + text": internal_mode = "combined"
@@ -1860,14 +1901,13 @@ if audio:
             char_lock["__global__"] = global_char_desc.strip()
             st.success(f"🌍 Global Lock: {global_char_desc[:60]}...")
         others = [k for k in char_lock.keys() if k != '__global__']
-        if others:
-            st.success(f"🔒 Per-name lock: {others}")
+        if others: st.success(f"🔒 Per-name lock: {others}")
         seed_lock = random.randint(1, 2**31 - 1) if enable_seed_lock else None
         if seed_lock: st.info(f"🎲 Seed: {seed_lock}")
 
         cache_dir = Path.home() / ".wb_cache"; cache_dir.mkdir(exist_ok=True)
 
-        root = Path(tempfile.mkdtemp(prefix=f"wb_v93_{style_mode}_"))
+        root = Path(tempfile.mkdtemp(prefix=f"wb_v10_{style_mode}_"))
         try:
             src = root / audio.name; src.write_bytes(audio.getbuffer())
             dur = ffprobe_duration(src)
@@ -1891,7 +1931,10 @@ if audio:
                 bstart = bi * effective_batch
                 stt.markdown(f"### 🧠 Đợt {idx+1}/{len(vc)} — STT...")
                 tr = transcribe_file(client, chunk, stt_model, lang_code, cache_dir)
-                if lang_code is None: st.info(f"🌐 Whisper: **{detect_language(tr)}**")
+                if lang_code is None:
+                    detected = detect_language(tr)
+                    st.info(f"🌐 Whisper: **{detected}**")
+                    effective_lang = "en" if detected.startswith("en") else "vi"
                 segs = normalize_segments(tr, bstart)
                 btext = "\n".join(f"[{x['start']:.2f}-{x['end']:.2f}] {x['text']}" for x in segs)
 
@@ -1902,10 +1945,10 @@ if audio:
                     s_l = idx*lp; e_l = min(s_l+lp, len(lines))
                     bscript = "\n".join(lines[s_l:e_l])
 
-                stt.markdown(f"### ✂️ Đợt {idx+1}/{len(vc)} — Lên kịch bản ({style_mode} {scene_min}-{scene_max}s)...")
+                stt.markdown(f"### ✂️ Đợt {idx+1}/{len(vc)} — Lên kịch bản (lang={effective_lang})...")
                 scenes = make_scene_plan(client, btext, bstart, bdur, planner_model,
                                          scene_min, scene_max, max_scenes, cm_mode,
-                                         language=lang_code or "vi",
+                                         language=effective_lang,
                                          enable_rich=enable_rich_overlay,
                                          char_lock=char_lock,
                                          enable_sfx=enable_sfx,
@@ -1930,7 +1973,7 @@ if audio:
                                    enable_arrows=enable_arrows, enable_shadow=enable_shadow,
                                    enable_sfx=enable_sfx, sfx_vol=sfx_volume,
                                    enable_music=enable_music, music_vol=music_volume,
-                                   seed_lock=seed_lock, style_mode=style_mode)
+                                   seed_lock=seed_lock, style_mode=style_mode, language=effective_lang)
                 sv = root / f"batch_final_{idx+1:03d}.mp4"
                 shutil.copy2(bvi, sv); bvids.append(sv)
                 all_s += len(scenes)
@@ -1939,7 +1982,7 @@ if audio:
             stt.markdown("### 🎬 Ghép video cuối...")
             fv = root / "video_final.mp4"
             concat_batches(bvids, fv)
-            st.success(f"Hoàn thành! {all_s} cảnh ({style_mode} mode).")
+            st.success(f"Hoàn thành! {all_s} cảnh ({style_mode} / {effective_lang} mode).")
             st.video(str(fv))
             st.download_button("⬇️ TẢI VIDEO", data=fv.read_bytes(),
                 file_name="video_final.mp4", mime="video/mp4", use_container_width=True)
