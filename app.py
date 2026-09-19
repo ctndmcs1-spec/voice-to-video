@@ -1,16 +1,16 @@
 """
-Xưởng Video Diễn Hoạt Kiến Thức AI — Bản Siêu Cấp V9.2
+Xưởng Video Diễn Hoạt Kiến Thức AI — Bản Siêu Cấp V9.3
 =====================================================
-V9.2 MỚI:
-- Global Character Lock: nhân vật chính xuất hiện trong MỌI cảnh
-- Per-name lock (giữ nguyên): chèn khi tên xuất hiện
-- 2 lớp lock độc lập, có thể bật cả 2
+V9.3 FIX:
+- Fix gạch chân title đè lên chữ (tính underline_y sai)
+- Fix text box đè nhân vật giữa (smart_filter + auto-downgrade)
+- Preset nhân vật cổ đại / Ai Cập / Trung cổ / Tiền sử
+- Auto downgrade size chữ dài > 20 ký tự
 
-Kế thừa V9.1:
-- Nhịp horror 5-10s
-- Style Mode: Comic + Horror
-- Horror Sanitize + Camera + SFX + Music
-- Fix text box mép + arrow dài
+Kế thừa V9.2:
+- Global Character Lock
+- Horror 5-10s + Comic
+- Nhạc nền + SFX + Voice+Text combined
 """
 
 import os, re, io, json, math, time, base64, random, shutil, subprocess, tempfile, threading, wave
@@ -29,7 +29,7 @@ import numpy as np
 # ============================================================
 # CẤU HÌNH
 # ============================================================
-APP_TITLE = "Xưởng Video Diễn Hoạt Kiến Thức AI (V9.2)"
+APP_TITLE = "Xưởng Video Diễn Hoạt Kiến Thức AI (V9.3)"
 BATCH_SECONDS = 5 * 60
 FPS = 24
 WIDTH = 1280
@@ -69,6 +69,18 @@ SIZE_MAP = {"small": 22, "medium": 30, "large": 44, "huge": 58}
 VALID_SFX = {"none", "whoosh", "pop", "ding", "impact", "sad", "bell", "typing", "sparkle", "swoosh"}
 HORROR_SFX = {"none", "whoosh", "impact", "sad", "typing", "swoosh",
               "creak", "whisper", "scream", "heartbeat", "thunder", "silence_break"}
+
+# ===== PRESET NHÂN VẬT =====
+CHAR_PRESETS = {
+    "Custom (tự nhập)": "",
+    "🏹 Cổ đại / Cave man": "a cartoon caveman character with simple line art, big expressive eyes, messy wild hair, wearing a rough animal-skin tunic, barefoot, thin stick-figure body with slightly rounded head, hand-drawn doodle style, thick black outlines, funny and expressive face",
+    "🐫 Ai Cập cổ": "a cartoon ancient Egyptian character with simple line art, big expressive eyes, wearing a white shendyt kilt and gold collar, black bob hairstyle, thin stick-figure body, thick black outlines, hand-drawn doodle style, expressive funny face",
+    "⚔️ Trung cổ / Medieval": "a cartoon medieval peasant character with simple line art, big expressive eyes, wearing a rough brown tunic and rope belt, messy hair, thin stick-figure body, thick black outlines, hand-drawn doodle style, funny face",
+    "🦴 Tiền sử / Prehistoric": "a cartoon prehistoric human character with simple line art, big expressive eyes, long messy hair, wearing a ragged animal fur, barefoot, thin stick-figure body, thick black outlines, hand-drawn doodle style, curious expression",
+    "🔬 Nhà khoa học điên": "a cartoon mad scientist character with simple line art, big expressive eyes, wild messy hair, wearing a white lab coat and goggles on forehead, thin stick-figure body, thick black outlines, hand-drawn doodle style, excited expression",
+    "👑 Vua / Hoàng đế": "a cartoon king character with simple line art, big expressive eyes, wearing a golden crown and purple royal robe with fur trim, thin stick-figure body, thick black outlines, hand-drawn doodle style, proud expression",
+    "🧙 Phù thủy": "a cartoon wizard character with simple line art, big expressive eyes, long white beard, wearing a tall pointed hat and long starry robe, thin stick-figure body, thick black outlines, hand-drawn doodle style, wise expression",
+}
 
 NOTE_FREQ = {
     'C3':130.81,'D3':146.83,'E3':164.81,'F3':174.61,'G3':196.00,'A3':220.00,'B3':246.94,
@@ -138,8 +150,8 @@ def horror_sanitize(text):
 # UI
 # ============================================================
 st.set_page_config(page_title=APP_TITLE, page_icon="🎬", layout="wide")
-st.title("🎬 Xưởng Video Diễn Hoạt Kiến Thức AI — V9.2")
-st.caption("Global Character Lock + Comic/Horror 5-10s + Voice+Text + Nhạc nền + SFX + Font đẹp")
+st.title("🎬 Xưởng Video Diễn Hoạt Kiến Thức AI — V9.3")
+st.caption("Preset nhân vật cổ đại + Fix gạch chân title + Global Lock + Horror 5-10s")
 
 with st.sidebar:
     st.header("🎨 Style Mode")
@@ -179,7 +191,7 @@ with st.sidebar:
 
     st.header("📝 Văn bản kịch bản (tùy chọn)")
     script_text = st.text_area("Dán kịch bản để AI phân tích chính xác hơn",
-        value="", height=120)
+        value="", height=100)
     use_script_mode = st.radio("Chế độ phân tích",
         ["Chỉ dùng voice", "Kết hợp voice + text", "Chỉ dùng text"], index=0)
 
@@ -200,16 +212,27 @@ with st.sidebar:
         help="Chèn mô tả nhân vật khi tên xuất hiện trong prompt.")
     enable_seed_lock = st.checkbox("🎲 Cố định Seed", value=False)
 
-    # ===== V9.2: GLOBAL CHARACTER LOCK =====
+    # ===== GLOBAL CHARACTER LOCK với PRESET =====
     st.markdown("---")
     st.subheader("🌍 Global Character Lock")
     enable_global_char = st.checkbox("Bật Global Lock", value=False,
         help="MỌI cảnh đều có nhân vật chính, bất kể có nhắc tên hay không.")
+
+    # Preset dropdown
+    preset_choice = st.selectbox("🎨 Preset nhân vật", list(CHAR_PRESETS.keys()),
+        index=1, help="Chọn preset để tự động điền mô tả nhân vật.")
+
+    # Auto-fill preset vào textarea
+    if preset_choice != "Custom (tự nhập)" and CHAR_PRESETS[preset_choice]:
+        default_global = CHAR_PRESETS[preset_choice]
+    else:
+        default_global = "a young Vietnamese man, short black hair, brown eyes, wearing a blue hoodie and dark jeans"
+
     global_char_desc = st.text_area("Mô tả nhân vật chính toàn cục (English)",
-        value="a young Vietnamese man, short black hair, brown eyes, wearing a blue hoodie and dark jeans",
-        height=60,
-        help="Nhân vật này sẽ xuất hiện trong MỌI cảnh, kể cả cảnh phong cảnh.")
-    # =======================================
+        value=default_global,
+        height=100,
+        help="Nhân vật này sẽ xuất hiện trong MỌI cảnh. Chọn preset hoặc tự nhập.")
+    # =========================================
 
     st.header("🔊 Âm thanh")
     enable_sfx = st.checkbox("Bật sound effects", value=True)
@@ -248,12 +271,9 @@ with st.sidebar:
         default_min, default_max = 6, 10
     else:
         default_min, default_max = 19, 27
-    scene_min = st.slider("Tối thiểu (giây)", 5, 25, default_min,
-        help="Horror: 5-6s. Comic: 18-20s.")
-    scene_max = st.slider("Tối đa (giây)", 10, 35, default_max,
-        help="Horror: 8-10s. Comic: 25-30s.")
-    if scene_max < scene_min:
-        scene_max = scene_min
+    scene_min = st.slider("Tối thiểu (giây)", 5, 25, default_min)
+    scene_max = st.slider("Tối đa (giây)", 10, 35, default_max)
+    if scene_max < scene_min: scene_max = scene_min
 
     st.header("⚙️ Khác")
     max_scenes = st.slider("Số cảnh tối đa/batch", 5, 60,
@@ -269,8 +289,7 @@ with st.sidebar:
 # ============================================================
 def run_cmd(cmd, timeout=600):
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
-    if p.returncode != 0:
-        raise RuntimeError(p.stderr[-5000:] or "Lệnh thất bại")
+    if p.returncode != 0: raise RuntimeError(p.stderr[-5000:] or "Lệnh thất bại")
     return p.stdout
 
 def ffprobe_duration(path):
@@ -371,25 +390,18 @@ def build_character_lock(mn, md, sn, sd, enabled=True):
     if sn.strip() and sd.strip(): lock[sn.strip().lower()] = sd.strip()
     return lock
 
-# ===== V9.2: GLOBAL CHARACTER LOCK =====
 def enforce_character_lock(prompt, char_lock):
     if not char_lock: return prompt
     pl = prompt.lower()
     result = prompt
-
-    # 1. GLOBAL LOCK
     global_desc = char_lock.get("__global__")
     if global_desc:
         result = f"[MAIN CHARACTER (MUST appear in this scene): {global_desc}] " + result
-
-    # 2. PER-NAME LOCK
     for name, desc in char_lock.items():
         if name == "__global__": continue
         if name in pl and desc not in pl:
             result = f"[CHARACTER: {name} = {desc}] " + result
-
     return result
-# ========================================
 
 # ============================================================
 # TITLE BAND
@@ -632,12 +644,10 @@ def make_scene_plan(client, transcript_text, batch_start, batch_duration, model,
                     user_script="", use_script_mode="voice_only", style_mode="comic"):
     avg_dur = (min_s + max_s) / 2.0
     expected = max(1, round(batch_duration / avg_dur))
-
     is_en = (language == "en")
     lang_name = "English" if is_en else "Tiếng Việt"
     is_horror = (style_mode == "horror")
 
-    # ===== V9.2: Build char_note có Global =====
     char_note = ""
     if char_lock:
         items = [(n, d) for n, d in char_lock.items() if n != "__global__"]
@@ -645,60 +655,48 @@ def make_scene_plan(client, transcript_text, batch_start, batch_duration, model,
             char_note = "NHÂN VẬT CỐ ĐỊNH:\n" + "\n".join(f"  - {n}: {d}" for n, d in items) + "\n"
         if "__global__" in char_lock:
             char_note += f"\n⭐ NHÂN VẬT CHÍNH (PHẢI xuất hiện trong MỌI cảnh, mô tả y hệt): {char_lock['__global__']}\n"
-    # =========================================
 
     if is_horror:
-        style_rule = """
-RÀNG BUỘC PHONG CÁCH HORROR:
+        style_rule = """RÀNG BUỘC PHONG CÁCH HORROR:
 - Dark atmospheric illustration, cinematic horror mood, deep shadows
-- Rich moody backgrounds: dark rooms, moonlit forests, foggy streets, abandoned places
+- Rich moody backgrounds: dark rooms, moonlit forests, foggy streets
 - Dramatic lighting: blue moonlight, red ambient, harsh shadows
-- Characters show fear, tension, dread, horror in their faces
-- Color palette: deep blacks, blood reds, cool blues, muted greens, sickly yellows
+- Characters show fear, tension, dread, horror
+- Color palette: deep blacks, blood reds, cool blues, muted greens
 - NO text, letters, numbers in the image
-- IMPORTANT: Use soft keywords. Prefer "crimson liquid", "dark red", "motionless figure", "sharp blade", "silhouette", "shadow"."""
-        title_rule = f"- {'English: 3-6 words, mysterious, unsettling, UPPERCASE' if is_en else 'Tiếng Việt: 3-6 từ, bí ẩn, đáng sợ, VIẾT HOA'}"
-        visual_rule = f"""
-MỖI CẢNH LÀ MỘT "SÂN KHẤU KINH DỊ" KHÁC NHAU:
-- Bối cảnh đa dạng: hành lang tối, nghĩa địa, rừng sương mù, căn phòng bỏ hoang, nhà vệ sinh trường học cũ, gầm cầu thang, phòng ngủ đêm khuya, trong gương, trên mái nhà...
-- Nhân vật: nhân vật chính + bóng đen/xác ẩm/mắt đỏ/hình thù kỳ dị...
-- Đồ vật ẩn dụ: đèn nhấp nháy, đồng hồ 3h sáng, cửa hé mở, gương nứt, búp bê cũ, đèn pin, điện thoại mất sóng...
-- Cảm xúc: sợ hãi, hoảng loạn, tuyệt vọng, cô đơn, bị theo dõi...
-
-NHỊP HORROR 5-10s/CẢNH:
-- Mỗi cảnh chỉ 5-10s để tạo căng thẳng.
-- Thỉnh thoảng có cảnh cực ngắn (5-6s) với hình ảnh đột ngột (jump scare).
-- Xen kẽ cảnh ngắn và cảnh dài để tạo nhịp điệu không đều."""
-        rich_note = """
-QUY TẮC OVERLAY ("text_boxes"): Tạo ĐÚNG 1-2 text_boxes. Tọa độ từ 0.10-0.85.
-KHÔNG đặt gần title (y<0.20) hoặc đè mặt nhân vật.""" if enable_rich else ""
-        sfx_note = """
-QUY TẮC SFX ("sfx"): Chọn 1: creak/whisper/scream/heartbeat/thunder/silence_break/whoosh/impact/sad/swoosh/none.""" if enable_sfx else ""
-        music_note = """
-QUY TẮC NHẠC NỀN ("music_emotion"): Chọn 1: dread/panic/eerie/ominous/sad/tense/neutral/none.""" if enable_music else ""
-        camera_rule = """Chọn 1: slow_zoom_in/slow_zoom_out/creepy_pan_left/creepy_pan_right/dramatic_zoom_face/static_dread. LUÂN PHIÊN."""
+- IMPORTANT: Use soft keywords. Prefer "crimson liquid", "motionless figure", "silhouette"."""
+        title_rule = f"- {'English: 3-6 words, mysterious, UPPERCASE' if is_en else 'Tiếng Việt: 3-6 từ, bí ẩn, VIẾT HOA'}"
+        visual_rule = """MỖI CẢNH LÀ SÂN KHẤU KINH DỊ KHÁC NHAU:
+- Bối cảnh: hành lang tối, nghĩa địa, rừng sương mù, phòng bỏ hoang...
+- Nhân vật: nhân vật chính + bóng đen/mắt đỏ/hình thù kỳ dị
+- Đồ vật ẩn dụ: đèn nhấp nháy, cửa hé mở, gương nứt, búp bê cũ
+- Cảm xúc: sợ hãi, hoảng loạn, bị theo dõi
+NHỊP HORROR 5-10s/CẢNH: cảnh ngắn = giật mình, cảnh dài = chờ đợi."""
+        rich_note = """QUY TẮC OVERLAY ("text_boxes"): Tạo ĐÚNG 1-2 text_boxes.
+Vị trí PHẢI ở 4 góc: (0.10,0.28) (0.72,0.28) (0.10,0.78) (0.72,0.78).
+CẤM ĐẶT ở vùng trung tâm (x 0.25-0.75, y 0.30-0.75).
+Text NGẮN: tối đa 4 từ.""" if enable_rich else ""
+        sfx_note = """QUY TẮC SFX ("sfx"): Chọn 1: creak/whisper/scream/heartbeat/thunder/silence_break/whoosh/impact/swoosh/none.""" if enable_sfx else ""
+        music_note = """QUY TẮC NHẠC NỀN ("music_emotion"): Chọn 1: dread/panic/eerie/ominous/sad/tense/neutral/none.""" if enable_music else ""
+        camera_rule = """Chọn 1: slow_zoom_in/slow_zoom_out/creepy_pan_left/creepy_pan_right/dramatic_zoom_face/static_dread."""
     else:
-        style_rule = "RÀNG BUỘC: 2D comic doodle, nét mực đen dày, nền TRẮNG TINH, KHÔNG chữ/số trong ảnh AI vẽ."
+        style_rule = "RÀNG BUỘC: 2D comic doodle, nét mực đen dày, nền TRẮNG TINH, KHÔNG chữ/số trong ảnh."
         title_rule = f"- {'English: 3-6 words, UPPERCASE' if is_en else 'Tiếng Việt: 3-6 từ, VIẾT HOA'}"
-        visual_rule = """
-MỖI CẢNH LÀ MỘT "SÂN KHẤU" KHÁC NHAU. KHÔNG lặp bố cục.
+        visual_rule = """MỖI CẢNH LÀ SÂN KHẤU KHÁC NHAU. KHÔNG lặp bố cục.
 Bao gồm: nhân vật + tư thế, hành động, bối cảnh, đồ vật ẩn dụ, cảm xúc, màu nhấn."""
-        rich_note = """
-QUY TẮC OVERLAY ("text_boxes"): Tạo ĐÚNG 2-3 text_boxes. Tọa độ từ 0.10-0.85.
-KHÔNG đặt gần title (y<0.20) hoặc đè mặt nhân vật.""" if enable_rich else ""
-        sfx_note = """
-QUY TẮC SFX ("sfx"): Chọn 1: whoosh/pop/ding/impact/sad/bell/typing/sparkle/swoosh/none. LUÂN PHIÊN.""" if enable_sfx else ""
-        music_note = """
-QUY TẮC NHẠC NỀN ("music_emotion"): Chọn 1: happy/sad/epic/calm/tense/inspirational/neutral/none. LUÂN PHIÊN.""" if enable_music else ""
-        camera_rule = """Chọn 1: zoom_in_center/zoom_out_center/pan_left_to_right/pan_right_to_left/zoom_in_top_left/zoom_in_bottom_right/ken_burns_slow/static. LUÂN PHIÊN."""
+        rich_note = """QUY TẮC OVERLAY ("text_boxes"): Tạo ĐÚNG 2-3 text_boxes.
+Vị trí PHẢI ở 4 góc: (0.10,0.28) (0.72,0.28) (0.10,0.78) (0.72,0.78).
+CẤM ĐẶT ở vùng trung tâm (x 0.25-0.75, y 0.30-0.75) vì đó là chỗ nhân vật.
+Text NGẮN: tối đa 4-5 từ.""" if enable_rich else ""
+        sfx_note = """QUY TẮC SFX ("sfx"): Chọn 1: whoosh/pop/ding/impact/sad/bell/typing/sparkle/swoosh/none.""" if enable_sfx else ""
+        music_note = """QUY TẮC NHẠC NỀN ("music_emotion"): Chọn 1: happy/sad/epic/calm/tense/inspirational/neutral/none.""" if enable_music else ""
+        camera_rule = """Chọn 1: zoom_in_center/zoom_out_center/pan_left_to_right/pan_right_to_left/zoom_in_top_left/zoom_in_bottom_right/ken_burns_slow/static."""
 
-    if is_horror:
-        sample_motion = "slow_zoom_in"; sample_sfx = "creak"; sample_music = "dread"
-    else:
-        sample_motion = "zoom_in_center"; sample_sfx = "sparkle"; sample_music = "inspirational"
+    sample_motion = "slow_zoom_in" if is_horror else "zoom_in_center"
+    sample_sfx = "creak" if is_horror else "sparkle"
+    sample_music = "dread" if is_horror else "inspirational"
 
-    system = f"""
-Bạn là giám đốc sáng tạo kịch bản cho kênh {("KINH DỊ" if is_horror else "hoạt họa kiến thức")} phong cách "Kiến Thức Thú Vị".
+    system = f"""Bạn là giám đốc sáng tạo kịch bản cho kênh {("KINH DỊ" if is_horror else "hoạt họa kiến thức")}.
 NGÔN NGỮ OUTPUT: {lang_name}.
 Nhiệm vụ: Chia đoạn âm thanh {batch_duration:.0f}s thành khoảng {expected} cảnh ({min_s}-{max_s}s/cảnh).
 
@@ -708,18 +706,17 @@ QUY TẮC TIÊU ĐỀ ("title"):
 
 QUY TẮC CHỮ TRÊN TRANH ("callout_type", "callout_text"):
 - "speech": bong bóng thoại. "thought": đám mây. "sticker": nhãn dán. "none": không chữ.
-- LUÂN PHIÊN.
 
 QUY TẮC QUAN TRỌNG NHẤT — "visual_prompt":
 {visual_rule}
 
-QUY TẮC NHÂN VẬT: Ghi rõ "male character"/"female character". KHÔNG dùng "two friends".
+QUY TẮC NHÂN VẬT: Ghi rõ "male character"/"female character".
 
 {style_rule}
 {rich_note}
 {sfx_note}
 {music_note}
-QUY TẮC CAMERA ("camera_motion"):
+QUY TẮC CAMERA:
 {camera_rule}
 
 JSON FORMAT:
@@ -727,27 +724,26 @@ JSON FORMAT:
   "scenes": [
     {{
       "start": 0.0, "end": {min_s}.0,
-      "title": "{'THE CALL AT MIDNIGHT' if is_en and is_horror else 'CUỘC GỌI LÚC NỬA ĐÊM' if is_horror else 'FEAR OF JUDGMENT' if is_en else 'NỖI SỢ BỊ PHÁN XÉT'}",
-      "callout_type": "speech", "callout_text": "{'WHO IS THERE?' if is_en and is_horror else 'AI ĐÓ?' if is_horror else 'WHAT ARE THEY THINKING?' if is_en else 'TỚ ĐANG NGHĨ GÌ?'}", "callout_side": "right",
+      "title": "{'THE CALL' if is_en and is_horror else 'CUỘC GỌI' if is_horror else 'FEAR' if is_en else 'NỖI SỢ'}",
+      "callout_type": "speech", "callout_text": "{'WHO?' if is_en else 'AI ĐÓ?'}", "callout_side": "right",
       "camera_motion": "{sample_motion}",
       "sfx": "{sample_sfx}",
       "music_emotion": "{sample_music}",
       "visual_prompt": "2D illustration: ...",
-      "text_boxes": [{{"text":"...","x":0.15,"y":0.25,"color":"red","size":"large","style":"outlined","arrow":null}}]
+      "text_boxes": [{{"text":"...","x":0.10,"y":0.28,"color":"red","size":"medium","style":"outlined","arrow":null}}]
     }}
   ]
 }}
 """
 
     if use_script_mode == "combined" and user_script.strip():
-        user = (f"Audio length: {batch_duration:.2f}s.\nMAX {expected} SCENES ({min_s}-{max_s}s each).\n\n"
-                f"USER SCRIPT (accurate content):\n{user_script}\n\n"
-                f"WHISPER TRANSCRIPT (accurate timing):\n{transcript_text}\n\n"
+        user = (f"Audio length: {batch_duration:.2f}s.\nMAX {expected} SCENES.\n\n"
+                f"USER SCRIPT:\n{user_script}\n\nWHISPER TIMING:\n{transcript_text}\n\n"
                 f"CRITICAL: Match script to whisper timestamps.")
     elif use_script_mode == "text_only" and user_script.strip():
-        user = (f"Audio length: {batch_duration:.2f}s.\nMAX {expected} SCENES.\n\nSCRIPT:\n{user_script}\n\nDivide evenly.")
+        user = f"Audio length: {batch_duration:.2f}s.\nMAX {expected} SCENES.\n\nSCRIPT:\n{user_script}\n\nDivide evenly."
     else:
-        user = (f"Audio length: {batch_duration:.2f}s.\nMAX {expected} SCENES.\n\nTRANSCRIPT:\n{transcript_text}")
+        user = f"Audio length: {batch_duration:.2f}s.\nMAX {expected} SCENES.\n\nTRANSCRIPT:\n{transcript_text}"
 
     MODEL_CAP = {"qwen/qwen3.8-27b": 3500, "openai/gpt-oss-120b": 7000, "openai/gpt-oss-20b": 5000}
     dyn_max = min(MODEL_CAP.get(model, 7000), max(4000, int(expected * 500 * 1.3)))
@@ -760,7 +756,7 @@ JSON FORMAT:
         obj = extract_json(raw); raw_scenes = obj.get("scenes", [])
         if not raw_scenes: st.warning(f"⚠️ Không có scenes. Preview: {raw[:200]}")
     except Exception as e:
-        st.error(f"❌ Qwen/Parse fail: {str(e)[:200]}")
+        st.error(f"❌ Qwen fail: {str(e)[:200]}")
         if raw: st.code(raw[:1000], language="text")
         raw_scenes = []
 
@@ -779,20 +775,20 @@ JSON FORMAT:
                 text = str(tb.get("text", "")).strip()
                 if not text or len(text) > 40: continue
                 x = max(0.10, min(0.85, float(tb.get("x", 0.5))))
-                y = max(0.22, min(0.88, float(tb.get("y", 0.5))))
+                y = max(0.28, min(0.88, float(tb.get("y", 0.5))))
                 c = str(tb.get("color", "black")).lower()
                 if c not in valid_colors: c = "black"
                 s = str(tb.get("size", "medium")).lower()
                 if s not in valid_sizes: s = "medium"
-                st_ = str(tb.get("style", "outlined")).lower()
-                if st_ not in valid_styles: st_ = "outlined"
+                stl = str(tb.get("style", "outlined")).lower()
+                if stl not in valid_styles: stl = "outlined"
                 arr = tb.get("arrow"); ac = None
                 if isinstance(arr, dict):
                     try:
                         ac = {"to_x": max(0.05, min(0.95, float(arr.get("to_x", x)))),
                               "to_y": max(0.15, min(0.95, float(arr.get("to_y", y))))}
                     except Exception: ac = None
-                out.append({"text": text, "x": x, "y": y, "color": c, "size": s, "style": st_, "arrow": ac})
+                out.append({"text": text, "x": x, "y": y, "color": c, "size": s, "style": stl, "arrow": ac})
             except Exception: continue
         return out
 
@@ -827,35 +823,30 @@ JSON FORMAT:
         fb_t = "SCENE" if is_en else "CẢNH"
         if is_horror:
             fb_prompts = [
-                "2D dark horror illustration: a lone figure walking through a foggy forest at night, moonlight, deep shadows, cold blue tones, no text",
-                "2D dark horror illustration: an empty hallway with flickering lights, doorway slightly open, red ambient glow, no text",
-                "2D dark horror illustration: a person staring at their own reflection in a cracked mirror, fear in eyes, no text",
-                "2D dark horror illustration: a figure standing at the end of a long corridor, back turned, shadow stretching, no text",
-                "2D dark horror illustration: an old bedroom at 3am, curtains moving, moonlight through window, no text",
+                "2D dark horror illustration: a lone figure in a foggy hallway, moonlight, deep shadows, no text",
+                "2D dark horror illustration: a figure staring at their reflection in a cracked mirror, no text",
+                "2D dark horror illustration: an old bedroom at 3am, curtains moving, no text",
             ]
-            emotions_pool = ["dread", "eerie", "ominous", "panic", "tense"]
-            sfx_pool = ["creak", "whisper", "heartbeat", "thunder", "silence_break"]
-            motions_pool = list(HORROR_MOTIONS.keys())
+            emotions_pool = ["dread", "eerie", "ominous", "tense"]
+            sfx_pool = ["creak", "whisper", "heartbeat", "thunder"]
         else:
             fb_prompts = [
-                "2D comic doodle: a person standing at the edge of a cliff at sunset, red sunset, white background, no text",
-                "2D comic doodle: a person sitting alone on a bench, thinking pose, blue accents, white background, no text",
-                "2D comic doodle: a person holding a glowing light bulb, yellow sparkles, white background, no text",
+                "2D comic doodle: a person at the edge of a cliff at sunset, red sunset, white background, no text",
+                "2D comic doodle: a person sitting alone on a bench, thinking, white background, no text",
             ]
             emotions_pool = ["neutral", "calm", "inspirational"]
             sfx_pool = ["whoosh", "pop", "ding"]
-            motions_pool = ["zoom_in_center", "zoom_out_center", "ken_burns_slow"]
         clean = []
         for i in range(n):
             clean.append({"start": i * sd, "end": (i + 1) * sd,
                 "title": f"{fb_t} {i+1:02d}",
                 "callout_type": "none", "callout_text": "", "callout_side": "right",
-                "camera_motion": random.choice(motions_pool),
+                "camera_motion": random.choice(list(valid_motions)),
                 "sfx": random.choice(sfx_pool),
                 "music_emotion": random.choice(emotions_pool),
                 "visual_prompt": fb_prompts[i % len(fb_prompts)],
                 "text_boxes": []})
-        st.error(f"❌ Qwen fail — {n} fallback scenes (~{sd:.0f}s/cảnh)")
+        st.error(f"❌ Qwen fail — {n} fallback scenes")
 
     merge_threshold = max(min_s * 0.7, 5.0)
     merged = []
@@ -899,31 +890,27 @@ def _build_full_prompt(prompt, chars=None, char_lock=None, style_mode="comic"):
     chars = chars or {}
     if style_mode == "horror":
         safe = horror_sanitize(prompt)
-        style = """Dramatic dark illustration, cinematic horror atmosphere, deep shadows, high contrast lighting.
-Rich moody backgrounds: dark rooms, moonlit forests, foggy streets, abandoned places.
+        style = """Dramatic dark illustration, cinematic horror atmosphere, deep shadows.
+Rich moody backgrounds: dark rooms, moonlit forests, foggy streets.
 Dramatic lighting: blue moonlight, red ambient, harsh shadows.
-Expressive characters showing fear, tension, dread, or horror.
-Color palette: deep blacks, blood reds, cool blues, muted greens, sickly yellows.
-Soft keywords only: use "crimson liquid", "dark red", "motionless figure", "sharp blade", "silhouette", "shadow" instead of graphic gore.
-Absolutely NO text, letters, numbers, captions, or empty speech balloons.
+Expressive characters showing fear, tension, dread.
+Color palette: deep blacks, blood reds, cool blues, muted greens.
+Soft keywords only: "crimson liquid", "motionless figure", "silhouette".
+Absolutely NO text, letters, numbers, captions.
 Wide 16:9 cinematic composition.
-CHARACTER GENDER: male character = MALE, female character = FEMALE. NEVER swap."""
+CHARACTER GENDER: male = MALE, female = FEMALE."""
     else:
         safe = sanitize_prompt_text(prompt)
         style = """Authentic 2D comic doodle art style, thick black ink contour outlines, hand-drawn wobbly lines.
-Pure solid flat white background OR simple scene background if described above.
+Pure solid flat white background OR simple scene background.
 Vivid expressive cartoon character with clear emotion.
 Selective vibrant spot colors (red, blue, orange, green) ONLY on key symbolic elements.
 Absolutely NO text, letters, numbers, captions, or empty speech balloons.
-Do not draw desk, table, markers, pens UNLESS explicitly mentioned.
 Wide 16:9 cinematic composition.
-CHARACTER GENDER: male character = MALE, female character = FEMALE. NEVER swap."""
+CHARACTER GENDER: male = MALE, female = FEMALE."""
     if char_lock: safe = enforce_character_lock(safe, char_lock)
-
-    # V9.2: Tăng cường cho Global Lock
     if char_lock and char_lock.get("__global__"):
         safe += "\n\nIMPORTANT: The MAIN CHARACTER MUST be visible in this scene and identical to the description above. Do NOT omit the character."
-
     return f"{safe}.\n\nSTYLE CONSTRAINTS:\n{style}"
 
 def _validate(data, name):
@@ -1082,7 +1069,7 @@ def save_image(data, output_path):
         raise RuntimeError(f"Ảnh invalid: {e}")
 
 # ============================================================
-# OVERLAY
+# OVERLAY — V9.3 với FIX
 # ============================================================
 def draw_arrow(draw, s, e, color, w=5):
     draw.line([s, e], fill=color, width=w)
@@ -1099,13 +1086,32 @@ def draw_text_shadow(draw, xy, text, font, fill, sw=0, sf=None, shadow=True):
     else: draw.text((x, y), text, font=font, fill=fill)
 
 def draw_rich_text_box(img, draw, tb, enable_shadow=True):
+    """V9.3: Auto-downgrade size + skip nếu tràn vào vùng nhân vật."""
     try:
         x = int(tb["x"] * WIDTH); y = int(tb["y"] * HEIGHT)
         text = tb["text"]; color = COLOR_MAP.get(tb["color"], "#212121")
-        f_size = SIZE_MAP.get(tb["size"], 30); stl = tb["style"]
+        stl = tb["style"]
+
+        # Auto downgrade size nếu text dài
+        size_key = tb["size"]
+        if len(text) > 20 and size_key in ("large", "huge"):
+            size_key = "medium"
+        if len(text) > 30 and size_key == "medium":
+            size_key = "small"
+        f_size = SIZE_MAP.get(size_key, 30)
         f = font_for(f_size, bold=True)
+
         bbox = draw.textbbox((0, 0), text, font=f)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+        # SKIP nếu tràn vào vùng trung tâm (nhân vật) — V9.3 fix
+        text_end_x = x + tw
+        text_end_y = y + th
+        if text_end_x > WIDTH * 0.30 and x < WIDTH * 0.70:
+            if text_end_y > HEIGHT * 0.30 and y < HEIGHT * 0.75:
+                return  # Chữ đang đè vùng trung tâm → bỏ
+
+        # Clamp không tràn mép
         if x + tw + 20 > WIDTH: x = max(10, WIDTH - tw - 20)
         if y + th + 20 > HEIGHT: y = max(TITLE_BAND_H + 10, HEIGHT - th - 20)
         if x < 10: x = 10
@@ -1129,19 +1135,30 @@ def draw_rich_text_box(img, draw, tb, enable_shadow=True):
     except Exception: pass
 
 def smart_filter_tbs(tbs, callout_text, callout_type, callout_side):
+    """V9.3: Chỉ cho phép 4 góc."""
     filtered = []; min_dist = 0.20
     for tb in tbs:
         x, y = tb["x"], tb["y"]
-        if y < 0.20: continue
-        if 0.30 < x < 0.70 and 0.35 < y < 0.70: continue
+        if y < 0.25: continue
+        # Chỉ cho phép 4 góc
+        in_corners = (
+            (x < 0.30 and y < 0.40) or
+            (x > 0.65 and y < 0.40) or
+            (x < 0.30 and y > 0.72) or
+            (x > 0.65 and y > 0.72)
+        )
+        if not in_corners: continue
+        # Bỏ nếu đè callout
         if callout_text and callout_type != "none":
             if callout_side == "left":
                 if x < 0.45 and 0.35 < y < 0.55: continue
             else:
                 if x > 0.55 and 0.35 < y < 0.55: continue
+        # Bỏ nếu quá gần box khác
         close = False
         for ex in filtered:
-            if abs(ex["x"] - x) < min_dist and abs(ex["y"] - y) < min_dist: close = True; break
+            if abs(ex["x"] - x) < min_dist and abs(ex["y"] - y) < min_dist:
+                close = True; break
         if not close: filtered.append(tb)
         if len(filtered) >= 3: break
     return filtered
@@ -1156,8 +1173,10 @@ def add_comic_overlays(image_path, title, callout_type, callout_text, callout_si
     bubble_text_color = "#6a0000" if is_horror else "#1b5e20"
     thought_text_color = "#1a0033" if is_horror else "#0d47a1"
 
+    # ===== TITLE với FIX GẠCH CHÂN =====
     if title:
-        draw.rectangle([0, 0, WIDTH, TITLE_BAND_H], fill="white" if not is_horror else "#0a0a0a")
+        band_bg = "#0a0a0a" if is_horror else "white"
+        draw.rectangle([0, 0, WIDTH, TITLE_BAND_H], fill=band_bg)
         f_size = 38; f_title = font_for(f_size, bold=True)
         while f_size > 20:
             box = draw.textbbox((0, 0), title, font=f_title)
@@ -1165,9 +1184,15 @@ def add_comic_overlays(image_path, title, callout_type, callout_text, callout_si
             f_size -= 2; f_title = font_for(f_size, bold=True)
         box = draw.textbbox((0, 0), title, font=f_title)
         tw = box[2] - box[0]
-        draw.text(((WIDTH - tw) / 2, 22), title, fill=title_color, font=f_title)
-        uy = 22 + (box[3] - box[1]) + 8
-        draw.line([(WIDTH/2 - tw/2, uy), (WIDTH/2 + tw/2, uy)], fill=underline_color, width=4)
+        text_x = (WIDTH - tw) / 2
+        text_y = 22
+        draw.text((text_x, text_y), title, fill=title_color, font=f_title)
+        # V9.3 FIX: underline_y = text_y + box[3] + padding (KHÔNG phải + height)
+        underline_y = text_y + box[3] + 10
+        # Vẽ gạch chân bên dưới chữ, không đè
+        draw.line([(text_x, underline_y), (text_x + tw, underline_y)],
+                  fill=underline_color, width=4)
+    # =====================================
 
     if callout_text and callout_type != "none":
         f_text = font_for(26, bold=True)
@@ -1681,13 +1706,6 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
         if others:
             st.success(f"🔒 Per-name lock: {others}")
     if seed_lock is not None: st.info(f"🎲 Seed: {seed_lock}")
-    if enable_sfx:
-        cnt = sum(1 for s in scenes if s.get("sfx", "none") != "none")
-        st.info(f"🔊 SFX: {cnt}/{total}")
-    if enable_music:
-        cnt = sum(1 for s in scenes if s.get("music_emotion", "none") != "none")
-        emos = Counter(s.get("music_emotion", "neutral") for s in scenes if s.get("music_emotion") != "none")
-        st.info(f"🎵 Nhạc: {cnt}/{total} — {dict(emos)}")
 
     st.markdown("### 🎨 Tạo ảnh song song")
     ps = {"done": 0, "scene_status": {}, "provider_stats": {p["name"]: {"ok":0,"err":0,"total_time":0.0,"last_scene":None,"errors":[],"circuit_broken":False} for p in providers}}
@@ -1802,8 +1820,7 @@ if st.sidebar.button("🔎 KIỂM TRA PROVIDER", use_container_width=True):
     else:
         st.write(f"**{len(providers)} provider ({style_mode} mode):**")
         for i, p in enumerate(providers, 1): st.write(f"{i}. {p['name']}")
-        if char_lock:
-            st.info(f"Char lock keys: {list(char_lock.keys())}")
+        if char_lock: st.info(f"Char lock keys: {list(char_lock.keys())}")
         if st.button("▶️ Test 1 ảnh"):
             if style_mode == "horror":
                 tp = "2D dark horror illustration: a lone figure in a foggy hallway, moonlight, deep shadows, no text"
@@ -1842,20 +1859,20 @@ if audio:
         if enable_global_char and global_char_desc.strip():
             char_lock["__global__"] = global_char_desc.strip()
             st.success(f"🌍 Global Lock: {global_char_desc[:60]}...")
-        if char_lock and len([k for k in char_lock.keys() if k != '__global__']) > 0:
-            st.success(f"🔒 Per-name lock: {[k for k in char_lock.keys() if k != '__global__']}")
+        others = [k for k in char_lock.keys() if k != '__global__']
+        if others:
+            st.success(f"🔒 Per-name lock: {others}")
         seed_lock = random.randint(1, 2**31 - 1) if enable_seed_lock else None
         if seed_lock: st.info(f"🎲 Seed: {seed_lock}")
 
         cache_dir = Path.home() / ".wb_cache"; cache_dir.mkdir(exist_ok=True)
 
-        root = Path(tempfile.mkdtemp(prefix=f"wb_v92_{style_mode}_"))
+        root = Path(tempfile.mkdtemp(prefix=f"wb_v93_{style_mode}_"))
         try:
             src = root / audio.name; src.write_bytes(audio.getbuffer())
             dur = ffprobe_duration(src)
-
             effective_batch = 2 * 60 if style_mode == "horror" else BATCH_SECONDS
-            st.info(f"Thời lượng: {dur/60:.2f} phút. Batch {effective_batch//60} phút (style={style_mode}).")
+            st.info(f"Thời lượng: {dur/60:.2f} phút. Batch {effective_batch//60} phút.")
 
             client = groq_client(groq_key)
             bd = root / "batches"; bd.mkdir()
