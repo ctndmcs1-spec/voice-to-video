@@ -1,15 +1,15 @@
 """
-Xưởng Video Diễn Hoạt Kiến Thức AI — Bản Siêu Cấp V10.0
+Xưởng Video Diễn Hoạt Kiến Thức AI — Bản Siêu Cấp V10.1
 =======================================================
-V10.0 MỚI:
-- English mode: AI tự vẽ chữ (native text) + màu tự nhiên (earth tones)
-- Vietnamese mode: giữ Pillow overlay (tránh AI sai dấu)
-- 2 style prompt khác nhau theo ngôn ngữ
+V10.1 FIX:
+- Sticker-style title: chữ trắng/yellow viền đen, KHÔNG band nền
+- Cấm AI vẽ rectangular banner / black bar
+- Title hòa vào tranh tự nhiên như thumbnail Neon Rush
 
-Kế thừa V9.3:
-- Preset nhân vật cổ đại + Global Lock
-- Fix gạch chân title + text box đè nhân vật
-- Horror 5-10s + Comic + Voice+Text + Nhạc nền + SFX
+Kế thừa V10.0:
+- English mode: AI tự vẽ chữ + màu tự nhiên
+- Vietnamese mode: Pillow overlay + nền trắng
+- Preset nhân vật + Global Lock + Horror 5-10s
 """
 
 import os, re, io, json, math, time, base64, random, shutil, subprocess, tempfile, threading, wave
@@ -28,7 +28,7 @@ import numpy as np
 # ============================================================
 # CẤU HÌNH
 # ============================================================
-APP_TITLE = "Xưởng Video Diễn Hoạt Kiến Thức AI (V10.0)"
+APP_TITLE = "Xưởng Video Diễn Hoạt Kiến Thức AI (V10.1)"
 BATCH_SECONDS = 5 * 60
 FPS = 24
 WIDTH = 1280
@@ -148,8 +148,8 @@ def horror_sanitize(text):
 # UI
 # ============================================================
 st.set_page_config(page_title=APP_TITLE, page_icon="🎬", layout="wide")
-st.title("🎬 Xưởng Video Diễn Hoạt Kiến Thức AI — V10.0")
-st.caption("English: AI vẽ chữ + màu tự nhiên | Vietnamese: Pillow overlay + nền trắng")
+st.title("🎬 Xưởng Video Diễn Hoạt Kiến Thức AI — V10.1")
+st.caption("Sticker title + English AI vẽ chữ + Vietnamese Pillow overlay")
 
 with st.sidebar:
     st.header("🎨 Style Mode")
@@ -160,17 +160,15 @@ with st.sidebar:
     st.header("🌐 Ngôn ngữ")
     language_mode = st.selectbox("Ngôn ngữ video",
         ["Auto Detect", "Tiếng Việt", "English"], index=0,
-        help="English: AI tự vẽ chữ + màu tự nhiên. Vietnamese: Pillow overlay + nền trắng.")
+        help="English: AI vẽ chữ + màu tự nhiên + sticker title. Vietnamese: Pillow overlay.")
 
-    # Detect effective language (Auto = vi mặc định)
     effective_lang = "vi"
     if language_mode == "English": effective_lang = "en"
     elif language_mode == "Tiếng Việt": effective_lang = "vi"
-    elif language_mode == "Auto Detect": effective_lang = "vi"  # sẽ update sau STT
 
     if style_mode == "comic":
         if effective_lang == "en":
-            st.success("🇬🇧 English comic: AI vẽ chữ + màu nâu đất tự nhiên")
+            st.success("🇬🇧 English comic: AI vẽ sticker title + màu nâu đất")
         else:
             st.info("🇻🇳 Vietnamese comic: Pillow overlay + nền trắng")
     else:
@@ -201,8 +199,7 @@ with st.sidebar:
             value=os.getenv("NEXA_API_KEY", ""), type="password")
 
     st.header("📝 Văn bản kịch bản (tùy chọn)")
-    script_text = st.text_area("Dán kịch bản để AI phân tích chính xác hơn",
-        value="", height=100)
+    script_text = st.text_area("Dán kịch bản", value="", height=100)
     use_script_mode = st.radio("Chế độ phân tích",
         ["Chỉ dùng voice", "Kết hợp voice + text", "Chỉ dùng text"], index=0)
 
@@ -643,8 +640,6 @@ def make_scene_plan(client, transcript_text, batch_start, batch_duration, model,
     is_en = (language == "en")
     lang_name = "English" if is_en else "Tiếng Việt"
     is_horror = (style_mode == "horror")
-
-    # LƯU Ý: Native text rendering khi English + Comic
     native_text = is_en and not is_horror
 
     char_note = ""
@@ -658,38 +653,31 @@ def make_scene_plan(client, transcript_text, batch_start, batch_duration, model,
     if is_horror:
         style_rule = """RÀNG BUỘC PHONG CÁCH HORROR:
 - Dark atmospheric illustration, cinematic horror mood, deep shadows
-- Rich moody backgrounds, dramatic lighting
 - NO text, letters, numbers in the image
-- Use soft keywords: "crimson liquid", "motionless figure", "silhouette"."""
+- Use soft keywords."""
         title_rule = f"- {'English: 3-6 words, mysterious, UPPERCASE' if is_en else 'Tiếng Việt: 3-6 từ, bí ẩn, VIẾT HOA'}"
         visual_rule = """MỖI CẢNH LÀ SÂN KHẤU KINH DỊ KHÁC NHAU.
-NHỊP HORROR 5-10s/CẢNH: cảnh ngắn = giật mình."""
-        rich_note = """QUY TẮC OVERLAY: Tạo ĐÚNG 1-2 text_boxes. 4 góc.
-CẤM ĐẶT ở vùng trung tâm.""" if enable_rich else ""
+NHỊP HORROR 5-10s/CẢNH."""
+        rich_note = """OVERLAY: 1-2 text_boxes. 4 góc.""" if enable_rich else ""
         sfx_note = """SFX: creak/whisper/scream/heartbeat/thunder/silence_break/whoosh/impact/swoosh/none.""" if enable_sfx else ""
         music_note = """NHẠC: dread/panic/eerie/ominous/sad/tense/neutral/none.""" if enable_music else ""
         camera_rule = """slow_zoom_in/slow_zoom_out/creepy_pan_left/creepy_pan_right/dramatic_zoom_face/static_dread."""
     else:
         if native_text:
-            # English comic: AI vẽ chữ + màu tự nhiên
             style_rule = """RÀNG BUỘC PHONG CÁCH ENGLISH COMIC:
 - COLORED cartoon illustration with NATURAL WARM EARTH TONES (brown, tan, orange, yellow, beige, warm gray)
-- Soft textures on rocks, wood, fabric, ground
-- Warm firelight glow, soft shadows, cinematic lighting
-- NOT pure white background. If scene is outdoors: natural sky (blue, orange sunset, gray cloudy). If indoors: warm cave/room tones.
+- Soft textures, warm firelight glow, cinematic lighting
+- NOT pure white background
 - Thick black outlines, hand-drawn doodle style
-- EXPRESSIVE CARTOON CHARACTERS with clear emotions
-- RENDER ENGLISH TEXT in the image: title at top, speech bubbles with text, labels. Text MUST be in English and correctly spelled.
-- Wide 16:9 cinematic composition
-- CHARACTER GENDER: male = MALE, female = FEMALE."""
+- RENDER ENGLISH TEXT VISIBLY: title, speech bubbles, labels
+- Title as STICKER-STYLE: bold letters with thick outline, NO rectangular banner
+- Wide 16:9 cinematic composition"""
         else:
-            # Vietnamese comic: nền trắng, Pillow overlay
             style_rule = "RÀNG BUỘC: 2D comic doodle, nét mực đen dày, nền TRẮNG TINH, KHÔNG chữ/số trong ảnh."
         title_rule = f"- {'English: 3-6 words, UPPERCASE' if is_en else 'Tiếng Việt: 3-6 từ, VIẾT HOA'}"
         visual_rule = """MỖI CẢNH LÀ SÂN KHẤU KHÁC NHAU. KHÔNG lặp bố cục.
 Bao gồm: nhân vật + tư thế, hành động, bối cảnh, đồ vật ẩn dụ, cảm xúc, màu nhấn."""
-        rich_note = """QUY TẮC OVERLAY: Tạo ĐÚNG 2-3 text_boxes. 4 góc.
-Text NGẮN: tối đa 4-5 từ.""" if enable_rich else ""
+        rich_note = """OVERLAY: 2-3 text_boxes. 4 góc. Text NGẮN.""" if enable_rich else ""
         sfx_note = """SFX: whoosh/pop/ding/impact/sad/bell/typing/sparkle/swoosh/none.""" if enable_sfx else ""
         music_note = """NHẠC: happy/sad/epic/calm/tense/inspirational/neutral/none.""" if enable_music else ""
         camera_rule = """zoom_in_center/zoom_out_center/pan_left_to_right/pan_right_to_left/zoom_in_top_left/zoom_in_bottom_right/ken_burns_slow/static."""
@@ -698,18 +686,13 @@ Text NGẮN: tối đa 4-5 từ.""" if enable_rich else ""
     sample_sfx = "creak" if is_horror else "sparkle"
     sample_music = "dread" if is_horror else "inspirational"
 
-    # Hướng dẫn native text (chỉ cho English comic)
     if native_text:
-        native_note = f"""
-⭐ QUAN TRỌNG — NATIVE TEXT RENDERING:
-Vì đây là English mode, AI sẽ TỰ VẼ chữ vào ảnh. Do đó:
-- "title": viết tiếng Anh, 3-6 từ, IN HOA
-- "callout_text": viết tiếng Anh, ngắn gọn
-- Trong "visual_prompt", MÔ TẢ vị trí chữ sẽ xuất hiện:
-  * "Title text 'XXX' at top center"
-  * "Speech bubble with text 'YYY' near the character"
-  * KHÔNG cần cấm text nữa. Ngược lại, YÊU CẦU AI vẽ chữ rõ ràng.
-- Ví dụ visual_prompt: "Colored cartoon illustration with natural warm earth tones. A caveman stands in a cave holding a stone axe, campfire nearby, cave paintings on walls. Title text 'FIRST TOOL?' at top center. Speech bubble 'WHAT IS THIS?' near the character. Earth tones, brown and orange, warm firelight."
+        native_note = """
+⭐ NATIVE TEXT RENDERING:
+- AI sẽ TỰ VẼ chữ vào ảnh. Trong "visual_prompt", MÔ TẢ vị trí chữ:
+  * "Title text 'XXX' as sticker-style bold letters with thick outline, NO banner"
+  * "Speech bubble with text 'YYY'"
+- KHÔNG cần cấm text. YÊU CẦU AI vẽ chữ sticker rõ ràng.
 """
     else:
         native_note = """
@@ -838,8 +821,8 @@ JSON FORMAT:
     if not clean:
         n = max(3, int(batch_duration / avg_dur)); sd = batch_duration / n
         fb_t = "SCENE" if is_en else "CẢNH"
-        fb_prompts = ["Colored cartoon illustration with warm earth tones, a character in a natural scene, no text",
-                      "Colored cartoon illustration, dramatic lighting, a character, no text"]
+        fb_prompts = ["Colored cartoon illustration with warm earth tones, a character in a natural scene",
+                      "Colored cartoon illustration, dramatic lighting, a character"]
         clean = []
         for i in range(n):
             clean.append({"start": i * sd, "end": (i + 1) * sd, "title": f"{fb_t} {i+1:02d}",
@@ -885,7 +868,7 @@ JSON FORMAT:
     return final
 
 # ============================================================
-# IMAGE PROVIDERS — V10: nhận thêm language, title, callout_text
+# IMAGE PROVIDERS — V10.1 với sticker title
 # ============================================================
 def _build_full_prompt(prompt, chars=None, char_lock=None, style_mode="comic",
                        language="vi", title="", callout_text=""):
@@ -902,20 +885,28 @@ Absolutely NO text, letters, numbers, captions.
 Wide 16:9 cinematic composition.
 CHARACTER GENDER: male = MALE, female = FEMALE."""
     elif native_text:
-        # English comic: AI vẽ chữ + màu tự nhiên
-        safe = prompt  # KHÔNG sanitize text
+        # V10.1: Sticker-style title + KHÔNG band nền
+        safe = prompt
         style = """COLORED CARTOON ILLUSTRATION with natural warm earth tones.
 Color palette: brown, tan, orange, yellow, beige, warm gray, olive, deep green.
 Soft textures on rocks, wood, fabric, ground. Warm firelight glow, soft shadows, cinematic lighting.
-NOT pure white background. Outdoor scenes: natural sky (blue, orange sunset, gray cloudy).
-Indoor scenes: warm cave/room tones (brown, orange, tan).
+NOT pure white background. Outdoor scenes: natural sky. Indoor scenes: warm cave/room tones.
 Thick black outlines, hand-drawn doodle style.
 EXPRESSIVE CARTOON CHARACTERS with clear emotions.
-RENDER ENGLISH TEXT VISIBLY: title at top, speech bubbles, labels. Text MUST be correctly spelled in English.
+
+⭐ TITLE STYLE RULE (CRITICAL):
+- Title must be STICKER-STYLE text: bold letters with THICK contrasting outline.
+- Example: white letters with thick black outline, OR yellow letters with thick black outline.
+- Title is placed DIRECTLY on the illustration, floating over the scene naturally.
+- ABSOLUTELY NO rectangular background band, NO banner, NO black bar, NO frame around title.
+- Title can be anywhere natural (top, angled, left, right) as long as it reads well.
+- Think "comic book title sticker" NOT "YouTube channel banner".
+- FORBIDDEN: drawing any rectangle, band, bar, or frame behind the title text.
+
+RENDER TEXT VISIBLY: title, speech bubbles, labels. Text MUST be correctly spelled in English.
 Wide 16:9 cinematic composition.
 CHARACTER GENDER: male = MALE, female = FEMALE."""
     else:
-        # Vietnamese comic: nền trắng, Pillow overlay
         safe = sanitize_prompt_text(prompt)
         style = """Authentic 2D comic doodle art style, thick black ink contour outlines, hand-drawn wobbly lines.
 Pure solid flat white background OR simple scene background.
@@ -929,15 +920,20 @@ CHARACTER GENDER: male = MALE, female = FEMALE."""
     if char_lock and char_lock.get("__global__"):
         safe += "\n\nIMPORTANT: The MAIN CHARACTER MUST be visible and identical to the description above."
 
-    # V10: chèn yêu cầu text cho English mode
+    # V10.1: Sticker title instructions
     if native_text:
         text_instructions = []
         if title:
-            text_instructions.append(f'Title text "{title}" at top center in bold black font')
+            text_instructions.append(
+                f'Title "{title}" as sticker-style text: bold letters with thick contrasting outline '
+                f'(white or yellow fill, thick black outline), integrated into the scene naturally, '
+                f'NO rectangular banner, NO black background bar, NO frame behind text'
+            )
         if callout_text and callout_text.strip():
             text_instructions.append(f'Speech bubble with text "{callout_text}"')
         if text_instructions:
-            safe += "\n\nTEXT TO RENDER IN IMAGE: " + ". ".join(text_instructions) + "."
+            safe += "\n\nTEXT TO RENDER: " + ". ".join(text_instructions) + "."
+            safe += "\nMANDATORY: Do NOT draw any rectangular shape, band, banner, or frame behind the title."
 
     return f"{safe}.\n\nSTYLE CONSTRAINTS:\n{style}"
 
@@ -1190,13 +1186,9 @@ def smart_filter_tbs(tbs, callout_text, callout_type, callout_side):
 def add_comic_overlays(image_path, title, callout_type, callout_text, callout_side, output_path,
                         text_boxes=None, enable_arrows=True, enable_shadow=True,
                         style_mode="comic", language="vi"):
-    """
-    V10: Nếu language=EN + comic → SKIP hoàn toàn (AI đã vẽ chữ + màu rồi).
-    Nếu VI hoặc Horror → vẽ Pillow overlay như cũ.
-    """
     img = Image.open(image_path).convert("RGB").resize((WIDTH, HEIGHT))
 
-    # V10: English comic → không overlay (AI tự vẽ)
+    # V10.1: English comic → SKIP hoàn toàn
     if language == "en" and style_mode == "comic":
         img.save(output_path, quality=95)
         return
@@ -1595,7 +1587,7 @@ def create_placeholder(out, title):
     img.save(out, quality=95)
 
 # ============================================================
-# PARALLEL — V10: nhận language
+# PARALLEL
 # ============================================================
 def parallel_gen(scenes, batch_dir, providers, image_timeout, progress_state,
                  flux_steps=4, fair_share=True, circuit=True, prio_fast=True,
@@ -1733,7 +1725,8 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
     if not providers: raise RuntimeError("Chưa cấu hình provider.")
 
     native_text = (language == "en" and style_mode == "comic")
-    st.markdown(f"### 🔗 {len(providers)} Provider ({'👻 Horror' if style_mode=='horror' else '🇬🇧 English Comic (native text)' if native_text else '📚 Comic VI (Pillow overlay)'})")
+    mode_label = '👻 Horror' if style_mode=='horror' else ('🇬🇧 English Comic (sticker title)' if native_text else '📚 Comic VI (Pillow overlay)')
+    st.markdown(f"### 🔗 {len(providers)} Provider ({mode_label})")
     pc = st.columns(min(4, len(providers)))
     for i, p in enumerate(providers):
         with pc[i % len(pc)]: st.markdown(f"**{i+1}.** {p['name']}")
@@ -1861,7 +1854,7 @@ if st.sidebar.button("🔎 KIỂM TRA PROVIDER", use_container_width=True):
             if style_mode == "horror":
                 tp = "2D dark horror illustration: a lone figure in a foggy hallway, moonlight, no text"
             elif effective_lang == "en":
-                tp = "Colored cartoon illustration with warm earth tones, a caveman in a cave with campfire, cave paintings on walls, brown and orange palette"
+                tp = "Colored cartoon illustration with warm earth tones, a caveman in a cave with campfire, brown and orange palette"
             else:
                 tp = "2D comic doodle: a person at desk with laptop, white background, no text"
             for pc in providers:
@@ -1889,7 +1882,7 @@ if audio:
         lang_code = None
         if language_mode == "Tiếng Việt": lang_code = "vi"; effective_lang = "vi"
         elif language_mode == "English": lang_code = "en"; effective_lang = "en"
-        else: lang_code = None  # Auto detect
+        else: lang_code = None
         st.info(f"🌐 Ngôn ngữ: **{language_mode}** | 🎨 Style: **{style_mode.upper()}** | ⏱️ Nhịp: **{scene_min}-{scene_max}s**")
 
         if use_script_mode == "Kết hợp voice + text": internal_mode = "combined"
@@ -1907,7 +1900,7 @@ if audio:
 
         cache_dir = Path.home() / ".wb_cache"; cache_dir.mkdir(exist_ok=True)
 
-        root = Path(tempfile.mkdtemp(prefix=f"wb_v10_{style_mode}_"))
+        root = Path(tempfile.mkdtemp(prefix=f"wb_v101_{style_mode}_"))
         try:
             src = root / audio.name; src.write_bytes(audio.getbuffer())
             dur = ffprobe_duration(src)
@@ -1945,7 +1938,7 @@ if audio:
                     s_l = idx*lp; e_l = min(s_l+lp, len(lines))
                     bscript = "\n".join(lines[s_l:e_l])
 
-                stt.markdown(f"### ✂️ Đợt {idx+1}/{len(vc)} — Lên kịch bản (lang={effective_lang})...")
+                stt.markdown(f"### ✂️ Đợt {idx+1}/{len(vc)} — Lên kịch bản ({effective_lang})...")
                 scenes = make_scene_plan(client, btext, bstart, bdur, planner_model,
                                          scene_min, scene_max, max_scenes, cm_mode,
                                          language=effective_lang,
