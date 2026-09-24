@@ -1,14 +1,19 @@
 """
-Xưởng Video Diễn Hoạt Kiến Thức AI — Bản Siêu Cấp V10.2
+Xưởng Video Diễn Hoạt Kiến Thức AI — Bản Siêu Cấp V11.0
 =======================================================
-V10.2 FIX:
-- MODEL_CAP Qwen lên 14000 (tránh cắt JSON)
+V11.0 FIX:
+- Cache đúng voice, checkpoint ảnh/cảnh/batch, xem trước kịch bản
+- Sửa timeline, không nhân đôi prompt, giữ phần audio đuôi
+- FFmpeg writer an toàn, trộn âm thanh ưu tiên voice, xuất SRT
+- Ngân sách token có thể chỉnh, chia batch theo sức chứa, xử lý 429 riêng
 - English mode: KHÔNG tách title band, camera motion áp dụng full 720px
 - English zoom nhẹ hơn (1.12) tránh cắt title
 - VI/Horror giữ nguyên title band 95px + Pillow overlay
 """
 
-import os, re, io, json, math, time, base64, random, shutil, subprocess, tempfile, threading, wave
+import uuid
+import textwrap
+import os, re, io, json, math, time, base64, random, shutil, subprocess, tempfile, threading, wave, hashlib
 from pathlib import Path
 from queue import Queue, Empty
 from collections import Counter
@@ -18,13 +23,16 @@ import requests
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
 from groq import Groq
+from studio_core import (VERSION, fingerprint, file_digest, read_json, write_json,
+                         artifact_ok, mark_artifact, job_lock, RawVideoWriter,
+                         frame_durations, script_slice, srt_text, planner_capacity, chat_completion, PlannerRateLimit)
 import cv2
 import numpy as np
 
 # ============================================================
 # CẤU HÌNH
 # ============================================================
-APP_TITLE = "Xưởng Video Diễn Hoạt Kiến Thức AI (V10.2)"
+APP_TITLE = "Xưởng Video Diễn Hoạt Kiến Thức AI (V11.0)"
 BATCH_SECONDS = 5 * 60
 FPS = 24
 WIDTH = 1280
@@ -145,8 +153,15 @@ def horror_sanitize(text):
 # UI
 # ============================================================
 st.set_page_config(page_title=APP_TITLE, page_icon="🎬", layout="wide")
-st.title("🎬 Xưởng Video Diễn Hoạt Kiến Thức AI — V10.2")
-st.caption("Qwen 14k tokens + English full-frame camera + sticker title")
+st.title("🎬 Xưởng Video Diễn Hoạt Kiến Thức AI — V11.0")
+st.caption("VOICE → KỊCH BẢN → HÌNH ẢNH → VIDEO • Studio V11.0")
+st.markdown("Tạo video minh họa từ lời đọc, kiểm tra kịch bản trước khi tạo ảnh và tiếp tục khi bị gián đoạn.")
+
+def setting(name):
+    value = os.getenv(name)
+    if value is not None: return value
+    try: return str(st.secrets.get(name, ""))
+    except Exception: return ""
 
 with st.sidebar:
     st.header("🎨 Style Mode")
@@ -173,27 +188,27 @@ with st.sidebar:
 
     st.header("🔑 API Keys")
     groq_key = st.text_input("Groq API Key",
-        value=os.getenv("GROQ_API_KEY", ""), type="password")
+        value=setting("GROQ_API_KEY"), type="password")
 
     with st.expander("🎨 Nhà cung cấp ảnh AI", expanded=False):
         pollinations_key = st.text_input("Pollinations API Key",
-            value=os.getenv("POLLINATIONS_API_KEY", ""), type="password")
+            value=setting("POLLINATIONS_API_KEY"), type="password")
         pollinations_model = st.selectbox("Pollinations Model",
             ["flux-pro", "flux", "gptimage", "kontext", "flux-realism"], index=0)
         agnes_key = st.text_input("Agnes AI API Key",
-            value=os.getenv("AGNES_API_KEY", ""), type="password")
+            value=setting("AGNES_API_KEY"), type="password")
         cf_account = st.text_input("Cloudflare Account ID",
-            value=os.getenv("CLOUDFLARE_ACCOUNT_ID", ""), type="password")
+            value=setting("CLOUDFLARE_ACCOUNT_ID"), type="password")
         cf_token = st.text_input("Cloudflare API Token",
-            value=os.getenv("CLOUDFLARE_API_TOKEN", ""), type="password")
+            value=setting("CLOUDFLARE_API_TOKEN"), type="password")
         hf_token = st.text_input("Hugging Face Token",
-            value=os.getenv("HF_TOKEN", ""), type="password")
+            value=setting("HF_TOKEN"), type="password")
         freetheai_key = st.text_input("FreeTheAi API Key",
-            value=os.getenv("FREETHEAI_API_KEY", ""), type="password")
+            value=setting("FREETHEAI_API_KEY"), type="password")
         together_key = st.text_input("Together AI API Key",
-            value=os.getenv("TOGETHER_API_KEY", ""), type="password")
+            value=setting("TOGETHER_API_KEY"), type="password")
         nexa_key = st.text_input("NexaAPI Key",
-            value=os.getenv("NEXA_API_KEY", ""), type="password")
+            value=setting("NEXA_API_KEY"), type="password")
 
     st.header("📝 Văn bản kịch bản (tùy chọn)")
     script_text = st.text_area("Dán kịch bản", value="", height=100)
@@ -234,6 +249,9 @@ with st.sidebar:
     planner_model = st.selectbox("Biên kịch Model",
         ["qwen/qwen3.8-27b", "openai/gpt-oss-120b", "openai/gpt-oss-20b"], index=1)
 
+    planner_output_budget = st.number_input("Token đầu ra tối đa / yêu cầu", min_value=1024, max_value=14000,
+        value=4096, step=256, help="Đây là ngân sách ứng dụng, không phải hạn mức tài khoản. Giảm khi Groq báo Request too large / OTPM. Tool tự chia đợt nhỏ hơn.")
+
     st.header("🎬 Phong cách diễn hoạt")
     draw_style = st.selectbox("Render style", [
         "1. Vẽ 3 phase + Pan/Zoom",
@@ -257,10 +275,11 @@ with st.sidebar:
     ], index=0)
 
     st.header("⏱️ Nhịp cảnh")
+    pacing = st.selectbox("Nhịp dựng", ["YouTube gọn (8–14s)", "Nhịp bản gốc"], index=0)
     if style_mode == "horror":
         default_min, default_max = 6, 10
     else:
-        default_min, default_max = 19, 27
+        default_min, default_max = (8, 14) if pacing.startswith("YouTube") else (19, 27)
     scene_min = st.slider("Tối thiểu (giây)", 5, 25, default_min)
     scene_max = st.slider("Tối đa (giây)", 10, 35, default_max)
     if scene_max < scene_min: scene_max = scene_min
@@ -273,6 +292,17 @@ with st.sidebar:
     fair_share_enabled = st.checkbox("Fair share cap", value=True)
     circuit_breaker_enabled = st.checkbox("Circuit breaker", value=True)
     prioritize_fast = st.checkbox("⚡ Ưu tiên provider nhanh", value=True)
+
+with st.sidebar:
+    st.header("✨ Hoàn thiện video")
+    consistent_provider = st.checkbox("Giữ một nhà cung cấp ảnh", value=True,
+        help="Dùng provider đầu tiên trong danh sách để giảm thay đổi phong cách. Tắt để dùng lại chế độ nhiều provider song song.")
+    allow_placeholder = st.checkbox("Cho phép ảnh dự phòng khi API lỗi", value=False)
+    export_size = st.selectbox("Độ phân giải xuất", ["720p gốc", "1080p nâng kích thước"], index=0,
+        help="Ảnh và diễn hoạt gốc 720p. 1080p được upscale, không tự bổ sung chi tiết thật.")
+    normalize_voice = st.checkbox("Cân bằng âm lượng bản xuất", value=True)
+    burn_subtitles = st.checkbox("Gắn phụ đề vào video", value=False)
+    st.caption("Nhạc nền tự giảm khi có giọng đọc. SRT luôn có thể tải riêng.")
 
 # ============================================================
 # UTILITIES
@@ -311,33 +341,53 @@ def extract_json(text):
     if best is not None: return best
     raise ValueError(f"JSON invalid (preview={text[:200]})")
 
-def groq_client(key): return Groq(api_key=key)
+def groq_client(key): return Groq(api_key=key, max_retries=0, timeout=120.0)
 
 def transcribe_file(client, path, model, language=None, cache_dir=None):
-    if cache_dir:
-        cf = Path(cache_dir) / f"{Path(path).stem}_transcript.json"
-        if cf.exists():
-            try:
-                data = json.loads(cf.read_text(encoding="utf-8"))
-                st.info(f"💾 Cache: {cf.name}")
-                class CR:
-                    def __init__(s, d): s._d = d
-                    def model_dump(s): return s._d
-                    def __getattr__(s, k): return s._d.get(k)
-                return CR(data)
-            except Exception: pass
-    with open(path, "rb") as f:
-        kw = {"file": (Path(path).name, f.read()), "model": model,
-              "response_format": "verbose_json", "timestamp_granularities": ["segment"],
-              "temperature": 0.0}
-        if language: kw["language"] = language
-        result = client.audio.transcriptions.create(**kw)
-    if cache_dir:
+    # Content + STT settings identify a transcript; batch filenames are reused.
+    audio_bytes = Path(path).read_bytes()
+    settings = json.dumps({"version": 2, "model": model, "language": language}, sort_keys=True)
+    key = hashlib.sha256(settings.encode() + b"\0" + audio_bytes).hexdigest()
+    cf = Path(cache_dir) / f"transcript_v2_{key}.json" if cache_dir else None
+    if cf and cf.exists():
         try:
+            data = json.loads(cf.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and isinstance(data.get("segments"), list):
+                st.info("💾 Đã dùng transcript của đúng nội dung audio và cấu hình STT.")
+                return data
+        except (ValueError, OSError):
+            pass
+    upload_bytes = audio_bytes
+    upload_name = Path(path).name
+    # Keep full-bandwidth batch audio for the video; shrink only the STT upload if needed.
+    if len(upload_bytes) > 20 * 1024 * 1024:
+        with tempfile.TemporaryDirectory() as temporary:
+            speech = Path(temporary) / "speech.wav"
+            run_cmd(["ffmpeg", "-y", "-v", "error", "-i", str(path), "-ar", "16000", "-ac", "1",
+                     "-c:a", "pcm_s16le", str(speech)], timeout=300)
+            upload_bytes = speech.read_bytes()
+            upload_name = "speech.wav"
+    kw = {"file": (upload_name, upload_bytes), "model": model,
+          "response_format": "verbose_json", "timestamp_granularities": ["segment"],
+          "temperature": 0.0}
+    if language:
+        kw["language"] = language
+    result = client.audio.transcriptions.create(**kw)
+    if cf:
+        tmp = None
+        try:
+            cf.parent.mkdir(parents=True, exist_ok=True)
             data = result.model_dump() if hasattr(result, "model_dump") else result
-            (Path(cache_dir) / f"{Path(path).stem}_transcript.json").write_text(
-                json.dumps(data, ensure_ascii=False, default=str), encoding="utf-8")
-        except Exception: pass
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=cf.parent,
+                                             delete=False, suffix=".tmp") as f:
+                tmp = Path(f.name)
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(tmp, cf)
+        except (OSError, TypeError, ValueError):
+            pass
+        finally:
+            if tmp:
+                tmp.unlink(missing_ok=True)
     return result
 
 def detect_language(result):
@@ -347,10 +397,10 @@ def detect_language(result):
     except Exception: return "unknown"
 
 def chunk_audio(src, out_dir, bs):
-    pattern = str(Path(out_dir) / "batch_%03d.m4a")
-    run_cmd(["ffmpeg", "-y", "-i", str(src), "-map", "0:a:0", "-c:a", "aac", "-b:a", "96k",
+    pattern = str(Path(out_dir) / "batch_%03d.wav")
+    run_cmd(["ffmpeg", "-y", "-v", "error", "-i", str(src), "-map", "0:a:0", "-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2",
              "-f", "segment", "-segment_time", str(bs), "-reset_timestamps", "1", pattern], timeout=900)
-    return sorted(Path(out_dir).glob("batch_*.m4a"))
+    return sorted(Path(out_dir).glob("batch_*.wav"))
 
 def normalize_segments(result, offset):
     data = result.model_dump() if hasattr(result, "model_dump") else result
@@ -403,13 +453,18 @@ def compose_frame(tb, ct):
     c[:TITLE_BAND_H] = tb; c[TITLE_BAND_H:] = ct
     return c
 
+def smooth_crop(frame, scale, cx, cy):
+    h, w = frame.shape[:2]
+    scale = max(1.0, float(scale))
+    crop_w, crop_h = w / scale, h / scale
+    left = max(0.0, min(w-crop_w, cx-crop_w/2))
+    top = max(0.0, min(h-crop_h, cy-crop_h/2))
+    matrix = np.array([[1/scale, 0, left], [0, 1/scale, top]], dtype=np.float32)
+    return cv2.warpAffine(frame, matrix, (w, h), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+                          borderMode=cv2.BORDER_REPLICATE)
+
 def crop_content_motion(c, scale, cx, cy):
-    ch, cw = c.shape[:2]
-    w = max(1, min(cw, int(cw / max(0.5, scale))))
-    h = max(1, min(ch, int(ch / max(0.5, scale))))
-    x1 = max(0, min(cw - w, int(cx - w / 2)))
-    y1 = max(0, min(ch - h, int(cy - h / 2)))
-    return cv2.resize(c[y1:y1+h, x1:x1+w], (cw, ch), interpolation=cv2.INTER_LINEAR)
+    return smooth_crop(c, scale, cx, cy)
 
 def traj_to_content(traj_full):
     out = [(int(px), int(py - TITLE_BAND_H)) for (px, py) in traj_full if py >= TITLE_BAND_H]
@@ -454,8 +509,6 @@ def _ensure_fonts():
     return True
 
 def font_for(size, bold=True):
-    try: _ensure_fonts()
-    except Exception: pass
     noto = FONT_DIR / ("NotoSans-Bold.ttf" if bold else "NotoSans-Regular.ttf")
     if noto.exists():
         try: return ImageFont.truetype(str(noto), size)
@@ -478,6 +531,10 @@ def font_for(size, bold=True):
     if tmp.exists():
         try: return ImageFont.truetype(str(tmp), size)
         except Exception: pass
+    try:
+        _ensure_fonts()
+        if noto.exists(): return ImageFont.truetype(str(noto), size)
+    except Exception: pass
     return ImageFont.load_default()
 
 # ============================================================
@@ -600,7 +657,7 @@ def build_music_track(scenes, out, sr=SFX_SAMPLE_RATE, vol_db=-22):
         emo = s.get("music_emotion", "neutral")
         if emo in ("none", None): continue
         st_ = s["start"]; dur = s["end"] - s["start"]
-        key = f"{emo}_{int(dur)}"
+        key = (emo, round(dur * sr))
         if key not in cache: cache[key] = generate_music_track(emo, dur, sr)
         mus = cache[key]
         if len(mus) == 0: continue
@@ -615,13 +672,22 @@ def build_music_track(scenes, out, sr=SFX_SAMPLE_RATE, vol_db=-22):
     write_wav(full, out, sr); return out
 
 def mix_audio_tracks(voice, sfx, music, out):
-    inputs = ["-i", str(voice)]; filters = ["[0:a]"]; n = 1
-    if sfx and Path(sfx).exists(): inputs += ["-i", str(sfx)]; filters.append(f"[{n}:a]"); n += 1
-    if music and Path(music).exists(): inputs += ["-i", str(music)]; filters.append(f"[{n}:a]"); n += 1
-    if n == 1: shutil.copy2(voice, out); return out
-    mix = "".join(filters) + f"amix=inputs={n}:duration=first:dropout_transition=2[aout]"
-    run_cmd(["ffmpeg", "-y"] + inputs + ["-filter_complex", mix, "-map", "[aout]",
-             "-c:a", "aac", "-b:a", "128k", str(out)], timeout=600)
+    inputs = ["-i", str(voice)]
+    filters = ["[0:a]aresample=48000,aformat=channel_layouts=stereo,asplit=2[voice][side]"]
+    labels = ["[voice]"]; next_input = 1
+    if music and Path(music).exists():
+        inputs += ["-i", str(music)]
+        filters.append(f"[{next_input}:a]aresample=48000,aformat=channel_layouts=stereo[music]")
+        filters.append("[music][side]sidechaincompress=threshold=0.03:ratio=5:attack=15:release=300[ducked]")
+        labels.append("[ducked]"); next_input += 1
+    else:
+        filters.append("[side]anullsink")
+    if sfx and Path(sfx).exists():
+        inputs += ["-i", str(sfx)]
+        labels.append(f"[{next_input}:a]")
+    filters.append("".join(labels) + f"amix=inputs={len(labels)}:duration=first:normalize=0,alimiter=limit=0.95:level=0:latency=1[aout]")
+    run_cmd(["ffmpeg", "-y", "-v", "error"] + inputs + ["-filter_complex", ";".join(filters),
+             "-map", "[aout]", "-ar", "48000", "-ac", "2", "-c:a", "aac", "-b:a", "192k", str(out)], timeout=600)
     return out
 
 # ============================================================
@@ -631,9 +697,11 @@ def make_scene_plan(client, transcript_text, batch_start, batch_duration, model,
                     min_s, max_s, max_scenes, camera_mode="auto",
                     language="vi", enable_rich=True, char_lock=None,
                     enable_sfx=True, enable_music=True,
-                    user_script="", use_script_mode="voice_only", style_mode="comic"):
+                    user_script="", use_script_mode="voice_only", style_mode="comic", previous_scenes=None, feedback="", output_budget=4096):
     avg_dur = (min_s + max_s) / 2.0
-    expected = max(1, round(batch_duration / avg_dur))
+    expected = min(max_scenes, max(1, round(batch_duration / avg_dur)))
+    if use_script_mode != "text_only" and not transcript_text.strip():
+        raise ValueError("Không nhận dạng được lời thoại. Hãy kiểm tra audio hoặc chọn ngôn ngữ cụ thể.")
     is_en = (language == "en")
     lang_name = "English" if is_en else "Tiếng Việt"
     is_horror = (style_mode == "horror")
@@ -688,6 +756,17 @@ Ví dụ: "... Title 'XXX' as sticker text top center. Speech bubble 'YYY' near 
 
     system = f"""Bạn là giám đốc sáng tạo kịch bản cho kênh {("KINH DỊ" if is_horror else "hoạt họa kiến thức")}.
 NGÔN NGỮ OUTPUT: {lang_name}.
+TIMING: start/end tính bằng giây CỤC BỘ trong batch này, bắt đầu từ 0.
+Các cảnh theo thứ tự thời gian, không chồng lấn, phủ kín audio đến {batch_duration:.2f}s.
+Mỗi cảnh bám đúng lời thoại trong khoảng thời gian tương ứng.
+Không lặp visual_prompt và không kể lại nội dung trước đó.
+DỰNG PHIM: mỗi cảnh truyền tải một ý, chọn cỡ cảnh toàn/trung/cận phù hợp.
+Luân phiên bối cảnh, hành động và cỡ cảnh; giữ ngoại hình nhân vật, bảng màu nhất quán.
+Mở đoạn đầu bằng hình ảnh cụ thể gắn với câu hook, tránh hình minh họa chung chung.
+Không tự bịa số liệu, thương hiệu, biểu đồ hoặc thông tin không có trong lời thoại.
+Giữ phần chữ ngắn, tránh vùng mép ảnh và vùng dưới cùng dành cho phụ đề.
+Các cảnh trước (chỉ tham khảo tính liên tục, KHÔNG kể lại): {json.dumps(previous_scenes or [], ensure_ascii=False)}
+Lỗi cần sửa từ lần lập kế hoạch trước: {feedback}
 Nhiệm vụ: Chia đoạn âm thanh {batch_duration:.0f}s thành khoảng {expected} cảnh ({min_s}-{max_s}s/cảnh).
 
 {char_note}
@@ -734,20 +813,25 @@ JSON FORMAT:
     else:
         user = f"Audio length: {batch_duration:.2f}s.\nMAX {expected} SCENES.\n\nTRANSCRIPT:\n{transcript_text}"
 
-    # V10.2: Qwen cap 14000
-    MODEL_CAP = {"qwen/qwen3.8-27b": 14000, "openai/gpt-oss-120b": 14000, "openai/gpt-oss-20b": 9000}
-    dyn_max = min(MODEL_CAP.get(model, 14000), max(5000, int(expected * 600 * 1.3)))
-
+    dyn_max = min(int(output_budget), max(1024, 512 + expected * 650))
     raw = ""
     try:
-        r = client.chat.completions.create(model=model, temperature=0.15, max_tokens=dyn_max,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}])
-        raw = r.choices[0].message.content or ""
+        response = chat_completion(client, model,
+            [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            dyn_max, notify=st.info)
+        choice = response.choices[0]
+        if getattr(choice, "finish_reason", None) == "length":
+            raise ValueError("JSON bị cắt vì hết token. Giảm số cảnh/đợt hoặc điều chỉnh ngân sách token phù hợp Limits.")
+        raw = choice.message.content or ""
         obj = extract_json(raw); raw_scenes = obj.get("scenes", [])
-    except Exception as e:
-        st.error(f"❌ Qwen fail: {str(e)[:200]}")
-        if raw: st.code(raw[:1000], language="text")
-        raw_scenes = []
+    except PlannerRateLimit:
+        raise
+    except Exception as exc:
+        # Authentication/model availability/network errors are not script repair requests.
+        if getattr(exc, "status_code", None) is not None: raise
+        raise RuntimeError(f"Không tạo được kịch bản hợp lệ: {str(exc)[:300]}") from exc
+    if not isinstance(raw_scenes, list) or len(raw_scenes) > max_scenes:
+        raise ValueError("scenes phải là danh sách trong giới hạn số cảnh đã chọn.")
 
     valid_motions = (set(HORROR_MOTIONS.keys()) if is_horror else
                      {"zoom_in_center", "zoom_out_center", "pan_left_to_right", "pan_right_to_left",
@@ -782,10 +866,12 @@ JSON FORMAT:
         return out
 
     clean = []
-    for s in raw_scenes[:max_scenes]:
+    for s in raw_scenes:
         try:
-            a = max(0.0, float(s["start"])); b = min(batch_duration, float(s["end"]))
-            if b <= a + 1.0: continue
+            a = float(s["start"]); b = float(s["end"])
+            if not math.isfinite(a) or not math.isfinite(b): continue
+            a = max(0.0, a); b = min(batch_duration, b)
+            if b <= a: continue
             vp = str(s.get("visual_prompt", "")).strip()
             if not vp or len(vp) < 10: continue
             if is_horror: vp = horror_sanitize(vp)
@@ -803,49 +889,34 @@ JSON FORMAT:
                 "callout_type": ct, "callout_text": str(s.get("callout_text", "")).strip(),
                 "callout_side": str(s.get("callout_side", "right")).strip().lower(),
                 "camera_motion": cm, "sfx": sfx, "music_emotion": emo,
-                "visual_prompt": vp, "text_boxes": clean_tbs(s.get("text_boxes", []))})
+                "visual_prompt": vp, "text_boxes": clean_tbs(s.get("text_boxes", [])) if enable_rich else []})
         except Exception: continue
 
+    if len(clean) != len(raw_scenes):
+        raise ValueError("Có cảnh sai thời gian hoặc thiếu mô tả; cần lập lại kịch bản.")
     if not clean:
-        n = max(3, int(batch_duration / avg_dur)); sd = batch_duration / n
-        fb_t = "SCENE" if is_en else "CẢNH"
-        fb_prompts = ["Colored cartoon illustration with warm earth tones, a character in a natural scene",
-                      "Colored cartoon illustration, dramatic lighting, a character"]
-        clean = []
-        for i in range(n):
-            clean.append({"start": i * sd, "end": (i + 1) * sd, "title": f"{fb_t} {i+1:02d}",
-                "callout_type": "none", "callout_text": "", "callout_side": "right",
-                "camera_motion": random.choice(list(valid_motions)),
-                "sfx": random.choice(list(valid_sfx_set - {"none"})),
-                "music_emotion": random.choice(list(VALID_EMOTIONS - {"none"})),
-                "visual_prompt": fb_prompts[i % len(fb_prompts)], "text_boxes": []})
+        raise ValueError("Kịch bản không có cảnh hợp lệ. Dừng thay vì dùng hai prompt lặp lại.")
 
-    merge_threshold = max(min_s * 0.7, 5.0)
-    merged = []
-    for s in clean:
-        if not merged: merged.append(s)
-        else:
-            prev = merged[-1]
-            if (s["end"] - s["start"]) < merge_threshold or (s["start"] - prev["start"] < merge_threshold):
-                prev["end"] = max(prev["end"], s["end"])
-                if not prev.get("callout_text") and s.get("callout_text"):
-                    prev["callout_text"] = s["callout_text"]; prev["callout_type"] = s["callout_type"]
-            else: merged.append(s)
-    clean = merged
-    clean[0]["start"] = 0.0
-    for i in range(len(clean) - 1): clean[i]["end"] = clean[i + 1]["start"]
-    clean[-1]["end"] = batch_duration
-
-    split_threshold = max(max_s * 1.3, 15.0)
-    final = []
-    for s in clean:
-        dur = s["end"] - s["start"]
-        if dur > split_threshold:
-            mid = s["start"] + dur / 2.0
-            final.append({**s, "end": mid})
-            final.append({**s, "start": mid, "title": f"{s['title']} (TIẾP)",
-                "callout_type": "sticker", "callout_text": "!", "text_boxes": []})
-        else: final.append(s)
+    # Sort and reject overlapping intervals before closing timing gaps.
+    clean.sort(key=lambda scene: (scene["start"], scene["end"]))
+    ordered = []
+    prompts = set()
+    for scene in clean:
+        signature = " ".join(scene["visual_prompt"].casefold().split())
+        if signature in prompts:
+            raise ValueError("AI trả về mô tả ảnh trùng nhau. Hãy thử lên kịch bản lại.")
+        prompts.add(signature)
+        if ordered and (scene["start"] <= ordered[-1]["start"] or scene["start"] < ordered[-1]["end"] - 0.05):
+            raise ValueError("Kịch bản có cảnh chồng lấn; dừng để tránh sai thứ tự lời thoại.")
+        ordered.append(scene)
+    ordered[0]["start"] = 0.0
+    for i in range(len(ordered) - 1):
+        ordered[i]["end"] = ordered[i + 1]["start"]
+    ordered[-1]["end"] = batch_duration
+    # Never split a long scene by copying its visual_prompt and regenerating the image.
+    final = ordered
+    if any(scene["end"] - scene["start"] > max_s * 1.3 for scene in final):
+        st.warning("Một số cảnh dài hơn nhịp đã chọn. Giữ một cảnh, không nhân đôi ảnh.")
 
     if camera_mode == "random":
         for s in final: s["camera_motion"] = random.choice(list(valid_motions))
@@ -1177,7 +1248,7 @@ def add_comic_overlays(image_path, title, callout_type, callout_text, callout_si
 
     draw = ImageDraw.Draw(img)
     is_horror = (style_mode == "horror")
-    title_color = "#1a0000" if is_horror else "#111111"
+    title_color = "#fff1e6" if is_horror else "#111111"
     underline_color = "#8b0000" if is_horror else "#d32f2f"
     bubble_text_color = "#6a0000" if is_horror else "#1b5e20"
     thought_text_color = "#1a0033" if is_horror else "#0d47a1"
@@ -1198,7 +1269,8 @@ def add_comic_overlays(image_path, title, callout_type, callout_text, callout_si
         draw.line([(text_x, underline_y), (text_x + tw, underline_y)], fill=underline_color, width=4)
 
     if callout_text and callout_type != "none":
-        f_text = font_for(26, bold=True)
+        callout_text = "\n".join(textwrap.wrap(callout_text, width=26, break_long_words=False)[:3])
+        f_text = font_for(28, bold=True)
         bb = draw.textbbox((0, 0), callout_text, font=f_text)
         bw, bh = bb[2] - bb[0], bb[3] - bb[1]
         cx, cy = (int(WIDTH * 0.28), int(HEIGHT * 0.45)) if callout_side == "left" else (int(WIDTH * 0.74), int(HEIGHT * 0.42))
@@ -1402,21 +1474,16 @@ def interp_motion(kfs, p):
 
 def crop_full_frame(frame_bgr, scale, cx, cy):
     """Crop full frame (không tách title band) — dùng cho English mode."""
-    ch, cw = frame_bgr.shape[:2]
-    w = max(1, min(cw, int(cw / max(0.5, scale))))
-    h = max(1, min(ch, int(ch / max(0.5, scale))))
-    x1 = max(0, min(cw - w, int(cx - w / 2)))
-    y1 = max(0, min(ch - h, int(cy - h / 2)))
-    return cv2.resize(frame_bgr[y1:y1+h, x1:x1+w], (WIDTH, HEIGHT), interpolation=cv2.INTER_LINEAR)
+    return smooth_crop(frame_bgr, scale, cx, cy)
 
 # ============================================================
-# RENDER 4 STYLES — V10.2: English full-frame, VI/Horror title band
+# RENDER 4 STYLES — V11.0: English full-frame, VI/Horror title band
 # ============================================================
 def render_kttv(image_path, duration, output_path, hand_path, motion="zoom_in_center",
                 style_mode="comic", language="vi"):
     tf = max(1, round(duration * FPS))
-    dd = max(1.5, min(duration - 0.8, duration * DRAW_DURATION_RATIO))
-    df = int(dd * FPS); rf = int(0.35 * FPS)
+    dd = min(max(0.0, duration - 1.0 / FPS), max(0.0, duration * DRAW_DURATION_RATIO))
+    df = int(dd * FPS); rf = min(int(0.35 * FPS), max(0, tf-df-1))
     of = cv2.imread(str(image_path))
     if of is None: raise RuntimeError(f"Không đọc được ảnh: {image_path}")
     of = cv2.resize(of, (WIDTH, HEIGHT))
@@ -1441,58 +1508,56 @@ def render_kttv(image_path, duration, output_path, hand_path, motion="zoom_in_ce
     hb, ha, tx, ty = load_hand(hand_path, 320)
     cmd = ["ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo", "-s", f"{WIDTH}x{HEIGHT}",
            "-pix_fmt", "bgr24", "-r", str(FPS), "-i", "-", "-an", "-c:v", "libx264",
-           "-preset", "veryfast", "-pix_fmt", "yuv420p", str(output_path)]
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-    lt = ap[0] if ap else (WIDTH//2, ch_use//2)
-    kfs = get_motion_kfs(motion, style_mode, language)
+           "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p", str(output_path)]
+    with RawVideoWriter(cmd) as proc:
+        lt = ap[0] if ap else (WIDTH//2, ch_use//2)
+        kfs = get_motion_kfs(motion, style_mode, language)
 
-    for fi in range(tf):
-        hv = False; hx = hy = 0
-        if fi < df:
-            if fi < pf[0]: cp=0; lp=fi/max(1,pf[0])
-            elif fi < pf[1]: cp=1; lp=(fi-pf[0])/max(1,pf[1]-pf[0])
-            else: cp=2; lp=(fi-pf[1])/max(1,pf[2]-pf[1])
-            for pi in range(cp):
-                for pt in ph[pi]: cv2.circle(rm, pt, REVEAL_RADIUS, 255, -1)
-            cps = ph[cp]
-            if cps:
-                cnt = max(1, min(int(lp*len(cps)), len(cps)))
-                for pt in cps[:cnt]: cv2.circle(rm, pt, REVEAL_RADIUS, 255, -1)
-                tg = cps[cnt-1]
-            else: tg = lt
-            hx = tg[0]+int(1.2*math.sin(fi*1.8)); hy = tg[1]+int(1.2*math.cos(fi*1.8))
-            lt = (hx, hy); hv = True
-        elif fi < df+rf:
-            rm[:, :] = 255; pr = (fi-df)/max(1,rf)
-            hx = int(lt[0]+(WIDTH+180-lt[0])*pr); hy = int(lt[1]+(ch_use+180-lt[1])*pr); hv = True
-        else: rm[:, :] = 255
-        a = (cv2.GaussianBlur(rm, (13, 13), 0).astype(np.float32)/255.0)[:, :, None]
-        fc = (cb*a + wc*(1.0-a)).astype(np.uint8)
-        if hv: paste_hand(fc, hb, ha, hx-tx, hy-ty)
-        if fi < df+rf:
-            sc, cu, cyu = 1.0, WIDTH*0.5, ch_use*0.5
-        else:
-            op = (fi-df-rf)/max(1, tf-df-rf)
-            st_, cx_, cy_ = interp_motion(kfs, op)
-            # cy_ được tính theo HEIGHT gốc → scale theo ch_use
-            cyc = (cy_/HEIGHT)*ch_use
-            bl = ease(min(1.0, op*1.8))
-            sc = 1.0 + (st_-1.0)*bl
-            cu = WIDTH*0.5 + (cx_-WIDTH*0.5)*bl
-            cyu = ch_use*0.5 + (cyc-ch_use*0.5)*bl
-        if use_full_frame:
-            fo = crop_full_frame(fc, sc, cu, cyu)
-        else:
-            fo = compose_frame(tb, crop_content_motion(fc, sc, cu, cyu))
-        proc.stdin.write(fo.tobytes())
-    proc.stdin.close(); proc.wait()
-    if proc.returncode != 0: raise RuntimeError("FFmpeg fail (style 1)")
+        for fi in range(tf):
+            hv = False; hx = hy = 0
+            if fi < df:
+                if fi < pf[0]: cp=0; lp=fi/max(1,pf[0])
+                elif fi < pf[1]: cp=1; lp=(fi-pf[0])/max(1,pf[1]-pf[0])
+                else: cp=2; lp=(fi-pf[1])/max(1,pf[2]-pf[1])
+                for pi in range(cp):
+                    for pt in ph[pi]: cv2.circle(rm, pt, REVEAL_RADIUS, 255, -1)
+                cps = ph[cp]
+                if cps:
+                    cnt = max(1, min(int(lp*len(cps)), len(cps)))
+                    for pt in cps[:cnt]: cv2.circle(rm, pt, REVEAL_RADIUS, 255, -1)
+                    tg = cps[cnt-1]
+                else: tg = lt
+                hx = tg[0]+int(1.2*math.sin(fi*1.8)); hy = tg[1]+int(1.2*math.cos(fi*1.8))
+                lt = (hx, hy); hv = True
+            elif fi < df+rf:
+                rm[:, :] = 255; pr = (fi-df)/max(1,rf)
+                hx = int(lt[0]+(WIDTH+180-lt[0])*pr); hy = int(lt[1]+(ch_use+180-lt[1])*pr); hv = True
+            else: rm[:, :] = 255
+            a = (cv2.GaussianBlur(rm, (13, 13), 0).astype(np.float32)/255.0)[:, :, None]
+            fc = (cb*a + wc*(1.0-a)).astype(np.uint8)
+            if hv: paste_hand(fc, hb, ha, hx-tx, hy-ty)
+            if fi < df+rf:
+                sc, cu, cyu = 1.0, WIDTH*0.5, ch_use*0.5
+            else:
+                op = (fi-df-rf)/max(1, tf-df-rf)
+                st_, cx_, cy_ = interp_motion(kfs, op)
+                # cy_ được tính theo HEIGHT gốc → scale theo ch_use
+                cyc = (cy_/HEIGHT)*ch_use
+                bl = ease(min(1.0, op*1.8))
+                sc = 1.0 + (st_-1.0)*bl
+                cu = WIDTH*0.5 + (cx_-WIDTH*0.5)*bl
+                cyu = ch_use*0.5 + (cyc-ch_use*0.5)*bl
+            if use_full_frame:
+                fo = crop_full_frame(fc, sc, cu, cyu)
+            else:
+                fo = compose_frame(tb, crop_content_motion(fc, sc, cu, cyu))
+            proc.stdin.write(fo.tobytes())
 
 def render_hybrid(image_path, duration, output_path, hand_path, motion="zoom_in_center",
                   style_mode="comic", language="vi"):
     tf = max(1, round(duration * FPS))
-    dd = max(1.5, min(duration - 0.8, duration * DRAW_DURATION_RATIO))
-    df = int(dd*FPS); rf = int(0.35*FPS)
+    dd = min(max(0.0, duration - 1.0 / FPS), max(0.0, duration * DRAW_DURATION_RATIO))
+    df = int(dd*FPS); rf = min(int(0.35*FPS), max(0, tf-df-1))
     of = cv2.imread(str(image_path))
     if of is None: raise RuntimeError(f"Không đọc được ảnh: {image_path}")
     of = cv2.resize(of, (WIDTH, HEIGHT))
@@ -1512,54 +1577,52 @@ def render_hybrid(image_path, duration, output_path, hand_path, motion="zoom_in_
     hb, ha, tx, ty = load_hand(hand_path, 320)
     cmd = ["ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo", "-s", f"{WIDTH}x{HEIGHT}",
            "-pix_fmt", "bgr24", "-r", str(FPS), "-i", "-", "-an", "-c:v", "libx264",
-           "-preset", "veryfast", "-pix_fmt", "yuv420p", str(output_path)]
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-    lt = tr[0] if tr else (WIDTH//2, ch_use//2)
-    scx, scy = float(lt[0]), float(lt[1])
-    kfs = get_motion_kfs(motion, style_mode, language)
+           "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p", str(output_path)]
+    with RawVideoWriter(cmd) as proc:
+        lt = tr[0] if tr else (WIDTH//2, ch_use//2)
+        scx, scy = float(lt[0]), float(lt[1])
+        kfs = get_motion_kfs(motion, style_mode, language)
 
-    for fi in range(tf):
-        hv = False; hx = hy = 0
-        if fi < df:
-            if fi < pf[0]: cp=0; lp=fi/max(1,pf[0])
-            elif fi < pf[1]: cp=1; lp=(fi-pf[0])/max(1,pf[1]-pf[0])
-            else: cp=2; lp=(fi-pf[1])/max(1,pf[2]-pf[1])
-            for pi in range(cp):
-                for pt in ph[pi]: cv2.circle(rm, pt, REVEAL_RADIUS, 255, -1)
-            cps = ph[cp]
-            if cps:
-                cnt = max(1, min(int(lp*len(cps)), len(cps)))
-                for pt in cps[:cnt]: cv2.circle(rm, pt, REVEAL_RADIUS, 255, -1)
-                tg = cps[cnt-1]
-            else: tg = lt
-            hx = tg[0]+int(1.2*math.sin(fi*1.8)); hy = tg[1]+int(1.2*math.cos(fi*1.8))
-            lt = (hx, hy); hv = True
-        elif fi < df+rf:
-            rm[:, :] = 255; pr = (fi-df)/max(1,rf)
-            hx = int(lt[0]+(WIDTH+180-lt[0])*pr); hy = int(lt[1]+(ch_use+180-lt[1])*pr); hv = True
-        else: rm[:, :] = 255
-        a = (cv2.GaussianBlur(rm, (13, 13), 0).astype(np.float32)/255.0)[:, :, None]
-        fc = (cb*a + wc*(1.0-a)).astype(np.uint8)
-        if hv: paste_hand(fc, hb, ha, hx-tx, hy-ty)
-        if fi < df:
-            sc = 1.0
-            scx = scx*0.95 + hx*0.05; scy = scy*0.95 + hy*0.05
-            cu, cyu = scx, scy
-        elif fi < df+rf: sc, cu, cyu = 1.0, scx, scy
-        else:
-            op = (fi-df-rf)/max(1, tf-df-rf)
-            st_, cx_, cy_ = interp_motion(kfs, op); cyc = (cy_/HEIGHT)*ch_use
-            bl = ease(min(1.0, op*1.8)); sc = 1.0 + (st_-1.0)*bl
-            cu = scx + (cx_-scx)*bl; cyu = scy + (cyc-scy)*bl
-        if use_full_frame:
-            fo = crop_full_frame(fc, sc, cu, cyu)
-        else:
-            cw = int(WIDTH/sc); chh = int(ch_use/sc)
-            ccx = max(cw//2, min(WIDTH-cw//2, int(cu))); ccy = max(chh//2, min(ch_use-chh//2, int(cyu)))
-            fo = compose_frame(tb, crop_content_motion(fc, sc, ccx, ccy))
-        proc.stdin.write(fo.tobytes())
-    proc.stdin.close(); proc.wait()
-    if proc.returncode != 0: raise RuntimeError("FFmpeg fail (style 2)")
+        for fi in range(tf):
+            hv = False; hx = hy = 0
+            if fi < df:
+                if fi < pf[0]: cp=0; lp=fi/max(1,pf[0])
+                elif fi < pf[1]: cp=1; lp=(fi-pf[0])/max(1,pf[1]-pf[0])
+                else: cp=2; lp=(fi-pf[1])/max(1,pf[2]-pf[1])
+                for pi in range(cp):
+                    for pt in ph[pi]: cv2.circle(rm, pt, REVEAL_RADIUS, 255, -1)
+                cps = ph[cp]
+                if cps:
+                    cnt = max(1, min(int(lp*len(cps)), len(cps)))
+                    for pt in cps[:cnt]: cv2.circle(rm, pt, REVEAL_RADIUS, 255, -1)
+                    tg = cps[cnt-1]
+                else: tg = lt
+                hx = tg[0]+int(1.2*math.sin(fi*1.8)); hy = tg[1]+int(1.2*math.cos(fi*1.8))
+                lt = (hx, hy); hv = True
+            elif fi < df+rf:
+                rm[:, :] = 255; pr = (fi-df)/max(1,rf)
+                hx = int(lt[0]+(WIDTH+180-lt[0])*pr); hy = int(lt[1]+(ch_use+180-lt[1])*pr); hv = True
+            else: rm[:, :] = 255
+            a = (cv2.GaussianBlur(rm, (13, 13), 0).astype(np.float32)/255.0)[:, :, None]
+            fc = (cb*a + wc*(1.0-a)).astype(np.uint8)
+            if hv: paste_hand(fc, hb, ha, hx-tx, hy-ty)
+            if fi < df:
+                sc = 1.0
+                scx = scx*0.95 + hx*0.05; scy = scy*0.95 + hy*0.05
+                cu, cyu = scx, scy
+            elif fi < df+rf: sc, cu, cyu = 1.0, scx, scy
+            else:
+                op = (fi-df-rf)/max(1, tf-df-rf)
+                st_, cx_, cy_ = interp_motion(kfs, op); cyc = (cy_/HEIGHT)*ch_use
+                bl = ease(min(1.0, op*1.8)); sc = 1.0 + (st_-1.0)*bl
+                cu = scx + (cx_-scx)*bl; cyu = scy + (cyc-scy)*bl
+            if use_full_frame:
+                fo = crop_full_frame(fc, sc, cu, cyu)
+            else:
+                cw = int(WIDTH/sc); chh = int(ch_use/sc)
+                ccx = max(cw//2, min(WIDTH-cw//2, int(cu))); ccy = max(chh//2, min(ch_use-chh//2, int(cyu)))
+                fo = compose_frame(tb, crop_content_motion(fc, sc, ccx, ccy))
+            proc.stdin.write(fo.tobytes())
 
 def render_pure(image_path, duration, output_path, motion="zoom_in_center",
                 style_mode="comic", language="vi"):
@@ -1572,25 +1635,24 @@ def render_pure(image_path, duration, output_path, motion="zoom_in_center",
         tb, cb = split_title_band(of)
     cmd = ["ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo", "-s", f"{WIDTH}x{HEIGHT}",
            "-pix_fmt", "bgr24", "-r", str(FPS), "-i", "-", "-an", "-c:v", "libx264",
-           "-preset", "veryfast", "-pix_fmt", "yuv420p", str(output_path)]
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-    kfs = get_motion_kfs(motion, style_mode, language)
-    ch_use = cb.shape[0]
-    for fi in range(tf):
-        p = fi / max(1, tf-1)
-        s, cx, cyf = interp_motion(kfs, p)
-        cy = (cyf/HEIGHT)*ch_use
-        if use_full_frame:
-            fo = crop_full_frame(cb, s, cx, cy)
-        else:
-            fo = compose_frame(tb, crop_content_motion(cb, s, cx, cy))
-        proc.stdin.write(fo.tobytes())
-    proc.stdin.close(); proc.wait()
+           "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p", str(output_path)]
+    with RawVideoWriter(cmd) as proc:
+        kfs = get_motion_kfs(motion, style_mode, language)
+        ch_use = cb.shape[0]
+        for fi in range(tf):
+            p = fi / max(1, tf-1)
+            s, cx, cyf = interp_motion(kfs, p)
+            cy = (cyf/HEIGHT)*ch_use
+            if use_full_frame:
+                fo = crop_full_frame(cb, s, cx, cy)
+            else:
+                fo = compose_frame(tb, crop_content_motion(cb, s, cx, cy))
+            proc.stdin.write(fo.tobytes())
 
 def render_classic(image_path, duration, output_path, hand_path, motion="zoom_in_center",
                    style_mode="comic", language="vi"):
     tf = max(1, round(duration * FPS))
-    df = int(max(1.5, min(duration-0.8, duration*DRAW_DURATION_RATIO))*FPS); rf = int(0.35*FPS)
+    df = min(tf - 1, int(duration * DRAW_DURATION_RATIO * FPS)); rf = min(int(0.35*FPS), max(0, tf-df-1))
     of = cv2.resize(cv2.imread(str(image_path)), (WIDTH, HEIGHT))
     use_full_frame = (language == "en" and style_mode == "comic")
     if use_full_frame:
@@ -1606,38 +1668,37 @@ def render_classic(image_path, duration, output_path, hand_path, motion="zoom_in
     hb, ha, tx, ty = load_hand(hand_path)
     cmd = ["ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo", "-s", f"{WIDTH}x{HEIGHT}",
            "-pix_fmt", "bgr24", "-r", str(FPS), "-i", "-", "-an", "-c:v", "libx264",
-           "-preset", "veryfast", "-pix_fmt", "yuv420p", str(output_path)]
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-    lt = tr[0] if tr else (WIDTH//2, ch_use//2)
-    for fi in range(tf):
-        hv = False
-        if fi < df:
-            if fi < pf[0]: cp=0; lp=fi/max(1,pf[0])
-            elif fi < pf[1]: cp=1; lp=(fi-pf[0])/max(1,pf[1]-pf[0])
-            else: cp=2; lp=(fi-pf[1])/max(1,pf[2]-pf[1])
-            for pi in range(cp):
-                for pt in ph[pi]: cv2.circle(rm, pt, REVEAL_RADIUS, 255, -1)
-            cps = ph[cp]
-            if cps:
-                cnt = max(1, min(int(lp*len(cps)), len(cps)))
-                for pt in cps[:cnt]: cv2.circle(rm, pt, REVEAL_RADIUS, 255, -1)
-                tg = cps[cnt-1]
-            else: tg = lt
-            hx = tg[0]+int(1.2*math.sin(fi*1.8)); hy = tg[1]+int(1.2*math.cos(fi*1.8))
-            lt = (hx, hy); hv = True
-        elif fi < df+rf:
-            rm[:, :] = 255; pr = (fi-df)/max(1,rf)
-            hx = int(lt[0]+(WIDTH+180-lt[0])*pr); hy = int(lt[1]+(ch_use+180-lt[1])*pr); hv = True
-        else: rm[:, :] = 255
-        a = (cv2.GaussianBlur(rm, (13, 13), 0).astype(np.float32)/255.0)[:, :, None]
-        fc = (cb*a + wc*(1.0-a)).astype(np.uint8)
-        if hv: paste_hand(fc, hb, ha, hx-tx, hy-ty)
-        if use_full_frame:
-            fo = fc
-        else:
-            fo = compose_frame(tb, fc)
-        proc.stdin.write(fo.tobytes())
-    proc.stdin.close(); proc.wait()
+           "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p", str(output_path)]
+    with RawVideoWriter(cmd) as proc:
+        lt = tr[0] if tr else (WIDTH//2, ch_use//2)
+        for fi in range(tf):
+            hv = False
+            if fi < df:
+                if fi < pf[0]: cp=0; lp=fi/max(1,pf[0])
+                elif fi < pf[1]: cp=1; lp=(fi-pf[0])/max(1,pf[1]-pf[0])
+                else: cp=2; lp=(fi-pf[1])/max(1,pf[2]-pf[1])
+                for pi in range(cp):
+                    for pt in ph[pi]: cv2.circle(rm, pt, REVEAL_RADIUS, 255, -1)
+                cps = ph[cp]
+                if cps:
+                    cnt = max(1, min(int(lp*len(cps)), len(cps)))
+                    for pt in cps[:cnt]: cv2.circle(rm, pt, REVEAL_RADIUS, 255, -1)
+                    tg = cps[cnt-1]
+                else: tg = lt
+                hx = tg[0]+int(1.2*math.sin(fi*1.8)); hy = tg[1]+int(1.2*math.cos(fi*1.8))
+                lt = (hx, hy); hv = True
+            elif fi < df+rf:
+                rm[:, :] = 255; pr = (fi-df)/max(1,rf)
+                hx = int(lt[0]+(WIDTH+180-lt[0])*pr); hy = int(lt[1]+(ch_use+180-lt[1])*pr); hv = True
+            else: rm[:, :] = 255
+            a = (cv2.GaussianBlur(rm, (13, 13), 0).astype(np.float32)/255.0)[:, :, None]
+            fc = (cb*a + wc*(1.0-a)).astype(np.uint8)
+            if hv: paste_hand(fc, hb, ha, hx-tx, hy-ty)
+            if use_full_frame:
+                fo = fc
+            else:
+                fo = compose_frame(tb, fc)
+            proc.stdin.write(fo.tobytes())
 
 def create_placeholder(out, title):
     img = Image.new("RGB", (WIDTH, HEIGHT), "white")
@@ -1653,120 +1714,83 @@ def parallel_gen(scenes, batch_dir, providers, image_timeout, progress_state,
                  flux_steps=4, fair_share=True, circuit=True, prio_fast=True,
                  enable_arrows=True, enable_shadow=True, style_mode="comic", language="vi"):
     if not providers: raise RuntimeError("Không có provider nào.")
-    total_s = len(scenes)
-    if fair_share:
-        cap = max(3, int((total_s/len(providers))*FAIR_SHARE_MULTIPLIER))
-        st.caption(f"⚖️ Fair share cap: **{cap}** cảnh/provider")
-    else: cap = 999999
-    if circuit: st.caption(f"🔌 Circuit breaker: {CIRCUIT_BREAKER_THRESHOLD} lần fail → loại")
-    if prio_fast: st.caption(f"⚡ Slow penalty: >{SLOW_PROVIDER_THRESHOLD:.0f}s → sleep {SLOW_PROVIDER_PENALTY}s")
-
-    q = Queue(); attempts = {}
-    for i, s in enumerate(scenes):
-        ir = batch_dir / f"scene_{i+1:03d}_raw.png"; im = batch_dir / f"scene_{i+1:03d}.jpg"
-        if not im.exists():
-            q.put((i, s, ir, im)); attempts[i] = 0
-            progress_state["scene_status"][i] = {"status": "pending", "provider": None, "started": None, "elapsed": 0.0, "attempts": 0}
+    lock = progress_state.setdefault("_lock", threading.Lock())
+    stats = progress_state["provider_stats"]
+    results = {}; attempts = {}; failures = {}; q = Queue()
+    cap = max(3, math.ceil(len(scenes)/len(providers)*FAIR_SHARE_MULTIPLIER)) if fair_share else len(scenes)
+    keys = {}
+    for i, scene in enumerate(scenes):
+        image = batch_dir / f"scene_{i+1:03d}.jpg"
+        keys[i] = fingerprint({"version": VERSION, "scene": scene, "arrows": enable_arrows,
+                               "shadow": enable_shadow, "style": style_mode, "language": language})
+        if artifact_ok(image, keys[i]):
+            results[i] = "cached"
+            progress_state["done"] += 1
+            progress_state["scene_status"][i] = {"status": "done", "provider": "cached", "attempts": 0}
         else:
-            progress_state["scene_status"][i] = {"status": "done", "provider": "(cached)", "started": None, "elapsed": 0.0, "attempts": 0}
-    total = q.qsize()
-    if total == 0: return {}, 0
-    results = {}; failed = {}; rlock = threading.Lock()
-    pstats = {p["name"]: {"ok": 0, "err": 0, "total_time": 0.0, "last_scene": None, "errors": [], "circuit_broken": False} for p in providers}
+            q.put(i); attempts[i] = 0
+            progress_state["scene_status"][i] = {"status": "pending", "provider": None, "attempts": 0}
 
-    def worker(pc):
-        n = pc["name"]; my = 0; cf = 0; lok = 0; ltime = 0.0
-        while my < cap:
-            if circuit and cf >= CIRCUIT_BREAKER_THRESHOLD:
-                with rlock: pstats[n]["circuit_broken"] = True
+    def worker(provider):
+        name = provider["name"]; consecutive = 0; completed = 0
+        while completed < cap:
+            if circuit and consecutive >= CIRCUIT_BREAKER_THRESHOLD:
+                with lock: stats[name]["circuit_broken"] = True
                 return
-            if prio_fast and lok >= 2 and (ltime/lok) > SLOW_PROVIDER_THRESHOLD:
-                time.sleep(SLOW_PROVIDER_PENALTY)
-            try: idx, s, ir, im = q.get_nowait()
+            try: i = q.get_nowait()
             except Empty: return
-            ca = attempts.get(idx, 0)
-            if ca >= MAX_ATTEMPTS_PER_SCENE:
-                create_placeholder(im, s["title"])
-                add_comic_overlays(im, s["title"], s.get("callout_type", "speech"), s.get("callout_text", ""),
-                                   s.get("callout_side", "right"), im, s.get("text_boxes", []),
-                                   enable_arrows, enable_shadow, style_mode, language)
-                with rlock:
-                    results[idx] = "placeholder"; progress_state["done"] += 1
-                    progress_state["scene_status"][idx] = {"status": "placeholder", "provider": "placeholder", "started": None, "elapsed": 0.0, "attempts": ca}
-                continue
-            t0 = time.time()
-            with rlock:
-                progress_state["scene_status"][idx] = {"status": "working", "provider": n, "started": t0, "elapsed": 0.0, "attempts": ca+1}
+            if attempts[i] >= MAX_ATTEMPTS_PER_SCENE:
+                failures[i] = "Đã hết số lần thử"; continue
+            scene = scenes[i]; started = time.monotonic()
+            with lock:
+                attempts[i] += 1
+                progress_state["scene_status"][i] = {"status": "working", "provider": name, "attempts": attempts[i]}
+            image = batch_dir / f"scene_{i+1:03d}.jpg"
+            raw = batch_dir / f"scene_{i+1:03d}_raw.png"
             try:
-                kw = pc.get("kwargs", {}).copy()
-                data = pc["fn"](s["visual_prompt"], *pc.get("args", []), timeout=image_timeout,
-                                title=s.get("title", ""), callout_text=s.get("callout_text", ""),
-                                language=language, **kw)
-                if not data or len(data) < 500: raise RuntimeError("empty")
-                save_image(data, ir)
-                add_comic_overlays(ir, s["title"], s.get("callout_type", "speech"), s.get("callout_text", ""),
-                                   s.get("callout_side", "right"), im, s.get("text_boxes", []),
-                                   enable_arrows, enable_shadow, style_mode, language)
-                el = time.time() - t0; my += 1; lok += 1; ltime += el; cf = 0
-                with rlock:
-                    results[idx] = n; pstats[n]["ok"] += 1; pstats[n]["total_time"] += el; pstats[n]["last_scene"] = idx+1
-                    progress_state["scene_status"][idx] = {"status": "done", "provider": n, "started": t0, "elapsed": el, "attempts": ca+1}
-                    progress_state["done"] += 1
-            except Exception as e:
-                el = time.time() - t0; err = str(e)[:150]; cf += 1
-                with rlock:
-                    attempts[idx] = ca+1; pstats[n]["err"] += 1; pstats[n]["errors"].append(err)
-                    progress_state["scene_status"][idx] = {"status": "pending" if attempts[idx] < MAX_ATTEMPTS_PER_SCENE else "failed",
-                        "provider": None if attempts[idx] < MAX_ATTEMPTS_PER_SCENE else n, "started": None, "elapsed": el, "attempts": attempts[idx], "error": err}
-                if attempts[idx] < MAX_ATTEMPTS_PER_SCENE:
-                    q.put((idx, s, ir, im)); time.sleep(FAIL_SLEEP_SECONDS)
-                else:
-                    create_placeholder(im, s["title"])
-                    add_comic_overlays(im, s["title"], s.get("callout_type", "speech"), s.get("callout_text", ""),
-                                       s.get("callout_side", "right"), im, s.get("text_boxes", []),
-                                       enable_arrows, enable_shadow, style_mode, language)
-                    with rlock:
-                        results[idx] = "placeholder"; progress_state["done"] += 1
-                        progress_state["scene_status"][idx] = {"status": "placeholder", "provider": "placeholder", "started": None, "elapsed": el, "attempts": attempts[idx]}
+                data = provider["fn"](scene["visual_prompt"], *provider.get("args", []),
+                      timeout=image_timeout, title=scene.get("title", ""),
+                      callout_text=scene.get("callout_text", ""), language=language,
+                      **provider.get("kwargs", {}))
+                save_image(data, raw)
+                add_comic_overlays(raw, scene["title"], scene.get("callout_type", "speech"),
+                      scene.get("callout_text", ""), scene.get("callout_side", "right"), image,
+                      scene.get("text_boxes", []), enable_arrows, enable_shadow, style_mode, language)
+                mark_artifact(image, keys[i])
+                elapsed = time.monotonic()-started
+                with lock:
+                    results[i] = name; progress_state["done"] += 1
+                    stats[name]["ok"] += 1; stats[name]["total_time"] += elapsed; stats[name]["last_scene"] = i+1
+                    progress_state["scene_status"][i] = {"status": "done", "provider": name, "attempts": attempts[i], "elapsed": elapsed}
+                completed += 1; consecutive = 0
+                if prio_fast and elapsed > SLOW_PROVIDER_THRESHOLD: time.sleep(SLOW_PROVIDER_PENALTY)
+            except Exception as exc:
+                consecutive += 1
+                with lock:
+                    stats[name]["err"] += 1; stats[name]["errors"].append(str(exc)[:150])
+                    progress_state["scene_status"][i] = {"status": "failed", "provider": name, "attempts": attempts[i]}
+                if attempts[i] < MAX_ATTEMPTS_PER_SCENE:
+                    q.put(i); time.sleep(FAIL_SLEEP_SECONDS)
+                else: failures[i] = str(exc)
 
-    with ThreadPoolExecutor(max_workers=len(providers)) as ex:
-        fs = [ex.submit(worker, p) for p in providers]
-        wait(fs, timeout=None)
-
-    rem = []
+    # Fair-share rounds never bypass the circuit breaker or the per-scene retry cap.
     while not q.empty():
-        try: rem.append(q.get_nowait())
-        except Empty: break
-    if rem:
-        st.warning(f"⚠️ {len(rem)} cảnh sót, fallback tuần tự...")
-        for idx, s, ir, im in rem:
-            ok = False
-            for pc in providers:
-                try:
-                    kw = pc.get("kwargs", {}).copy()
-                    data = pc["fn"](s["visual_prompt"], *pc.get("args", []), timeout=min(image_timeout, 45),
-                                    title=s.get("title", ""), callout_text=s.get("callout_text", ""),
-                                    language=language, **kw)
-                    if data and len(data) > 500:
-                        save_image(data, ir)
-                        add_comic_overlays(ir, s["title"], s.get("callout_type", "speech"), s.get("callout_text", ""),
-                                           s.get("callout_side", "right"), im, s.get("text_boxes", []),
-                                           enable_arrows, enable_shadow, style_mode, language)
-                        with rlock:
-                            results[idx] = pc["name"]; pstats[pc["name"]]["ok"] += 1; progress_state["done"] += 1
-                            progress_state["scene_status"][idx] = {"status": "done", "provider": pc["name"]+" (fb)", "started": None, "elapsed": 0.0, "attempts": attempts.get(idx, 0)}
-                        ok = True; break
-                except Exception: continue
-            if not ok:
-                create_placeholder(im, s["title"])
-                add_comic_overlays(im, s["title"], s.get("callout_type", "speech"), s.get("callout_text", ""),
-                                   s.get("callout_side", "right"), im, s.get("text_boxes", []),
-                                   enable_arrows, enable_shadow, style_mode, language)
-                with rlock:
-                    results[idx] = "placeholder"; progress_state["done"] += 1
-                    progress_state["scene_status"][idx] = {"status": "placeholder", "provider": "placeholder", "started": None, "elapsed": 0.0, "attempts": attempts.get(idx, 0)}
-    progress_state["provider_stats"] = pstats
-    return results, len(failed)
+        active = [p for p in providers if not stats[p["name"]]["circuit_broken"]]
+        if not active: break
+        with ThreadPoolExecutor(max_workers=len(active)) as executor:
+            futures = [executor.submit(worker, p) for p in active]
+            for future in futures: future.result()
+    for i, scene in enumerate(scenes):
+        if i in results: continue
+        image = batch_dir / f"scene_{i+1:03d}.jpg"
+        create_placeholder(image, scene["title"])
+        # No success marker: failed images will be retried when resuming.
+        Path(str(image)+".json").unlink(missing_ok=True)
+        results[i] = "placeholder"; failures.setdefault(i, "Provider không khả dụng")
+        with lock:
+            progress_state["done"] += 1
+            progress_state["scene_status"][i] = {"status": "placeholder", "provider": "placeholder", "attempts": attempts.get(i, 0)}
+    return results, len(failures)
 
 # ============================================================
 # RENDER BATCH
@@ -1776,13 +1800,14 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
                  image_timeout, flux_steps=4, fair_share=True, circuit=True, prio_fast=True,
                  chars=None, char_lock=None, enable_arrows=True, enable_shadow=True,
                  enable_sfx=True, sfx_vol=-12, enable_music=True, music_vol=-22,
-                 seed_lock=None, style_mode="comic", language="vi"):
+                 seed_lock=None, style_mode="comic", language="vi", allow_placeholder=False, consistent_provider=True):
     total = len(scenes)
     if total == 0: raise RuntimeError("Không có cảnh nào.")
     chars = chars or {}; char_lock = char_lock or {}
     providers = build_provider_list(cf_acc, cf_tok, hf_tok, fta_key, tg_key, nx_key, ag_key,
                                     pol_key, pol_mod, flux_steps, chars, char_lock, seed_lock, style_mode)
     if not providers: raise RuntimeError("Chưa cấu hình provider.")
+    if consistent_provider: providers = providers[:1]
 
     native_text = (language == "en" and style_mode == "comic")
     mode_label = '👻 Horror' if style_mode=='horror' else ('🇬🇧 English full-frame' if native_text else '📚 Comic VI (title band)')
@@ -1799,7 +1824,7 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
 
     st.markdown("### 🎨 Tạo ảnh song song")
     ps = {"done": 0, "scene_status": {}, "provider_stats": {p["name"]: {"ok":0,"err":0,"total_time":0.0,"last_scene":None,"errors":[],"circuit_broken":False} for p in providers}}
-    plock = threading.Lock()
+    plock = threading.Lock(); ps["_lock"] = plock
     bar = st.progress(0); txt = st.empty(); stats_t = st.empty(); scene_t = st.empty()
 
     def spd(avg):
@@ -1810,7 +1835,7 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
 
     def dash():
         with plock:
-            done = ps["done"]; ss = dict(ps["scene_status"]); pst = dict(ps["provider_stats"])
+            done = ps["done"]; ss = dict(ps["scene_status"]); pst = json.loads(json.dumps(ps["provider_stats"]))
         pct = min(1.0, done/total)*0.6
         bar.progress(pct); txt.markdown(f"**🎨 Ảnh: {done}/{total}** ({pct/0.6*100:.0f}%)")
         sd = []
@@ -1840,25 +1865,42 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
             rc["r"] = r
         except Exception as e: rc["e"] = e
     t = threading.Thread(target=run_p, daemon=True); t.start()
-    while t.is_alive():
-        dash(); time.sleep(0.8)
-    t.join(); dash()
+    try:
+        while t.is_alive():
+            dash(); time.sleep(0.8)
+    finally:
+        t.join()  # Keep the job lock until image workers have finished on rerun.
+    dash()
     if rc["e"]: raise rc["e"]
     used = rc["r"] or {}
-    st.success(f"✅ Đã tạo {len(used)}/{total} ảnh — {dict(Counter(used.values()))}")
+    missing = [i+1 for i, provider in used.items() if provider == "placeholder"]
+    if missing and not allow_placeholder:
+        raise RuntimeError(f"Chưa có ảnh thật cho cảnh {missing}. Tiến độ đã lưu; bấm BẮT ĐẦU để thử lại các cảnh lỗi.")
+    st.success(f"✅ Ảnh: {len(used)}/{total} — {dict(Counter(used.values()))}")
+    batch_key = fingerprint({"version": VERSION, "scenes": scenes, "images": [file_digest(batch_dir / f"scene_{i+1:03d}.jpg") for i in range(total)],
+                            "style": style, "language": language, "audio": file_digest(batch_audio),
+                            "hand": file_digest(hand_path) if hand_path.exists() else "fallback", "sfx": [enable_sfx, sfx_vol], "music": [enable_music, music_vol]})
+    if artifact_ok(batch_dir / "batch_final.mp4", batch_key):
+        st.info("💾 Đợt này đã hoàn thành, dùng lại video đã lưu.")
+        return batch_dir / "batch_final.mp4"
 
     st.markdown("### 🎬 Render video")
     rb = st.progress(0); rt = st.empty()
-    vids = []
+    vids = []; durations = frame_durations(scenes, FPS)
     for i, s in enumerate(scenes, 1):
         im = batch_dir / f"scene_{i:03d}.jpg"; vd = batch_dir / f"scene_{i:03d}.mp4"
         if not im.exists(): raise RuntimeError(f"Thiếu ảnh scene {i}")
-        dur = max(1.0, float(s["end"]) - float(s["start"]))
+        dur = durations[i-1]
         mo = s.get("camera_motion", "zoom_in_center")
-        if "1." in style or "Vẽ 3 phase" in style: render_kttv(im, dur, vd, hand_path, mo, style_mode, language)
-        elif "2." in style or "Hybrid" in style: render_hybrid(im, dur, vd, hand_path, mo, style_mode, language)
-        elif "3." in style or "Chỉ Camera" in style: render_pure(im, dur, vd, mo, style_mode, language)
-        else: render_classic(im, dur, vd, hand_path, mo, style_mode, language)
+        video_key = fingerprint({"version": VERSION, "image": file_digest(im), "duration": dur,
+                                 "style": style, "motion": mo, "mode": style_mode, "language": language,
+                                 "hand": file_digest(hand_path) if hand_path.exists() else "fallback"})
+        if not artifact_ok(vd, video_key):
+            if "1." in style or "Vẽ 3 phase" in style: render_kttv(im, dur, vd, hand_path, mo, style_mode, language)
+            elif "2." in style or "Hybrid" in style: render_hybrid(im, dur, vd, hand_path, mo, style_mode, language)
+            elif "3." in style or "Chỉ Camera" in style: render_pure(im, dur, vd, mo, style_mode, language)
+            else: render_classic(im, dur, vd, hand_path, mo, style_mode, language)
+            mark_artifact(vd, video_key)
         vids.append(vd)
         rb.progress(i/total); rt.markdown(f"**🎬 Render: {i}/{total}** — {s['title']}")
 
@@ -1876,17 +1918,12 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
         st.markdown("### 🎵 Nhạc nền")
         mus_t = build_music_track(scenes, batch_dir / "music.wav", SFX_SAMPLE_RATE, music_vol)
 
-    if sfx_t or mus_t:
-        mixed = batch_dir / "audio_mixed.m4a"
-        mix_audio_tracks(str(batch_audio), str(sfx_t) if sfx_t else None, str(mus_t) if mus_t else None, str(mixed))
-        run_cmd(["ffmpeg", "-y", "-i", str(bv), "-i", str(mixed), "-map", "0:v:0", "-map", "1:a:0",
-                 "-c:v", "copy", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(fb)], timeout=900)
-    else:
-        run_cmd(["ffmpeg", "-y", "-i", str(bv), "-i", str(batch_audio), "-map", "0:v:0", "-map", "1:a:0",
-                 "-c:v", "copy", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(fb)], timeout=900)
+    mixed = batch_dir / "audio_mixed.m4a"
+    mix_audio_tracks(str(batch_audio), str(sfx_t) if sfx_t else None, str(mus_t) if mus_t else None, str(mixed))
+    run_cmd(["ffmpeg", "-y", "-v", "error", "-i", str(bv), "-i", str(mixed), "-map", "0:v:0", "-map", "1:a:0",
+             "-c:v", "copy", "-c:a", "copy", "-t", str(scenes[-1]["end"]), "-movflags", "+faststart", str(fb)], timeout=900)
 
-    for f in batch_dir.glob("scene_*_raw.png"): f.unlink(missing_ok=True)
-    for f in batch_dir.glob("scene_*.mp4"): f.unlink(missing_ok=True)
+    mark_artifact(fb, batch_key)
     cf_f.unlink(missing_ok=True); bv.unlink(missing_ok=True)
     return fb
 
@@ -1896,148 +1933,233 @@ def concat_batches(vids, out):
     run_cmd(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(cf), "-c", "copy", "-movflags", "+faststart", str(out)], timeout=1800)
 
 # ============================================================
-# MAIN
+# PROJECT WORKFLOW — session-isolated checkpoints, no stored API keys
 # ============================================================
-st.sidebar.divider()
+def validate_storyboard(batches):
+    seen = set()
+    for batch in batches:
+        for scene in batch["scenes"]:
+            prompt = str(scene.get("visual_prompt", "")).strip()
+            if len(prompt) < 10: raise ValueError("Mô tả ảnh phải có ít nhất 10 ký tự.")
+            if not str(scene.get("title", "")).strip(): raise ValueError("Tiêu đề cảnh không được để trống.")
+            signature = " ".join(prompt.casefold().split())
+            if signature in seen: raise ValueError("Có mô tả ảnh trùng trong dự án. Hãy đổi bố cục/hành động.")
+            seen.add(signature)
 
+
+def loudness_filter(path):
+    # Measure first: silent/very short audio can yield infinite loudnorm gains.
+    cmd = ["ffmpeg", "-v", "info", "-i", str(path), "-vn", "-af",
+           "loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json", "-f", "null", "-"]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=600)
+    if result.returncode: raise RuntimeError(result.stderr[-2000:])
+    matches = re.findall(r'\{[^{}]*"input_i"[^{}]*\}', result.stderr)
+    if not matches: raise RuntimeError("Không đo được âm lượng audio.")
+    stats = json.loads(matches[-1])
+    keys = ["input_i", "input_tp", "input_lra", "input_thresh", "target_offset"]
+    if not all(math.isfinite(float(stats[key])) for key in keys):
+        return "anull"
+    return (f"loudnorm=I=-16:TP=-1.5:LRA=11:measured_I={stats['input_i']}:"
+            f"measured_TP={stats['input_tp']}:measured_LRA={stats['input_lra']}:"
+            f"measured_thresh={stats['input_thresh']}:offset={stats['target_offset']}:linear=true")
+
+
+def finish_export(batches, root, duration, captions):
+    joined = root / "joined.mp4"
+    concat_batches(batches, joined)
+    final = root / "video_final.mp4"; part = root / "export.part.mp4"
+    filters = []
+    if "1080p" in export_size: filters.append("scale=1920:1080:flags=lanczos")
+    # Repeat only the last frame to cover sub-frame/AAC rounding, never an entire scene.
+    filters.append("tpad=stop_mode=clone:stop_duration=1")
+    if burn_subtitles and captions.strip():
+        subtitles = (root / "subtitles.srt").as_posix()
+        filters.append(f"subtitles=filename='{subtitles}':force_style='FontName=DejaVu Sans,FontSize=20,Outline=2,MarginV=24'")
+    cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(joined), "-vf", ",".join(filters),
+           "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p",
+           "-af", (loudness_filter(joined)+"," if normalize_voice else "")+"apad",
+           "-ar", "48000", "-ac", "2", "-c:a", "aac", "-b:a", "192k",
+           "-t", str(duration), "-movflags", "+faststart", str(part)]
+    run_cmd(cmd, timeout=max(1800, int(duration*20)))
+    os.replace(part, final)
+    return final
+
+
+st.sidebar.divider()
 if st.sidebar.button("🔎 KIỂM TRA PROVIDER", use_container_width=True):
-    char_lock = build_character_lock(char_main_name, char_main_desc, char_second_name, char_second_desc, enable_char_lock)
-    if enable_global_char and global_char_desc.strip():
-        char_lock["__global__"] = global_char_desc.strip()
-    providers = build_provider_list(cf_account, cf_token, hf_token, freetheai_key, together_key, nexa_key, agnes_key,
-                                    pollinations_key, pollinations_model, flux_steps, {}, char_lock, None, style_mode)
-    if not providers: st.error("Chưa có provider.")
-    else:
-        st.write(f"**{len(providers)} provider ({style_mode} mode):**")
-        for i, p in enumerate(providers, 1): st.write(f"{i}. {p['name']}")
-        if st.button("▶️ Test 1 ảnh"):
-            if style_mode == "horror":
-                tp = "2D dark horror illustration: a lone figure in a foggy hallway, moonlight, no text"
-            elif effective_lang == "en":
-                tp = "Colored cartoon illustration with warm earth tones, a caveman in a cave with campfire, brown and orange palette"
-            else:
-                tp = "2D comic doodle: a person at desk with laptop, white background, no text"
-            for pc in providers:
-                try:
-                    with st.spinner(f"Test {pc['name']}..."):
-                        t0 = time.time()
-                        d = pc["fn"](tp, *pc.get("args", []), timeout=45,
-                                    title="TEST TITLE", callout_text="HELLO WORLD",
-                                    language=effective_lang, **pc.get("kwargs", {}))
-                        el = time.time() - t0
-                    if d and len(d) > 500:
-                        img = Image.open(io.BytesIO(d)).convert("RGB").resize((WIDTH, HEIGHT))
-                        st.success(f"✅ {pc['name']} — {el:.1f}s")
-                        st.image(img, use_container_width=True); break
-                except Exception as e:
-                    st.warning(f"❌ {pc['name']}: {str(e)[:150]}")
+    st.session_state["show_provider_test"] = not st.session_state.get("show_provider_test", False)
+if st.session_state.get("show_provider_test"):
+    test_lock = build_character_lock(char_main_name, char_main_desc, char_second_name, char_second_desc, enable_char_lock)
+    if enable_global_char and global_char_desc.strip(): test_lock["__global__"] = global_char_desc.strip()
+    test_providers = build_provider_list(cf_account, cf_token, hf_token, freetheai_key, together_key, nexa_key,
+        agnes_key, pollinations_key, pollinations_model, flux_steps, {}, test_lock, None, style_mode)
+    st.write("Provider đã cấu hình: " + (", ".join(p["name"] for p in test_providers) or "Chưa có"))
+    if st.button("▶️ Test 1 ảnh", disabled=not test_providers):
+        for provider in test_providers:
+            try:
+                with st.spinner(f"Test {provider['name']}..."):
+                    data = provider["fn"]("A cinematic illustration of a character beside a desk, coherent colors",
+                        *provider.get("args", []), timeout=image_timeout, language=effective_lang,
+                        title="TEST", callout_text="", **provider.get("kwargs", {}))
+                    st.image(Image.open(io.BytesIO(data)), use_container_width=True)
+                    st.success(f"Provider hoạt động: {provider['name']}"); break
+            except Exception as exc: st.warning(f"{provider['name']}: {str(exc)[:150]}")
 
 audio = st.file_uploader("🎤 Tải lên voice", type=["mp3", "m4a", "wav", "ogg", "webm", "mp4"])
-
 if audio:
     st.audio(audio)
-    if st.button("🚀 BẮT ĐẦU", type="primary", use_container_width=True):
+    internal_mode = {"Chỉ dùng voice": "voice_only", "Kết hợp voice + text": "combined", "Chỉ dùng text": "text_only"}[use_script_mode]
+    char_lock = build_character_lock(char_main_name, char_main_desc, char_second_name, char_second_desc, enable_char_lock)
+    if enable_global_char and global_char_desc.strip(): char_lock["__global__"] = global_char_desc.strip()
+    lang_code = {"Tiếng Việt": "vi", "English": "en"}.get(language_mode)
+    cm_mode = ("random" if "Random" in camera_motion_mode else
+               f"fixed:{camera_motion_mode.replace('Cố định: ', '').strip()}" if "Cố định" in camera_motion_mode else "auto")
+    # Credentials never enter the persisted project data or fingerprint.
+    config = {"version": VERSION, "audio": hashlib.sha256(audio.getbuffer()).hexdigest(),
+        "suffix": Path(audio.name).suffix.lower(), "mode": internal_mode,
+        "script": script_text if internal_mode != "voice_only" else "",
+        "language": language_mode, "style_mode": style_mode, "char_lock": char_lock,
+        "seed_lock": enable_seed_lock, "stt_model": stt_model, "planner_model": planner_model, "output_budget": int(planner_output_budget),
+        "scene_min": scene_min, "scene_max": scene_max, "max_scenes": max_scenes,
+        "camera": cm_mode, "rich": enable_rich_overlay, "arrows": enable_arrows, "shadow": enable_shadow,
+        "sfx": [enable_sfx, sfx_volume], "music": [enable_music, music_volume], "render": draw_style,
+        "provider_flags": [bool(cf_account and cf_token), bool(agnes_key), bool(together_key), bool(freetheai_key),
+                           bool(hf_token), bool(nexa_key), bool(pollinations_key)],
+        "image_model": pollinations_model, "steps": flux_steps, "consistent": consistent_provider}
+    if "studio_session" not in st.session_state: st.session_state["studio_session"] = uuid.uuid4().hex
+    project_id = fingerprint(config)
+    root = Path(tempfile.gettempdir()) / "voice_video_v11" / st.session_state["studio_session"] / project_id
+    root.mkdir(parents=True, exist_ok=True)
+    plan_path = root / "storyboard.json"
+    project = read_json(plan_path)
+    actions = st.columns(2)
+    plan_only = actions[0].button("📝 1. Xem kịch bản trước", use_container_width=True)
+    start = actions[1].button("🚀 BẮT ĐẦU / TIẾP TỤC", type="primary", use_container_width=True)
+    st.caption("Giữ nguyên voice và thiết lập để tiếp tục các cảnh chưa xong. Không cần tạo lại cảnh đã lưu trong phiên này.")
+
+    if plan_only or start:
         if not groq_key: st.error("Cần Groq API Key."); st.stop()
-
-        lang_code = None
-        if language_mode == "Tiếng Việt": lang_code = "vi"; effective_lang = "vi"
-        elif language_mode == "English": lang_code = "en"; effective_lang = "en"
-        else: lang_code = None
-        st.info(f"🌐 Ngôn ngữ: **{language_mode}** | 🎨 Style: **{style_mode.upper()}** | ⏱️ Nhịp: **{scene_min}-{scene_max}s**")
-
-        if use_script_mode == "Kết hợp voice + text": internal_mode = "combined"
-        elif use_script_mode == "Chỉ dùng text": internal_mode = "text_only"
-        else: internal_mode = "voice_only"
-
-        char_lock = build_character_lock(char_main_name, char_main_desc, char_second_name, char_second_desc, enable_char_lock)
-        if enable_global_char and global_char_desc.strip():
-            char_lock["__global__"] = global_char_desc.strip()
-            st.success(f"🌍 Global Lock: {global_char_desc[:60]}...")
-        others = [k for k in char_lock.keys() if k != '__global__']
-        if others: st.success(f"🔒 Per-name lock: {others}")
-        seed_lock = random.randint(1, 2**31 - 1) if enable_seed_lock else None
-        if seed_lock: st.info(f"🎲 Seed: {seed_lock}")
-
-        cache_dir = Path.home() / ".wb_cache"; cache_dir.mkdir(exist_ok=True)
-
-        root = Path(tempfile.mkdtemp(prefix=f"wb_v102_{style_mode}_"))
+        if internal_mode in ("combined", "text_only") and not script_text.strip():
+            st.error("Hãy nhập kịch bản cho chế độ đã chọn."); st.stop()
         try:
-            src = root / audio.name; src.write_bytes(audio.getbuffer())
-            dur = ffprobe_duration(src)
-            effective_batch = 2 * 60 if style_mode == "horror" else BATCH_SECONDS
-            st.info(f"Thời lượng: {dur/60:.2f} phút. Batch {effective_batch//60} phút.")
+            with job_lock(root):
+                source = root / ("source" + Path(audio.name).suffix.lower())
+                if not source.exists(): source.write_bytes(audio.getbuffer())
+                duration = ffprobe_duration(source)
+                if duration <= 0: raise ValueError("Audio không có thời lượng hợp lệ.")
+                if project is None:
+                    project = {"config": config, "duration": duration, "seed": random.randint(1, 2**31-1) if enable_seed_lock else None,
+                               "batches": [], "complete": False}
+                effective_batch = min(120 if style_mode == "horror" else BATCH_SECONDS,
+                    max(5, int(min(max_scenes, planner_capacity(planner_output_budget)) * (scene_min+scene_max)/2)))
+                chunks_dir = root / "batches"; chunks_dir.mkdir(exist_ok=True)
+                chunk_key = fingerprint([config["audio"], effective_batch, VERSION])
+                chunk_manifest = read_json(chunks_dir / "complete.json", {})
+                chunks = sorted(chunks_dir.glob("batch_*.wav"))
+                if chunk_manifest.get("key") != chunk_key or not chunks or len(chunks) != chunk_manifest.get("count"):
+                    for old in chunks: old.unlink()
+                    chunks = chunk_audio(source, chunks_dir, effective_batch)
+                    write_json(chunks_dir / "complete.json", {"key": chunk_key, "count": len(chunks)})
+                client = groq_client(groq_key); offset = 0.0
+                st.info(f"Voice: {duration/60:.2f} phút • {len(chunks)} đợt • Dự án {project_id[:8]}")
+                for index, chunk in enumerate(chunks):
+                    batch_duration = ffprobe_duration(chunk)
+                    if index < len(project["batches"]):
+                        offset += batch_duration; continue
+                    st.markdown(f"### 📝 Lập kịch bản đợt {index+1}/{len(chunks)}")
+                    batch_script = script_slice(script_text, offset, offset+batch_duration, duration) if internal_mode != "voice_only" else ""
+                    if internal_mode == "text_only":
+                        language = lang_code or ("vi" if re.search(r"[À-ỹ]", script_text) else "en")
+                        segments = [{"start": 0.0, "end": batch_duration, "text": batch_script}]
+                    else:
+                        transcript = transcribe_file(client, chunk, stt_model, lang_code, root / "transcripts")
+                        language = lang_code or ("en" if str(detect_language(transcript)).lower().startswith("en") else "vi")
+                        segments = normalize_segments(transcript, 0.0)
+                    transcript_text = "\n".join(f"[{x['start']:.2f}-{x['end']:.2f}] {x['text']}" for x in segments)
+                    previous = [scene for batch in project["batches"] for scene in batch["scenes"]]
+                    previous_context = [{"title": x["title"], "visual_prompt": x["visual_prompt"]} for x in previous[-6:]]
+                    feedback = ""
+                    for attempt in range(3):
+                        try:
+                            scenes = make_scene_plan(client, transcript_text, offset, batch_duration, planner_model,
+                                scene_min, scene_max, max_scenes, cm_mode, language=language, enable_rich=enable_rich_overlay,
+                                char_lock=char_lock, enable_sfx=enable_sfx, enable_music=enable_music, user_script=batch_script,
+                                use_script_mode=internal_mode, style_mode=style_mode, previous_scenes=previous_context, feedback=feedback, output_budget=planner_output_budget)
+                            batch = {"offset": offset, "duration": batch_duration, "language": language,
+                                     "segments": segments, "scenes": scenes, "chunk": chunk.name}
+                            validate_storyboard(project["batches"] + [batch]); break
+                        except PlannerRateLimit:
+                            raise
+                        except (ValueError, RuntimeError) as exc:
+                            if attempt == 2: raise
+                            feedback = str(exc)[:400]
+                            st.warning(f"Đang sửa kịch bản (lần {attempt+2}/3): {feedback}")
+                    project["batches"].append(batch); write_json(plan_path, project)
+                    offset += batch_duration
+                project["complete"] = True; write_json(plan_path, project)
+                captions = srt_text([dict(segment, start=batch["offset"]+max(0, segment["start"]),
+                                     end=batch["offset"]+min(batch["duration"], segment["end"]))
+                                    for batch in project["batches"] for segment in batch["segments"]])
+                (root / "subtitles.srt").write_text(captions, encoding="utf-8")
+                if internal_mode == "text_only": st.info("Phụ đề chế độ chỉ text là thời gian ước lượng theo độ dài văn bản.")
+                if start:
+                    validate_storyboard(project["batches"])
+                    output_key = fingerprint([project, export_size, normalize_voice, burn_subtitles, allow_placeholder])
+                    final = root / "video_final.mp4"
+                    if not artifact_ok(final, output_key):
+                        batch_videos = []
+                        for index, batch in enumerate(project["batches"]):
+                            st.markdown(f"### 🎬 Tạo video đợt {index+1}/{len(project['batches'])}")
+                            work = root / f"work_{index+1:03d}"; work.mkdir(exist_ok=True)
+                            batch_video = render_batch(chunks_dir / batch["chunk"], batch["scenes"], work,
+                                Path(__file__).with_name("hand.png"), draw_style, cf_account, cf_token, hf_token,
+                                freetheai_key, together_key, nexa_key, agnes_key, pollinations_key, pollinations_model,
+                                image_timeout, flux_steps, fair_share_enabled, circuit_breaker_enabled, prioritize_fast,
+                                char_lock=char_lock, enable_arrows=enable_arrows, enable_shadow=enable_shadow,
+                                enable_sfx=enable_sfx, sfx_vol=sfx_volume, enable_music=enable_music, music_vol=music_volume,
+                                seed_lock=project["seed"], style_mode=style_mode, language=batch["language"],
+                                allow_placeholder=allow_placeholder, consistent_provider=consistent_provider)
+                            batch_videos.append(batch_video)
+                        with st.spinner("Đang hoàn thiện âm thanh và xuất video..."):
+                            final = finish_export(batch_videos, root, duration, captions)
+                        mark_artifact(final, output_key)
+                    st.success("Video đã hoàn thành. Có thể tải bên dưới.")
+                else: st.success("Kịch bản đã sẵn sàng. Xem và sửa bên dưới trước khi tạo ảnh.")
+        except Exception as exc:
+            st.error(f"Chưa hoàn tất: {exc}")
+            st.info("Các bước hoàn thành đã lưu. Khắc phục lỗi rồi bấm BẮT ĐẦU / TIẾP TỤC trong phiên này.")
 
-            client = groq_client(groq_key)
-            bd = root / "batches"; bd.mkdir()
-            chunks = chunk_audio(src, bd, effective_batch)
-            hp = Path("hand.png")
-            bvids = []; all_s = 0; stt = st.empty()
-
-            vc = [(bi, ch, ffprobe_duration(ch)) for bi, ch in enumerate(chunks) if ffprobe_duration(ch) >= 5.0 or bi == 0]
-            if not vc: st.error("Không có audio hợp lệ."); st.stop()
-
-            cm_mode = ("random" if "Random" in camera_motion_mode else
-                      f"fixed:{camera_motion_mode.replace('Cố định: ', '').strip()}"
-                      if "Cố định" in camera_motion_mode else "auto")
-
-            for idx, (bi, chunk, bdur) in enumerate(vc):
-                bstart = bi * effective_batch
-                stt.markdown(f"### 🧠 Đợt {idx+1}/{len(vc)} — STT...")
-                tr = transcribe_file(client, chunk, stt_model, lang_code, cache_dir)
-                if lang_code is None:
-                    detected = detect_language(tr)
-                    st.info(f"🌐 Whisper: **{detected}**")
-                    effective_lang = "en" if detected.startswith("en") else "vi"
-                segs = normalize_segments(tr, bstart)
-                btext = "\n".join(f"[{x['start']:.2f}-{x['end']:.2f}] {x['text']}" for x in segs)
-
-                tc = len(vc); bscript = ""
-                if script_text and internal_mode in ("combined", "text_only"):
-                    lines = [l.strip() for l in script_text.split("\n") if l.strip()]
-                    lp = max(1, len(lines)//tc + 1)
-                    s_l = idx*lp; e_l = min(s_l+lp, len(lines))
-                    bscript = "\n".join(lines[s_l:e_l])
-
-                stt.markdown(f"### ✂️ Đợt {idx+1}/{len(vc)} — Lên kịch bản ({effective_lang})...")
-                scenes = make_scene_plan(client, btext, bstart, bdur, planner_model,
-                                         scene_min, scene_max, max_scenes, cm_mode,
-                                         language=effective_lang,
-                                         enable_rich=enable_rich_overlay,
-                                         char_lock=char_lock,
-                                         enable_sfx=enable_sfx,
-                                         enable_music=enable_music,
-                                         user_script=bscript,
-                                         use_script_mode=internal_mode,
-                                         style_mode=style_mode)
-                st.markdown(f"#### 📝 Đợt {idx+1}: {bdur:.1f}s → **{len(scenes)} cảnh**")
-                with st.expander("Chi tiết", expanded=False):
-                    for si, s in enumerate(scenes, 1):
-                        ci = f" | [{s.get('callout_type','').upper()}]: \"{s.get('callout_text','')}\"" if s.get('callout_text') else ""
-                        dur_s = s['end'] - s['start']
-                        st.caption(f"{si:02d}. {s['start']:.1f}s–{s['end']:.1f}s ({dur_s:.1f}s) — {s['title']}{ci} | 🎥 {s.get('camera_motion','?')} | 🔊 {s.get('sfx','none')} | 🎵 {s.get('music_emotion','none')}")
-
-                bw = root / f"work_{idx+1:03d}"; bw.mkdir()
-                stt.markdown(f"### 🎨 Đợt {idx+1}/{len(vc)} — Tạo ảnh + render...")
-                bvi = render_batch(chunk, scenes, bw, hp, draw_style,
-                                   cf_account, cf_token, hf_token, freetheai_key, together_key,
-                                   nexa_key, agnes_key, pollinations_key, pollinations_model,
-                                   image_timeout, flux_steps, fair_share_enabled, circuit_breaker_enabled,
-                                   prioritize_fast, chars={}, char_lock=char_lock,
-                                   enable_arrows=enable_arrows, enable_shadow=enable_shadow,
-                                   enable_sfx=enable_sfx, sfx_vol=sfx_volume,
-                                   enable_music=enable_music, music_vol=music_volume,
-                                   seed_lock=seed_lock, style_mode=style_mode, language=effective_lang)
-                sv = root / f"batch_final_{idx+1:03d}.mp4"
-                shutil.copy2(bvi, sv); bvids.append(sv)
-                all_s += len(scenes)
-                shutil.rmtree(bw, ignore_errors=True)
-
-            stt.markdown("### 🎬 Ghép video cuối...")
-            fv = root / "video_final.mp4"
-            concat_batches(bvids, fv)
-            st.success(f"Hoàn thành! {all_s} cảnh ({style_mode} / {effective_lang} mode).")
-            st.video(str(fv))
-            st.download_button("⬇️ TẢI VIDEO", data=fv.read_bytes(),
-                file_name="video_final.mp4", mime="video/mp4", use_container_width=True)
-        except Exception as e:
-            st.exception(e)
+    project = read_json(plan_path)
+    if project and project.get("batches"):
+        rows = [{"batch": bi+1, "scene": si+1, "start": round(batch["offset"]+scene["start"], 2),
+                 "end": round(batch["offset"]+scene["end"], 2), "title": scene["title"],
+                 "visual_prompt": scene["visual_prompt"], "callout_text": scene.get("callout_text", "")}
+                for bi, batch in enumerate(project["batches"]) for si, scene in enumerate(batch["scenes"])]
+        with st.expander(f"📝 Kịch bản • {len(rows)} cảnh — sửa tiêu đề, lời trên ảnh và mô tả", expanded=plan_only):
+            st.caption("Mốc thời gian được khóa để giữ khớp voice. Mô tả ảnh nên viết bằng tiếng Anh.")
+            with st.form(f"editor_{project_id}"):
+                edited = st.data_editor(rows, disabled=["batch", "scene", "start", "end"],
+                    use_container_width=True, hide_index=True, num_rows="fixed")
+                save_edits = st.form_submit_button("💾 Lưu chỉnh sửa kịch bản")
+            if save_edits:
+                try:
+                    with job_lock(root):
+                        changed = json.loads(json.dumps(project))
+                        for row in edited:
+                            scene = changed["batches"][int(row["batch"])-1]["scenes"][int(row["scene"])-1]
+                            for field in ("title", "visual_prompt", "callout_text"): scene[field] = str(row[field] or "").strip()
+                        validate_storyboard(changed["batches"])
+                        write_json(plan_path, changed); project = changed
+                    st.success("Đã lưu. Bấm BẮT ĐẦU để cập nhật các cảnh đã sửa.")
+                except Exception as exc: st.error(str(exc))
+            st.download_button("⬇️ Kịch bản JSON", json.dumps(project, ensure_ascii=False, indent=2),
+                file_name="storyboard.json", mime="application/json", on_click="ignore")
+        subtitles = root / "subtitles.srt"
+        if subtitles.exists():
+            st.download_button("⬇️ Phụ đề SRT", subtitles.read_bytes(), file_name="subtitles.srt", on_click="ignore")
+        final = root / "video_final.mp4"
+        output_key = fingerprint([project, export_size, normalize_voice, burn_subtitles, allow_placeholder])
+        if artifact_ok(final, output_key):
+            st.video(str(final))
+            st.download_button("⬇️ TẢI VIDEO", final.read_bytes(), file_name="video_final.mp4",
+                               mime="video/mp4", use_container_width=True, on_click="ignore")
