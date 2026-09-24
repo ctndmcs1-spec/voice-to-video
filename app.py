@@ -1,7 +1,7 @@
 """
-Xưởng Video Diễn Hoạt Kiến Thức AI — Bản Siêu Cấp V11.0
+Xưởng Video Diễn Hoạt Kiến Thức AI — Bản Siêu Cấp V11.2
 =======================================================
-V11.0 FIX:
+V11.2 FIX:
 - Cache đúng voice, checkpoint ảnh/cảnh/batch, xem trước kịch bản
 - Sửa timeline, không nhân đôi prompt, giữ phần audio đuôi
 - FFmpeg writer an toàn, trộn âm thanh ưu tiên voice, xuất SRT
@@ -25,14 +25,14 @@ from PIL import Image, ImageDraw, ImageFont
 from groq import Groq
 from studio_core import (VERSION, fingerprint, file_digest, read_json, write_json,
                          artifact_ok, mark_artifact, job_lock, RawVideoWriter,
-                         frame_durations, script_slice, srt_text, planner_capacity, chat_completion, PlannerRateLimit)
+                         frame_durations, script_slice, srt_text, planner_capacity, chat_completion, PlannerRateLimit, align_script_to_segments, scene_image_key, scene_narration)
 import cv2
 import numpy as np
 
 # ============================================================
 # CẤU HÌNH
 # ============================================================
-APP_TITLE = "Xưởng Video Diễn Hoạt Kiến Thức AI (V11.0)"
+APP_TITLE = "Xưởng Video Diễn Hoạt Kiến Thức AI (V11.2)"
 BATCH_SECONDS = 5 * 60
 FPS = 24
 WIDTH = 1280
@@ -153,8 +153,8 @@ def horror_sanitize(text):
 # UI
 # ============================================================
 st.set_page_config(page_title=APP_TITLE, page_icon="🎬", layout="wide")
-st.title("🎬 Xưởng Video Diễn Hoạt Kiến Thức AI — V11.0")
-st.caption("VOICE → KỊCH BẢN → HÌNH ẢNH → VIDEO • Studio V11.0")
+st.title("🎬 Xưởng Video Diễn Hoạt Kiến Thức AI — V11.2")
+st.caption("VOICE → KỊCH BẢN → HÌNH ẢNH → VIDEO • Studio V11.2")
 st.markdown("Tạo video minh họa từ lời đọc, kiểm tra kịch bản trước khi tạo ảnh và tiếp tục khi bị gián đoạn.")
 
 def setting(name):
@@ -249,8 +249,8 @@ with st.sidebar:
     planner_model = st.selectbox("Biên kịch Model",
         ["qwen/qwen3.8-27b", "openai/gpt-oss-120b", "openai/gpt-oss-20b"], index=1)
 
-    planner_output_budget = st.number_input("Token đầu ra tối đa / yêu cầu", min_value=1024, max_value=14000,
-        value=4096, step=256, help="Đây là ngân sách ứng dụng, không phải hạn mức tài khoản. Giảm khi Groq báo Request too large / OTPM. Tool tự chia đợt nhỏ hơn.")
+    planner_output_budget = st.number_input("Token đầu ra tối đa / yêu cầu", min_value=256, max_value=14000,
+        value=4096, step=64, help="Đây là ngân sách ứng dụng, không phải hạn mức tài khoản. Giảm khi Groq báo Request too large / OTPM. Tool tự chia đợt nhỏ hơn.")
 
     st.header("🎬 Phong cách diễn hoạt")
     draw_style = st.selectbox("Render style", [
@@ -806,14 +806,16 @@ JSON FORMAT:
 """
 
     if use_script_mode == "combined" and user_script.strip():
-        user = (f"Audio length: {batch_duration:.2f}s.\nMAX {expected} SCENES.\n\n"
+        user = (f"Text đã đối chiếu theo lời đọc. Dùng mốc WHISPER TIMING cho từng ý, không phân bố đều text theo thời lượng.\nAudio length: {batch_duration:.2f}s.\nMAX {expected} SCENES.\n\n"
                 f"USER SCRIPT:\n{user_script}\n\nWHISPER TIMING:\n{transcript_text}")
     elif use_script_mode == "text_only" and user_script.strip():
         user = f"Audio length: {batch_duration:.2f}s.\nMAX {expected} SCENES.\n\nSCRIPT:\n{user_script}"
     else:
         user = f"Audio length: {batch_duration:.2f}s.\nMAX {expected} SCENES.\n\nTRANSCRIPT:\n{transcript_text}"
 
-    dyn_max = min(int(output_budget), max(1024, 512 + expected * 650))
+    if output_budget < 1536:
+        system += "\nNgân sách thấp: JSON gọn không markdown/giải thích. visual_prompt tối đa 40 từ, tiêu đề tối đa 4 từ, callout tối đa 6 từ, text_boxes tối đa 2 mục ngắn."
+    dyn_max = min(int(output_budget), max(256, 512 + expected * 650))
     raw = ""
     try:
         response = chat_completion(client, model,
@@ -1477,7 +1479,7 @@ def crop_full_frame(frame_bgr, scale, cx, cy):
     return smooth_crop(frame_bgr, scale, cx, cy)
 
 # ============================================================
-# RENDER 4 STYLES — V11.0: English full-frame, VI/Horror title band
+# RENDER 4 STYLES — V11.2: English full-frame, VI/Horror title band
 # ============================================================
 def render_kttv(image_path, duration, output_path, hand_path, motion="zoom_in_center",
                 style_mode="comic", language="vi"):
@@ -1721,8 +1723,7 @@ def parallel_gen(scenes, batch_dir, providers, image_timeout, progress_state,
     keys = {}
     for i, scene in enumerate(scenes):
         image = batch_dir / f"scene_{i+1:03d}.jpg"
-        keys[i] = fingerprint({"version": VERSION, "scene": scene, "arrows": enable_arrows,
-                               "shadow": enable_shadow, "style": style_mode, "language": language})
+        keys[i] = scene_image_key(scene, enable_arrows, enable_shadow, style_mode, language)
         if artifact_ok(image, keys[i]):
             results[i] = "cached"
             progress_state["done"] += 1
@@ -1826,6 +1827,7 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
     ps = {"done": 0, "scene_status": {}, "provider_stats": {p["name"]: {"ok":0,"err":0,"total_time":0.0,"last_scene":None,"errors":[],"circuit_broken":False} for p in providers}}
     plock = threading.Lock(); ps["_lock"] = plock
     bar = st.progress(0); txt = st.empty(); stats_t = st.empty(); scene_t = st.empty()
+    image_preview = st.empty(); previewed = set()
 
     def spd(avg):
         if avg <= 0: return "—"
@@ -1836,6 +1838,13 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
     def dash():
         with plock:
             done = ps["done"]; ss = dict(ps["scene_status"]); pst = json.loads(json.dumps(ps["provider_stats"]))
+        fresh = [index for index, status in ss.items() if status["status"] == "done" and index not in previewed]
+        if fresh:
+            index = fresh[-1]
+            picture = batch_dir / f"scene_{index+1:03d}.jpg"
+            if picture.exists():
+                image_preview.image(str(picture), caption=f"Cảnh {index+1}/{total}: {scenes[index]['title']}", use_container_width=True)
+            previewed.update(fresh)
         pct = min(1.0, done/total)*0.6
         bar.progress(pct); txt.markdown(f"**🎨 Ảnh: {done}/{total}** ({pct/0.6*100:.0f}%)")
         sd = []
@@ -2061,14 +2070,49 @@ if audio:
                     chunks = chunk_audio(source, chunks_dir, effective_batch)
                     write_json(chunks_dir / "complete.json", {"key": chunk_key, "count": len(chunks)})
                 client = groq_client(groq_key); offset = 0.0
+                aligned_batches = None
+                if internal_mode == "combined":
+                    # Align the entire script once, so pauses/speaking speed cannot shift batch text.
+                    alignment_path = root / "alignment.json"
+                    aligned_batches = read_json(alignment_path)
+                    if aligned_batches is None:
+                        heard = []; records = []; absolute = 0.0
+                        for chunk in chunks:
+                            length = ffprobe_duration(chunk)
+                            st.info(f"Đối chiếu text + voice: nhận dạng {len(records)+1}/{len(chunks)}")
+                            transcript = transcribe_file(client, chunk, stt_model, lang_code, root / "transcripts")
+                            language = lang_code or ("en" if str(detect_language(transcript)).lower().startswith("en") else "vi")
+                            local = normalize_segments(transcript, 0.0)
+                            begin = len(heard)
+                            for segment in local:
+                                segment = dict(segment, start=max(0.0, segment["start"]), end=min(length, segment["end"]))
+                                if segment["end"] > segment["start"]:
+                                    heard.append(dict(segment, start=absolute+segment["start"], end=absolute+segment["end"]))
+                            records.append({"offset":absolute,"duration":length,"language":language,"begin":begin,"end":len(heard)})
+                            absolute += length
+                        corrected, diagnostics = align_script_to_segments(script_text, heard)
+                        aligned_batches = {"diagnostics":diagnostics,"batches":[]}
+                        for record in records:
+                            local = [dict(segment, start=segment["start"]-record["offset"], end=segment["end"]-record["offset"])
+                                     for segment in corrected[record["begin"]:record["end"]]]
+                            aligned_batches["batches"].append({"language":record["language"],"segments":local})
+                        write_json(alignment_path, aligned_batches)
+                    diagnostic = aligned_batches["diagnostics"]
+                    st.info(f"Text/voice khớp từ {diagnostic['score']:.0%}; {diagnostic['review_segments']} đoạn cần xem lại. Mốc thời gian giữ theo Whisper.")
+                    if diagnostic["script_only_words"]:
+                        st.warning("Các từ có trong text nhưng chưa tìm được thời gian trong voice: " + diagnostic["script_only_words"][:500])
                 st.info(f"Voice: {duration/60:.2f} phút • {len(chunks)} đợt • Dự án {project_id[:8]}")
                 for index, chunk in enumerate(chunks):
                     batch_duration = ffprobe_duration(chunk)
                     if index < len(project["batches"]):
                         offset += batch_duration; continue
                     st.markdown(f"### 📝 Lập kịch bản đợt {index+1}/{len(chunks)}")
-                    batch_script = script_slice(script_text, offset, offset+batch_duration, duration) if internal_mode != "voice_only" else ""
-                    if internal_mode == "text_only":
+                    batch_script = script_slice(script_text, offset, offset+batch_duration, duration) if internal_mode == "text_only" else ""
+                    if internal_mode == "combined":
+                        aligned = aligned_batches["batches"][index]
+                        language = aligned["language"]; segments = aligned["segments"]
+                        batch_script = "\n".join(segment["text"] for segment in segments)
+                    elif internal_mode == "text_only":
                         language = lang_code or ("vi" if re.search(r"[À-ỹ]", script_text) else "en")
                         segments = [{"start": 0.0, "end": batch_duration, "text": batch_script}]
                     else:
@@ -2127,6 +2171,9 @@ if audio:
                 else: st.success("Kịch bản đã sẵn sàng. Xem và sửa bên dưới trước khi tạo ảnh.")
         except Exception as exc:
             st.error(f"Chưa hoàn tất: {exc}")
+            if isinstance(exc, PlannerRateLimit) and exc.details:
+                with st.expander("Chi tiết lỗi gốc Groq (Limit / Used / Requested)"):
+                    st.code(exc.details, language="text")
             st.info("Các bước hoàn thành đã lưu. Khắc phục lỗi rồi bấm BẮT ĐẦU / TIẾP TỤC trong phiên này.")
 
     project = read_json(plan_path)
@@ -2154,6 +2201,68 @@ if audio:
                 except Exception as exc: st.error(str(exc))
             st.download_button("⬇️ Kịch bản JSON", json.dumps(project, ensure_ascii=False, indent=2),
                 file_name="storyboard.json", mime="application/json", on_click="ignore")
+        with st.container(border=True):
+            st.markdown("### 🎞️ Xem ảnh và nội dung từng cảnh")
+            selected = st.slider("Kéo để xem cảnh", 1, len(rows), 1, key=f"scene_preview_{project_id}") if len(rows)>1 else 1
+            row = rows[selected-1]
+            batch = project["batches"][row["batch"]-1]
+            scene = batch["scenes"][row["scene"]-1]
+            work = root / f"work_{row['batch']:03d}"
+            picture = work / f"scene_{row['scene']:03d}.jpg"
+            clip = work / f"scene_{row['scene']:03d}.mp4"
+            image_key = scene_image_key(scene, enable_arrows, enable_shadow, style_mode, batch["language"])
+            ready = artifact_ok(picture, image_key)
+            st.markdown(f"**Cảnh {selected}/{len(rows)} — {scene['title']}**")
+            st.caption(f"{row['start']:.2f}s → {row['end']:.2f}s • Đợt {row['batch']}, cảnh {row['scene']}")
+            left, right = st.columns([3, 2])
+            with left:
+                if ready:
+                    st.image(str(picture), caption="Ảnh đã tạo cho phiên bản cảnh hiện tại", use_container_width=True)
+                elif picture.exists():
+                    st.info("Ảnh đang là bản cũ hoặc ảnh dự phòng. Bấm tiếp tục để cập nhật cảnh này.")
+                else:
+                    st.info("Chưa tạo ảnh cho cảnh này. Bạn có thể kiểm tra nội dung trước.")
+            with right:
+                st.markdown("**Lời đọc liên quan**")
+                st.write(scene_narration(scene, batch["segments"]) or "Không có lời đọc trong khoảng này.")
+                st.caption("Lời đọc hiển thị theo đoạn Whisper giao với cảnh; ranh giới câu có thể cần kiểm tra bằng tai.")
+                st.markdown("**Mô tả gửi AI tạo ảnh**")
+                st.write(scene["visual_prompt"])
+                st.caption(f"Camera: {scene.get('camera_motion','auto')} • SFX: {scene.get('sfx','none')} • Nhạc: {scene.get('music_emotion','none')}")
+            with st.expander("▶️ Nghe voice và xem đoạn diễn hoạt"):
+                audio_chunk = root / "batches" / batch["chunk"]
+                if audio_chunk.exists():
+                    st.audio(str(audio_chunk), start_time=max(0, int(scene["start"])))
+                    st.caption("Voice bắt đầu gần đầu cảnh và tiếp tục tới cuối đợt; dừng nghe ở mốc kết thúc cảnh bên trên.")
+                durations = frame_durations(batch["scenes"], FPS)
+                hand = Path(__file__).with_name("hand.png")
+                clip_key = fingerprint({"version":VERSION,"image":file_digest(picture),"duration":durations[row["scene"]-1],
+                    "style":draw_style,"motion":scene.get("camera_motion","zoom_in_center"),"mode":style_mode,
+                    "language":batch["language"],"hand":file_digest(hand) if hand.exists() else "fallback"}) if ready else None
+                if ready and artifact_ok(clip, clip_key):
+                    st.video(str(clip)); st.caption("Đoạn diễn hoạt trước khi trộn âm thanh.")
+            with st.expander("🧩 Bảng ảnh tổng quan"):
+                page_count = max(1, math.ceil(len(rows)/6))
+                page = st.number_input("Trang ảnh", min_value=1, max_value=page_count, value=1, step=1,
+                                       key=f"scene_page_{project_id}")
+                columns = st.columns(2)
+                for position, item in enumerate(rows[(page-1)*6:page*6]):
+                    other_batch = project["batches"][item["batch"]-1]
+                    other_scene = other_batch["scenes"][item["scene"]-1]
+                    other = root / f"work_{item['batch']:03d}" / f"scene_{item['scene']:03d}.jpg"
+                    with columns[position%2]:
+                        st.caption(f"{item['start']:.1f}–{item['end']:.1f}s • {other_scene['title']}")
+                        if artifact_ok(other, scene_image_key(other_scene, enable_arrows, enable_shadow, style_mode, other_batch["language"])):
+                            st.image(str(other), use_container_width=True)
+                        else: st.caption("Chưa có ảnh hợp lệ cho phiên bản này.")
+        alignment = read_json(root / "alignment.json")
+        if alignment:
+            with st.expander("🔎 Đối chiếu text và lời nhận dạng"):
+                comparison = [{"đợt":i+1,"bắt đầu":segment["start"],"kết thúc":segment["end"],
+                               "Whisper":segment.get("original_text",segment["text"]),"Text đã căn":segment["text"],
+                               "Cần kiểm tra":segment.get("alignment_review",False)}
+                              for i, batch in enumerate(alignment["batches"]) for segment in batch["segments"]]
+                st.dataframe(comparison, use_container_width=True, hide_index=True)
         subtitles = root / "subtitles.srt"
         if subtitles.exists():
             st.download_button("⬇️ Phụ đề SRT", subtitles.read_bytes(), file_name="subtitles.srt", on_click="ignore")
