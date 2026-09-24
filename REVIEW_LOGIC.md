@@ -34,3 +34,7 @@ Bản gốc được lấy từ repo ctndmcs1-spec/voice-to-video; các kết lu
 - Trong kiểm thử audio im lặng đã tìm và sửa lỗi loudnorm sinh gain vô hạn: đo trước và bỏ normalization nếu kết quả không hữu hạn.
 
 Chưa chạy thử API thật, voice thật của người dùng hoặc triển khai lên app Streamlit đang hoạt động. Không khẳng định đã đạt chất lượng nghệ thuật tương đương một kênh YouTube cụ thể.
+
+## Bổ sung V11.2
+
+V11.0/V11.1 mới sửa text một dòng bằng cách chia theo tỉ lệ thời lượng; chưa xử lý tốc độ đọc thay đổi. V11.2 thay đường combined bằng đối chiếu toàn bài theo từ, giữ timestamp Whisper, chặn mismatch lớn. Phép đối chiếu này không phải forced alignment trên tín hiệu âm thanh và không bảo đảm sửa được transcript sai nghiêm trọng. Gallery hiển thị ảnh/clip có checkpoint khớp phiên bản cảnh hiện tại.

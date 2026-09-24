@@ -1,4 +1,4 @@
-# Voice to Video Studio V11.0
+# Voice to Video Studio V11.2
 
 Ứng dụng Streamlit tạo video minh họa từ voice, giữ các chế độ Comic/Horror, khóa nhân vật, bốn kiểu diễn hoạt và các provider của bản gốc.
 
@@ -21,3 +21,5 @@ python -m unittest discover -s tests -v
 ```
 
 API được giả lập trong kiểm thử; render, mux và giao diện Streamlit được chạy thật. Chưa xác minh bằng khóa dịch vụ của người dùng.
+
+V11.2: thanh kéo xem cảnh/ảnh/clip, gallery 6 ảnh mỗi trang và đối chiếu script với các đoạn transcript theo thứ tự lời đọc. Không tự luân phiên tài khoản để vượt quota.
