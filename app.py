@@ -1,17 +1,12 @@
-"""
-Xưởng Video Diễn Hoạt Kiến Thức AI — Bản Siêu Cấp V10.3
-=======================================================
-V10.3 FIX + VOICE/TEXT SYNC:
-- Combined: word timestamps, script spelling, locked scene timing, original continuous soundtrack
-- Cache transcript theo HASH voice → không lẫn cache giữa các voice khác nhau
-- Batch audio có hash tiền tố → không trùng tên batch giữa các lần chạy
-- Qwen 14000 tokens (không cắt JSON)
-- English mode: tắt hiệu ứng vẽ (hiện ảnh ngay + camera motion)
-- English mode: full-frame camera (không title band)
+"""Voice Video Studio Pro 12.0.0
+Standalone Streamlit app: editable storyboard, deterministic text and charts,
+voice/text alignment, licensed user music, ducking, loudness normalization,
+content-addressed render cache, project backup, and original rendering modes.
 """
 
 import os, re, io, json, math, time, base64, random, shutil, subprocess, tempfile, threading, wave, hashlib
 from pathlib import Path
+from functools import lru_cache
 from queue import Queue, Empty
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, wait
@@ -26,7 +21,7 @@ import numpy as np
 # ============================================================
 # CẤU HÌNH
 # ============================================================
-APP_TITLE = "Xưởng Video Diễn Hoạt Kiến Thức AI (V10.3)"
+APP_TITLE = "Voice Video Studio Pro 12"
 BATCH_SECONDS = 5 * 60
 FPS = 24
 WIDTH = 1280
@@ -157,9 +152,16 @@ def file_hash(path, nbytes=10000):
 # ============================================================
 # UI
 # ============================================================
+def app_secret(name):
+    value=os.getenv(name, '')
+    if value:return value
+    try:return str(st.secrets.get(name,''))
+    except Exception:return ''
+
 st.set_page_config(page_title=APP_TITLE, page_icon="🎬", layout="wide")
-st.title("🎬 Xưởng Video Diễn Hoạt Kiến Thức AI — V10.3")
-st.caption("Cache theo hash voice + Qwen 14k + English full-frame + sticker title")
+st.title("🎬 Voice Video Studio Pro 12")
+st.caption("Storyboard có thể sửa · Hình theo lời đọc · Nhạc tự hạ theo voice · Tiếp tục sau lỗi")
+engine_mode = st.radio("Không gian làm việc", ["Studio Pro", "Chế độ cũ"], horizontal=True)
 
 with st.sidebar:
     st.header("🎨 Style Mode")
@@ -176,7 +178,9 @@ with st.sidebar:
     if language_mode == "English": effective_lang = "en"
     elif language_mode == "Tiếng Việt": effective_lang = "vi"
 
-    if style_mode == "comic":
+    if engine_mode == "Studio Pro":
+        st.info("Studio dùng thiết lập nhịp, bố cục, chữ và phối âm riêng ở vùng chính. Các tùy chọn render cũ bên dưới dành cho Chế độ cũ.")
+    elif style_mode == "comic":
         if effective_lang == "en":
             st.success("🇬🇧 English: AI vẽ sticker title + full-frame camera")
         else:
@@ -186,34 +190,34 @@ with st.sidebar:
 
     st.header("🔑 API Keys")
     groq_key = st.text_input("Groq API Key",
-        value=os.getenv("GROQ_API_KEY", ""), type="password")
+        value=app_secret("GROQ_API_KEY"), type="password")
 
     with st.expander("🎨 Nhà cung cấp ảnh AI", expanded=False):
         pollinations_key = st.text_input("Pollinations API Key",
-            value=os.getenv("POLLINATIONS_API_KEY", ""), type="password")
+            value=app_secret("POLLINATIONS_API_KEY"), type="password")
         pollinations_model = st.selectbox("Pollinations Model",
             ["flux-pro", "flux", "gptimage", "kontext", "flux-realism"], index=0)
         agnes_key = st.text_input("Agnes AI API Key",
-            value=os.getenv("AGNES_API_KEY", ""), type="password")
+            value=app_secret("AGNES_API_KEY"), type="password")
         cf_account = st.text_input("Cloudflare Account ID",
-            value=os.getenv("CLOUDFLARE_ACCOUNT_ID", ""), type="password")
+            value=app_secret("CLOUDFLARE_ACCOUNT_ID"), type="password")
         cf_token = st.text_input("Cloudflare API Token",
-            value=os.getenv("CLOUDFLARE_API_TOKEN", ""), type="password")
+            value=app_secret("CLOUDFLARE_API_TOKEN"), type="password")
         hf_token = st.text_input("Hugging Face Token",
-            value=os.getenv("HF_TOKEN", ""), type="password")
+            value=app_secret("HF_TOKEN"), type="password")
         freetheai_key = st.text_input("FreeTheAi API Key",
-            value=os.getenv("FREETHEAI_API_KEY", ""), type="password")
+            value=app_secret("FREETHEAI_API_KEY"), type="password")
         together_key = st.text_input("Together AI API Key",
-            value=os.getenv("TOGETHER_API_KEY", ""), type="password")
+            value=app_secret("TOGETHER_API_KEY"), type="password")
         nexa_key = st.text_input("NexaAPI Key",
-            value=os.getenv("NEXA_API_KEY", ""), type="password")
+            value=app_secret("NEXA_API_KEY"), type="password")
 
     st.header("📝 Văn bản kịch bản (tùy chọn)")
     script_text = st.text_area("Dán kịch bản", value="", height=100,
-        help="⚠️ Combined mode có thể lệch timing 5-20%. Dùng 'Chỉ dùng voice' để chính xác nhất.")
+        help="Text là nguồn chữ; voice cung cấp nhịp cảnh. Nhận dạng thiếu từ không làm dừng căn cảnh.")
     use_script_mode = st.radio("Chế độ phân tích",
         ["Chỉ dùng voice", "Kết hợp voice + text", "Chỉ dùng text"], index=0,
-        help="'Chỉ dùng voice' = timing chính xác 100% (khuyên dùng).")
+        help="Chọn Kết hợp khi có đúng text đã đọc. Chỉ text dùng thời gian ước lượng.")
 
     st.header("👥 Nhân vật")
     char_main_name = st.text_input("Tên nhân vật chính", value="Tôi")
@@ -247,7 +251,8 @@ with st.sidebar:
     st.header("🧠 Groq Model")
     stt_model = st.selectbox("STT Model", ["whisper-large-v3", "whisper-large-v3-turbo"], index=0)
     planner_model = st.selectbox("Biên kịch Model",
-        ["qwen/qwen3.8-27b", "openai/gpt-oss-120b", "openai/gpt-oss-20b"], index=1)
+        ["qwen/qwen3.8-27b", "openai/gpt-oss-120b", "openai/gpt-oss-20b", "Model khác"], index=1)
+    if planner_model == "Model khác": planner_model = st.text_input("Model ID của tài khoản", value="").strip()
 
     st.header("🎬 Phong cách diễn hoạt")
     draw_style = st.selectbox("Render style", [
@@ -1052,7 +1057,7 @@ JSON FORMAT:
         if len(clean)!=len(locked_scenes): raise ValueError("AI trả cảnh không hợp lệ; không dùng ảnh thay thế sai nội dung.")
         for scene, window in zip(clean,locked_scenes):
             narration = window["narration"]
-            fallback = " ".join(w["text"] for w in combined_tokens(narration)[:4])
+            fallback = ""
             scene["title"] = combined_exact_text(scene["title"], narration, fallback).upper()
             scene["callout_text"] = combined_exact_text(scene["callout_text"], narration)
             if not scene["callout_text"]: scene["callout_type"] = "none"
@@ -1122,6 +1127,8 @@ def _build_full_prompt(prompt, chars=None, char_lock=None, style_mode="comic",
     chars = chars or {}
     native_text = (language == "en" and style_mode == "comic")
 
+    if language == "studio":
+        return prompt + "\nCHARACTER CONSISTENCY: " + json.dumps(char_lock or {},ensure_ascii=False) + "\nAbsolutely NO text, lettering, digits, watermark or logo. Use the supplied consistent art direction."
     if style_mode == "horror":
         safe = horror_sanitize(prompt)
         style = """Dramatic dark illustration, cinematic horror atmosphere, deep shadows.
@@ -2196,7 +2203,753 @@ if st.sidebar.button("🔎 KIỂM TRA PROVIDER", use_container_width=True):
                 except Exception as e:
                     st.warning(f"❌ {pc['name']}: {str(e)[:150]}")
 
+# Studio Pro: all functions embedded in app.py; no auxiliary Python import required.
+PRO_VERSION = '12.0.0'
+PRO_KINDS = ['illustration','quote','number','timeline','compare','chart']
+PRO_LABELS = {'illustration':'Tranh / tư liệu','quote':'Thẻ thông điệp','number':'Con số nổi bật','timeline':'Dòng thời gian','compare':'Đối chiếu','chart':'Biểu đồ dữ liệu'}
+
+
+def pro_hash(value):
+    return hashlib.sha256(json.dumps(value,ensure_ascii=False,sort_keys=True,default=str).encode()).hexdigest()[:24]
+
+
+def pro_digest(path):
+    h=hashlib.sha256()
+    with open(path,'rb') as f:
+        for block in iter(lambda:f.read(1024*1024),b''): h.update(block)
+    return h.hexdigest()
+
+
+def pro_save(path, data):
+    path=Path(path); path.parent.mkdir(parents=True,exist_ok=True)
+    temp=path.with_name(path.name+'.'+os.urandom(6).hex()+'.tmp')
+    temp.write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding='utf-8');os.replace(temp,path)
+
+
+def pro_read(path, default=None):
+    try:return json.loads(Path(path).read_text(encoding='utf-8'))
+    except (OSError,ValueError):return default
+
+
+class ProLock:
+    def __init__(self,root):self.root=Path(root);self.file=None
+    def __enter__(self):
+        import fcntl
+        self.root.mkdir(parents=True,exist_ok=True); self.file=open(self.root/'job.lock','a')
+        try:fcntl.flock(self.file,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:
+            self.file.close();raise RuntimeError('Dự án đang xử lý. Đợi tác vụ hiện tại hoàn tất.')
+        return self
+    def __exit__(self,*exc):
+        import fcntl
+        fcntl.flock(self.file,fcntl.LOCK_UN);self.file.close()
+
+
+def pro_asset(root,relative):
+    if not relative:return None
+    root=Path(root).resolve();p=(root/str(relative)).resolve()
+    if root not in p.parents:raise ValueError('Đường dẫn tài nguyên không hợp lệ.')
+    return p
+
+
+def pro_media_ok(path, duration=None):
+    if not Path(path).is_file() or Path(path).stat().st_size<100:return False
+    try:
+        actual=ffprobe_duration(path)
+        return actual>0 and (duration is None or abs(actual-duration)<.15)
+    except Exception:return False
+
+
+@lru_cache(maxsize=80)
+def pro_font(size,bold=True):
+    # Font installed by packages.txt: local and deterministic, no download during rendering.
+    paths=[Path(__file__).parent/'assets'/('DejaVuSans-Bold.ttf' if bold else 'DejaVuSans.ttf'),
+           Path('/usr/share/fonts/truetype/dejavu')/('DejaVuSans-Bold.ttf' if bold else 'DejaVuSans.ttf'),
+           Path('C:/Windows/Fonts')/('arialbd.ttf' if bold else 'arial.ttf')]
+    for p in paths:
+        if p.exists():return ImageFont.truetype(str(p),size)
+    return font_for(size,bold)
+
+
+def pro_wrap(draw,text,font,width):
+    lines=[]
+    for paragraph in str(text).splitlines() or ['']:
+        line=''
+        for word in paragraph.split():
+            candidate=(line+' '+word).strip()
+            if draw.textlength(candidate,font=font)<=width:line=candidate
+            else:
+                if line:lines.append(line);line=''
+                # Break unusually long URLs/tokens safely, not outside the frame.
+                for ch in word:
+                    if draw.textlength(line+ch,font=font)>width and line:lines.append(line);line=''
+                    line+=ch
+        if line:lines.append(line)
+    return lines
+
+
+def pro_text(draw,text,box,size=44,fill='#f5f1e9',bold=True,align='left'):
+    x,y,w,h=box
+    for fs in range(size,13,-2):
+        font=pro_font(fs,bold);lines=pro_wrap(draw,text,font,w);step=math.ceil(fs*1.35)
+        if len(lines)*step<=h:break
+    if len(lines)*step>h:raise ValueError('Chữ quá dài cho khung. Hãy rút gọn trong storyboard.')
+    for line in lines:
+        xx=x+(w-draw.textlength(line,font=font))/2 if align=='center' else x
+        draw.text((int(xx),int(y)),line,font=font,fill=fill,stroke_width=0);y+=step
+    return int(y)
+
+
+def pro_phrase(text,max_words=10):
+    # A complete short clause, never a first-N-words fragment.
+    for part in re.split(r'(?<=[.!?;])\s+|\n',text.strip()):
+        if 1<=len(part.split())<=max_words:return part.strip()
+    return ''
+
+
+def pro_draft(window):
+    narration=window['narration'];phrase=pro_phrase(narration)
+    return dict(window,id=pro_hash([window['start'],window['end'],narration]),kind='quote',
+        title='',headline=phrase or narration,labels=[],visual_prompt='',image='',image_key='',image_provider='',
+        source='',verified=False,data=[],unit='',sfx='none',sfx_offset=.5,revision=0,
+        warning='Bản nháp: chọn chữ chính hoặc bổ sung tranh minh họa trước khi xuất.')
+
+
+def pro_plan_one(client,model,scene,tokens=850):
+    # One scene per request: bounded output; no account rotation or unbounded retry loop.
+    system='''Bạn là biên tập hình cho kênh phân tích tài chính Việt Nam. Chỉ dùng nội dung được cấp.
+Trả JSON: {"kind":"illustration|quote|number|timeline|compare", "title":"", "headline":"", "labels":[], "visual_prompt":""}.
+Chọn một ý chính. title là cụm hoàn chỉnh 2-8 từ hoặc để trống; headline ngắn <=16 từ.
+Mọi chữ title/headline/labels phải trích nguyên văn từ narration, không tự sửa số, tên, không thêm dữ kiện.
+labels tối đa 3 cụm. Nếu không thể chọn cụm trọn nghĩa thì để trống; không lấy máy móc các từ đầu.
+visual_prompt bằng tiếng Anh: minh họa đúng ý chính, một tiêu điểm, không chữ/số/logo; không vẽ biểu đồ số liệu, không ám chỉ tội phạm hoặc phán quyết khi chỉ là án phạt trò chơi.
+Không mô phỏng người thật bằng ảnh chân dung bịa đặt. Không subtitle. Không timestamp.'''
+    try:
+        result=client.chat.completions.create(model=model,temperature=.2,max_tokens=int(tokens),
+            messages=[{'role':'system','content':system},{'role':'user','content':scene['narration']}])
+    except Exception as exc:
+        if getattr(exc,'status_code',None)==429:
+            raise RuntimeError('Groq đang giới hạn lượt/token. Tiến độ đã lưu; giảm ngân sách đầu ra hoặc đợi quota hồi rồi bấm Tiếp tục lập cảnh.') from None
+        raise RuntimeError('Không lập được cảnh. Kiểm tra model/quyền truy cập và kết nối; các cảnh trước đã được lưu.') from None
+    obj=extract_json(result.choices[0].message.content or '')
+    result=dict(scene);result['kind']=obj.get('kind') if obj.get('kind') in PRO_KINDS[:-1] else 'quote'
+    for key in ('title','headline'):
+        result[key]=combined_exact_text(str(obj.get(key,'')),scene['narration'])
+    result['labels']=[v for v in (combined_exact_text(str(x),scene['narration']) for x in obj.get('labels',[])[:3]) if v]
+    if not result['headline']:result['headline']=pro_phrase(scene['narration'])
+    if not result['headline'] and not result['labels']:result['headline']=scene['narration'];result['kind']='quote'
+    result['visual_prompt']=str(obj.get('visual_prompt',''))[:2000]
+    if result['kind']=='illustration' and not result['visual_prompt']:result['kind']='quote'
+    if result['kind'] in ('compare','timeline') and len(result['labels'])<2:result['kind']='quote'
+    result['warning']='';result['planned']=True
+    return result
+
+
+def pro_build_windows(root,src,script,mode,client,model,language,target):
+    duration=ffprobe_duration(src)
+    cache_key=pro_hash([pro_digest(src),script,mode,model,language,target,'align-v3'])
+    cache=root/'cache'/f'align_{cache_key}.json';cached=pro_read(cache)
+    if cached:return cached
+    root.joinpath('cache').mkdir(exist_ok=True)
+    if mode=='Chỉ dùng text':
+        tokens=combined_tokens(script)
+        if not tokens:raise ValueError('Hãy nhập kịch bản ở thanh bên.')
+        words=[dict(t,start=i*duration/len(tokens),end=(i+1)*duration/len(tokens),batch=0) for i,t in enumerate(tokens)]
+        report={'score':0,'review':[],'note':'Chỉ text: thời gian ước lượng theo độ dài, không căn nội dung voice.'}
+    else:
+        if client is None:raise ValueError('Cần Groq API Key để nhận dạng voice.')
+        words=[];estimate=False
+        for i,start in enumerate(np.arange(0,duration,180.0)):
+            length=min(180.0,duration-float(start));chunk=root/'cache'/f'voice_{pro_digest(src)[:12]}_{i}.wav'
+            if not pro_media_ok(chunk,length):
+                run_cmd(['ffmpeg','-v','error','-y','-ss',str(start),'-i',str(src),'-t',str(length),'-vn','-ac','1','-ar','16000',str(chunk)])
+            transcript=combined_transcribe(client,chunk,model,language,root/'cache')
+            found,approx=combined_words(transcript,float(start),length,i);words.extend(found);estimate|=approx
+        if not words:raise ValueError('Không nhận được mốc lời đọc. Kiểm tra audio hoặc chọn Chỉ dùng text để dựng theo thời gian ước lượng.')
+        if mode=='Kết hợp voice + text':
+            if not script.strip():raise ValueError('Hãy dán text để sửa chữ theo kịch bản.')
+            words,report=combined_align(script,words)
+        else:report={'score':1,'review':[]}
+        report['note']='Voice lấy nhịp, text quyết định chữ. Các chỗ nhận dạng khác được ước lượng.' if script and mode=='Kết hợp voice + text' else 'Chữ lấy từ nhận dạng; hãy sửa lỗi chính tả trong storyboard.'
+        report['segment_estimate']=estimate
+    windows=combined_windows(words,0,duration,max(2,target-2),target+2,max(1,math.ceil(duration/2)))
+    scenes=[];cursor=0
+    for window in windows:
+        count=len(combined_tokens(window['narration']));scene=pro_draft(window)
+        scene['anchors']=words[cursor:cursor+count];cursor+=count;scenes.append(scene)
+    result={'duration':duration,'report':report,'scenes':scenes}
+    pro_save(cache,result);return result
+
+
+def pro_validate_scenes(scenes,duration):
+    if not scenes:raise ValueError('Storyboard chưa có cảnh.')
+    last=0.0
+    for s in scenes:
+        start=float(s['start']);end=float(s['end'])
+        if not math.isfinite(start+end) or abs(start-last)>.02 or end-start<1/FPS:raise ValueError('Mốc cảnh phải liên tục, tăng dần và không ngắn hơn một khung hình.')
+        if s['kind'] not in PRO_KINDS:raise ValueError('Loại cảnh không hợp lệ.')
+        if s['kind']=='chart':
+            data=s.get('data',[])
+            if not s.get('verified') or not s.get('source') or not 2<=len(data)<=8:raise ValueError('Biểu đồ cần 2–8 điểm dữ liệu, nguồn và xác nhận số liệu.')
+            for row in data:
+                if not str(row.get('label','')).strip() or not math.isfinite(float(row['value'])):raise ValueError('Dữ liệu biểu đồ không hợp lệ.')
+        last=end
+    if abs(last-duration)>.05:raise ValueError('Storyboard phải kết thúc đúng thời lượng voice.')
+
+
+def pro_audit(project):
+    notes=[]
+    for i,s in enumerate(project['scenes']):
+        if s['end']-s['start']>12:notes.append(f'Cảnh {i+1}: dài hơn 12s; cân nhắc tách ý.')
+        if len(s.get('headline','').split())>18:notes.append(f'Cảnh {i+1}: nhiều chữ, nên rút gọn.')
+        if re.search(r'\d',s['narration']) and not s.get('source'):notes.append(f'Cảnh {i+1}: có số liệu/mốc thời gian, chưa gắn nguồn.')
+        if s.get('image') and not s.get('image_reviewed'):notes.append(f'Cảnh {i+1}: cần xem ảnh để loại chữ rác/chi tiết sai.')
+        if s.get('warning'):notes.append(f'Cảnh {i+1}: {s["warning"]}')
+        if i and s.get('image') and s.get('image')==project['scenes'][i-1].get('image'):notes.append(f'Cảnh {i+1}: dùng lại ảnh cảnh trước.')
+    return notes
+
+
+def pro_image(root,scene,providers,style,timeout=45):
+    identity=pro_hash([scene['visual_prompt'],style,scene.get('revision',0),[(p['name'],p.get('kwargs',{})) for p in providers], 'raw-image-v1'])
+    dest=root/'assets'/f'image_{identity}.jpg';dest.parent.mkdir(exist_ok=True)
+    if dest.exists():
+        try:Image.open(dest).verify();return str(dest.relative_to(root)),identity,'cache'
+        except Exception:dest.unlink()
+    if not providers:raise ValueError('Chọn nhà cung cấp ảnh ở thanh bên, hoặc tải ảnh riêng cho cảnh.')
+    prompt=scene['visual_prompt']+'\nCONSISTENT ART DIRECTION: '+style+'\nNo text, letters, numbers, logos, signatures, watermarks. No charts. One clear focal subject. Keep outer 10 percent uncluttered.'
+    for provider in providers:
+        try:
+            blob=provider['fn'](prompt,*provider.get('args',[]),timeout=timeout,language='studio',title='',callout_text='',**provider.get('kwargs',{}))
+            im=Image.open(io.BytesIO(blob)).convert('RGB');im.thumbnail((1920,1080))
+            temp=dest.with_suffix('.tmp');im.save(temp,format='JPEG',quality=94);os.replace(temp,dest)
+            return str(dest.relative_to(root)),identity,provider['name']
+        except Exception:continue
+    raise RuntimeError('Các nhà cung cấp ảnh đều chưa trả ảnh hợp lệ. Cảnh đã lưu; thử lại riêng cảnh này hoặc tải ảnh lên.')
+
+
+@lru_cache(maxsize=8)
+def pro_load_picture(path):
+    with Image.open(path) as im:return im.convert("RGB")
+
+
+def pro_frame(scene,root,progress=1.0,hand=False):
+    W,H=1280,720;bg='#101b2b';fg='#f6f2e9';muted='#a7b8ca';accent='#f5b942';cyan='#65d5d0'
+    frame=Image.new('RGB',(W,H),bg);d=ImageDraw.Draw(frame)
+    d.rectangle((0,0,10,H),fill=accent)
+    title=scene.get('title','');kind=scene['kind'];headline=scene.get('headline','');labels=scene.get('labels',[])
+    if title:pro_text(d,title,(56,35,1168,92),38,fg)
+    top=150 if title else 75
+    image_path=pro_asset(root,scene.get('image'))
+    if kind=='illustration' and image_path and image_path.exists():
+        from PIL import ImageOps
+        image=pro_load_picture(str(image_path))
+        # Only the picture moves. All lettering is composited afterward, inside safe margins.
+        x,y,w,h=540,top,680,510 if title else 565
+        z=1.0+.045*max(0,min(1,progress));image=ImageOps.fit(image,(round(w*z),round(h*z)),method=Image.Resampling.LANCZOS)
+        image=image.crop(((image.width-w)//2,(image.height-h)//2,(image.width+w)//2,(image.height+h)//2))
+        frame.paste(image,(x,y));d=ImageDraw.Draw(frame)
+        pro_text(d,headline,(56,top+30,440,315),46,fg)
+        if labels and progress>.35:pro_text(d,labels[0],(56,top+355,440,115),30,cyan)
+    elif kind=='chart':
+        data=scene.get('data',[])
+        if len(data)>=2:
+            vals=[float(r['value']) for r in data];lo=min(vals);hi=max(vals);pad=max((hi-lo)*.15,abs(hi)*.02,1);lo-=pad;hi+=pad
+            xs=np.linspace(125,1150,len(vals));ys=[560-(v-lo)/(hi-lo)*290 for v in vals]
+            pro_text(d,headline,(56,top,1168,105),40,fg)
+            for j in range(4):
+                yy=270+j*96;d.line((110,yy,1170,yy),fill='#293c50',width=1)
+            count=max(1,min(len(vals),1+int(progress*(len(vals)+1))))
+            for j in range(count):
+                if j:d.line((xs[j-1],ys[j-1],xs[j],ys[j]),fill=cyan,width=5)
+                d.ellipse((xs[j]-7,ys[j]-7,xs[j]+7,ys[j]+7),fill=accent)
+                label=f'{vals[j]:g} {scene.get("unit","")}'.strip()
+                pro_text(d,label,(max(56,min(1080,int(xs[j])-70)),max(230,int(ys[j])-45),145,40),23,fg)
+                pro_text(d,str(data[j]['label']),(max(56,min(1080,int(xs[j])-70)),590,145,65),22,muted)
+            pro_text(d,'Trục giá trị thu phóng theo dữ liệu',(56,645,1168,28),16,muted)
+    elif kind in ('timeline','compare'):
+        entries=(labels or [headline])[:3];n=len(entries);gap=24;cw=(1168-gap*(n-1))//max(1,n)
+        pro_text(d,headline,(56,top,1168,130),42,fg)
+        for j,text in enumerate(entries):
+            if progress<(j*.18):continue
+            x=56+j*(cw+gap);y=350
+            d.rounded_rectangle((x,y,x+cw,y+225),radius=20,fill='#1c2d42')
+            d.ellipse((x+22,y+20,x+44,y+42),fill=accent)
+            pro_text(d,text,(x+24,y+65,cw-48,135),32,fg)
+            if kind=='timeline' and j<n-1:d.line((x+cw,460,x+cw+gap,460),fill=cyan,width=4)
+    else:
+        if kind=='number':
+            pro_text(d,headline,(70,top+55,1140,290),100,accent,align='center')
+        else:
+            d.rounded_rectangle((48,top,1232,600),radius=28,fill='#1c2d42')
+            pro_text(d,headline,(88,top+45,1104,365 if top==150 else 420),60,fg,align='center')
+        if labels and progress>.35:pro_text(d,'  •  '.join(labels),(70,595,1140,66),28,cyan,align='center')
+    # A short, deliberate vector underline. The pen tip is anchored exactly, never guessed.
+    if hand and .12<progress<.38:
+        phase=(progress-.12)/.26;x=56+int(330*phase);y=132 if title else 52
+        d.line((56,y,x,y),fill=accent,width=5)
+        d.polygon([(x,y),(x+44,y-58),(x+53,y-48),(x+7,y+2)],fill='#e7bb8b')
+        d.line((x,y,x+30,y-41),fill='#263445',width=5)
+        d.ellipse((x+24,y-76,x+95,y-13),fill='#dca779',outline='#9f6a43',width=2)
+    elif hand and progress>=.38:d.line((56,132 if title else 52,386,132 if title else 52),fill=accent,width=5)
+    source=scene.get('source','')
+    if source:pro_text(d,('Nguồn: ' if scene.get('verified') else 'Nguồn khai báo: ')+source,(56,681,1168,26),16,muted)
+    return frame
+
+
+def pro_render_scene(root,scene,hand=False,preview=False):
+    frames=round(scene['end']*FPS)-round(scene['start']*FPS)
+    if frames<1:raise ValueError('Cảnh quá ngắn.')
+    picture=pro_asset(root,scene.get('image'));identity=pro_hash([PRO_VERSION,scene,pro_digest(picture) if picture and picture.exists() else None,hand,preview])
+    directory=root/'renders';directory.mkdir(exist_ok=True);dest=directory/f'{identity}.mp4'
+    if pro_media_ok(dest,frames/FPS):return dest
+    temp=dest.with_name(dest.stem+'.part.mp4')
+    with tempfile.TemporaryFile() as log:
+        proc=subprocess.Popen(['ffmpeg','-v','error','-y','-f','rawvideo','-pix_fmt','rgb24','-s','1280x720','-r',str(FPS),'-i','-',
+            '-an','-c:v','libx264','-preset','veryfast','-crf','21','-pix_fmt','yuv420p','-movflags','+faststart',str(temp)],stdin=subprocess.PIPE,stderr=log)
+        try:
+            for i in range(frames):
+                frame=pro_frame(scene,root,i/max(1,frames-1),hand)
+                if i<5:frame=Image.blend(Image.new('RGB',frame.size,'#101b2b'),frame,(i+1)/5)
+                proc.stdin.write(frame.tobytes())
+            proc.stdin.close();code=proc.wait(timeout=120)
+            if code:log.seek(0);raise RuntimeError('FFmpeg không render được cảnh: '+log.read().decode(errors='replace')[-500:])
+        except BaseException:
+            proc.kill();proc.wait();temp.unlink(missing_ok=True);raise
+    if not pro_media_ok(temp,frames/FPS):temp.unlink(missing_ok=True);raise RuntimeError('Video cảnh chưa đủ thời lượng.')
+    os.replace(temp,dest);return dest
+
+
+def pro_sfx(root,scenes,custom=None):
+    # Sparse events, tied to the editorial cue rather than every scene start.
+    duration=max(s['end'] for s in scenes);sr=48000;track=np.zeros(math.ceil(duration*sr),dtype=np.float32);last=-99;events=0
+    custom_data=None
+    if custom and Path(custom).exists():
+        blob=subprocess.check_output(['ffmpeg','-v','error','-i',str(custom),'-t','1.5','-ac','1','-ar',str(sr),'-f','f32le','-'])
+        custom_data=np.frombuffer(blob,dtype=np.float32).copy()
+    for s in scenes:
+        if s.get('sfx','none')=='none':continue
+        at=float(s['start'])+min(max(.1,float(s.get('sfx_offset',.5))),s['end']-s['start']-.05)
+        if at-last<3:continue
+        if custom_data is not None:sample=custom_data.copy()
+        else:
+            t=np.arange(int(.18*sr))/sr;freq=160 if s['sfx']=='impact' else 700
+            sample=(np.sin(2*np.pi*freq*t)*np.exp(-t*35)*np.minimum(1,t/.006)).astype(np.float32)
+        peak=np.max(np.abs(sample)) if len(sample) else 0
+        if peak:sample=sample/peak*.35
+        ix=int(at*sr);ln=min(len(sample),len(track)-ix)
+        if ln>0:track[ix:ix+ln]+=sample[:ln];events+=1;last=at
+    if not events:return None
+    out=root/'mix'/'events.wav';out.parent.mkdir(exist_ok=True);write_wav(track,out,sr);return out
+
+
+def pro_music_spec(root,project):
+    cues=project.get('music_cues',[])
+    if cues:
+        return [dict(path=pro_asset(root,c['file']),start=float(c['start']),end=float(c['end'])) for c in cues]
+    return pro_asset(root,project.get('music'))
+
+
+def pro_mix(root,voice,scenes,settings,music=None,sfx_file=None,limit=None):
+    duration=min(ffprobe_duration(voice),limit) if limit else ffprobe_duration(voice)
+    music_items=music if isinstance(music,list) else ([{'path':Path(music),'start':0.,'end':duration}] if music else [])
+    music_items=[dict(c,start=max(0.,float(c['start'])),end=min(duration,float(c['end']))) for c in music_items if float(c['start'])<duration and Path(c['path']).exists()]
+    music_items=[c for c in music_items if c['end']>c['start']]
+    music_identity=[(pro_digest(c['path']),c['start'],c['end']) for c in music_items]
+    ident=pro_hash(['mix-v2',pro_digest(voice),[(s['start'],s['end'],s.get('sfx'),s.get('sfx_offset')) for s in scenes],settings,
+                   music_identity,pro_digest(sfx_file) if sfx_file and Path(sfx_file).exists() else None,duration])
+    directory=root/'mix';directory.mkdir(exist_ok=True);out=directory/f'{ident}.m4a'
+    if pro_media_ok(out,duration):return out
+    effects=pro_sfx(root,scenes,sfx_file) if settings.get('sfx_enabled') else None
+    args=['ffmpeg','-v','error','-y','-i',str(voice)];filters=[];parts=['[v]'];idx=1
+    filters.append('[0:a]aresample=48000,aformat=channel_layouts=stereo,highpass=f=65[vbase]')
+    if music_items:
+        filters.append('[vbase]asplit=2[v][side]');beds=[]
+        for n,cue in enumerate(music_items):
+            args+=['-stream_loop','-1','-i',str(cue['path'])]
+            length=cue['end']-cue['start'];fade=min(1.2,length/3);delay=round(cue['start']*1000)
+            filters.append(f'[{idx}:a]aresample=48000,aformat=channel_layouts=stereo,atrim=duration={length},asetpts=PTS-STARTPTS,volume={settings["music_db"]}dB,afade=t=in:d={fade},afade=t=out:st={length-fade}:d={fade},adelay={delay}:all=1[b{n}]')
+            beds.append(f'[b{n}]');idx+=1
+        filters.append(''.join(beds)+f'amix=inputs={len(beds)}:normalize=0:duration=longest,apad,atrim=duration={duration}[bed]')
+        filters.append('[bed][side]sidechaincompress=threshold=0.025:ratio=8:attack=30:release=600:makeup=1[m]')
+        parts.append('[m]')
+    else:filters.append('[vbase]anull[v]')
+    if effects:
+        args+=['-i',str(effects)];filters.append(f'[{idx}:a]aresample=48000,aformat=channel_layouts=stereo,volume={settings["sfx_db"]}dB[s]');parts.append('[s]')
+    filters.append(''.join(parts)+f'amix=inputs={len(parts)}:normalize=0:duration=first,atrim=duration={duration}[mix]')
+    graph=';'.join(filters)
+    analysis=subprocess.run(args+['-loglevel','info','-filter_complex',graph+f';[mix]loudnorm=I={settings["lufs"]}:TP=-1.5:LRA=7:print_format=json[measure]',
+                '-map','[measure]','-f','null','-'],capture_output=True,text=True,timeout=1800)
+    if analysis.returncode:raise RuntimeError('Không phân tích được âm thanh. Kiểm tra file nhạc/SFX.')
+    matches=re.findall(r'\{\s*"input_i".*?\}',analysis.stderr,re.S)
+    if not matches:raise RuntimeError('FFmpeg chưa trả kết quả đo loudness.')
+    stats=json.loads(matches[-1]);normal=f'loudnorm=I={settings["lufs"]}:TP=-1.5:LRA=7'
+    if all(math.isfinite(float(stats[k])) for k in ('input_i','input_tp','input_lra','input_thresh','target_offset')):
+        normal+=f':measured_I={stats["input_i"]}:measured_TP={stats["input_tp"]}:measured_LRA={stats["input_lra"]}:measured_thresh={stats["input_thresh"]}:offset={stats["target_offset"]}:linear=true'
+    temp=out.with_name(out.stem+'.part.m4a')
+    run_cmd(args+['-filter_complex',graph+';[mix]'+normal+',aresample=48000[out]','-map','[out]','-t',str(duration),'-c:a','aac','-b:a','192k',str(temp)],timeout=1800)
+    os.replace(temp,out);pro_save(directory/f'{ident}.json',{'before':stats,'target_lufs':settings['lufs'],'true_peak_ceiling':-1.5})
+    return out
+
+
+def pro_export(root,project,settings,music=None,sfx_file=None,preview=False):
+    scenes=project['scenes'];pro_validate_scenes(scenes,project['duration'])
+    chosen=scenes[:min(3,len(scenes))] if preview else scenes
+    duration=chosen[-1]['end'];videos=[]
+    progress=st.progress(0,text='Dựng các cảnh đã duyệt…')
+    for i,s in enumerate(chosen):
+        videos.append(pro_render_scene(root,s,settings.get('hand',False)));progress.progress((i+1)/len(chosen),text=f'Cảnh {i+1}/{len(chosen)}')
+    identity=pro_hash([PRO_VERSION,[p.name for p in videos]])
+    joined=root/'renders'/f'joined_{identity}.mp4'
+    if not pro_media_ok(joined,duration):
+        listing=root/'renders'/f'concat_{identity}.txt'
+        # Generated basenames only: no shell/concat escaping of user filenames.
+        listing.write_text('\n'.join("file '"+p.name+"'" for p in videos))
+        temp=joined.with_name(joined.stem+'.part.mp4')
+        run_cmd(['ffmpeg','-v','error','-y','-f','concat','-safe','1','-i',str(listing),'-an','-c:v','copy',str(temp)],timeout=1800);os.replace(temp,joined)
+    mixed=pro_mix(root,pro_asset(root,project['voice']),chosen,settings,music,sfx_file,duration)
+    out_id=pro_hash([identity,mixed.name,settings.get('resolution','720p')]);final=root/f'output_{out_id}.mp4'
+    if not pro_media_ok(final,duration):
+        temp=final.with_name(final.stem+'.part.mp4')
+        video_opts=['-vf','scale=1920:1080:flags=lanczos','-c:v','libx264','-crf','20','-preset','veryfast'] if settings.get('resolution')=='1080p' else ['-c:v','copy']
+        run_cmd(['ffmpeg','-v','error','-y','-i',str(joined),'-i',str(mixed),'-map','0:v:0','-map','1:a:0']+video_opts+
+            ['-c:a','copy','-t',str(duration),'-movflags','+faststart',str(temp)],timeout=3600);os.replace(temp,final)
+    return final
+
+
+def pro_backup(root,project):
+    import zipfile
+    out=io.BytesIO()
+    with zipfile.ZipFile(out,'w',zipfile.ZIP_DEFLATED) as z:
+        z.writestr('project.json',json.dumps(project,ensure_ascii=False,indent=2))
+        for folder in ('assets','cache'):
+            for path in (root/folder).glob('*'):
+                if path.is_file() and path.suffix.lower() in ('.wav','.mp3','.m4a','.ogg','.jpg','.png','.json'):
+                    z.write(path,str(path.relative_to(root)))
+    return out.getvalue()
+
+
+def pro_restore(blob,root):
+    import zipfile
+    with zipfile.ZipFile(io.BytesIO(blob)) as z:
+        if sum(i.file_size for i in z.infolist())>1024*1024*1024 or len(z.infolist())>2500:raise ValueError('Gói dự án quá lớn.')
+        if len(set(z.namelist()))!=len(z.namelist()):raise ValueError('Gói có tên tệp trùng.')
+        for info in z.infolist():
+            p=Path(info.filename)
+            if p.is_absolute() or '..' in p.parts or '\\' in info.filename:raise ValueError('Gói có đường dẫn không hợp lệ.')
+            if info.filename!='project.json' and (len(p.parts)!=2 or p.parts[0] not in ('assets','cache')):raise ValueError('Gói có tệp ngoài dự án.')
+            if p.suffix.lower() not in ('.json','.wav','.mp3','.m4a','.ogg','.jpg','.png'):raise ValueError('Gói có định dạng không hỗ trợ.')
+        project=json.loads(z.read('project.json'));pro_validate_scenes(project['scenes'],float(project['duration']))
+        for name in [project['voice'],project.get('music',''),project.get('sfx_file','')]+[s.get('image','') for s in project['scenes']]+[m['file'] for m in project.get('music_library',[])]+[m['file'] for m in project.get('music_cues',[])]:
+            if name:
+                pro_asset(root,name)
+                if name not in z.namelist():raise ValueError('Gói thiếu tài nguyên dự án.')
+        root.mkdir(parents=True,exist_ok=True)
+        for info in z.infolist():
+            dest=pro_asset(root,info.filename);dest.parent.mkdir(exist_ok=True);dest.write_bytes(z.read(info))
+        project.pop('output',None);project.pop('output_signature',None);pro_save(root/'project.json',project)
+    return project
+
+
+def pro_upload_asset(root,upload,prefix,audio=False):
+    digest=hashlib.sha256(upload.getvalue()).hexdigest()[:20];directory=root/'assets';directory.mkdir(exist_ok=True)
+    if audio:
+        dest=directory/f'{prefix}_{digest}.m4a'
+        if not pro_media_ok(dest):
+            with tempfile.TemporaryDirectory() as td:
+                source=Path(td)/('input'+Path(upload.name).suffix.lower());source.write_bytes(upload.getvalue())
+                temp=dest.with_name(dest.stem+'.part.m4a')
+                run_cmd(['ffmpeg','-v','error','-y','-i',str(source),'-vn','-ar','48000','-ac','2','-c:a','aac','-b:a','192k',str(temp)],timeout=600);os.replace(temp,dest)
+    else:
+        dest=directory/f'{prefix}_{digest}.jpg'
+        im=Image.open(io.BytesIO(upload.getvalue())).convert('RGB');im.thumbnail((1920,1080));im.save(dest,quality=94)
+    return str(dest.relative_to(root))
+
+
+def pro_ui(audio):
+    st.subheader('Studio Pro — từ voice đến bản dựng có thể chỉnh sửa')
+    st.caption('1. Lập storyboard  →  2. Duyệt hình & chữ  →  3. Phối âm  →  4. Xuất video')
+    if 'pro_session' not in st.session_state:st.session_state.pro_session=os.urandom(16).hex()
+    home=Path(os.getenv('STUDIO_DATA_DIR',str(Path.home()/'.voice_video_studio')))/st.session_state.pro_session;home.mkdir(parents=True,exist_ok=True)
+    root=Path(st.session_state['pro_root']) if st.session_state.get('pro_root') else None
+    with st.expander('Mở lại dự án đã tải về'):
+        restore=st.file_uploader('Gói dự án .zip',type=['zip'],key='pro_restore')
+        if st.button('Khôi phục dự án',disabled=restore is None):
+            try:
+                destination=home/os.urandom(12).hex();pro_restore(restore.getvalue(),destination)
+                st.session_state.pro_root=str(destination);st.rerun()
+            except Exception as exc:st.error(str(exc))
+    with st.expander('Tạo storyboard từ voice',expanded=root is None):
+        st.caption('Script, chế độ voice/text và API được lấy từ thanh bên. Các thiết lập vẽ/âm thanh cũ chỉ áp dụng cho chế độ Cũ.')
+        a,b=st.columns(2)
+        target=a.slider('Nhịp mục tiêu của Studio (giây/cảnh)',4,12,7)
+        use_ai=b.checkbox('AI chọn ý và mô tả hình',value=bool(groq_key))
+        tokens=b.slider('Ngân sách đầu ra mỗi cảnh',256,1500,850,step=50)
+        style=st.text_area('Phong cách thống nhất',value='Editorial 2D illustration for an investigative finance documentary. Consistent clean ink outlines, restrained navy, ivory and amber palette. Realistic adult proportions. No chibi. Simple composition with one focal subject.',height=100)
+        if st.button('1. Lập storyboard',type='primary',disabled=audio is None):
+            try:
+                identity=pro_hash([hashlib.sha256(audio.getvalue()).hexdigest(),script_text,use_script_mode,target,stt_model,language_mode])
+                root=home/identity;root.mkdir(exist_ok=True);st.session_state.pro_root=str(root)
+                with ProLock(root):
+                    project=pro_read(root/'project.json')
+                    if not project:
+                        assets=root/'assets';assets.mkdir(exist_ok=True);src=assets/'voice.wav'
+                        with tempfile.TemporaryDirectory() as td:
+                            uploaded=Path(td)/('voice'+Path(audio.name).suffix.lower());uploaded.write_bytes(audio.getvalue())
+                            run_cmd(['ffmpeg','-v','error','-y','-i',str(uploaded),'-vn','-ar','48000','-ac','1','-c:a','pcm_s16le',str(src)],timeout=900)
+                        language={'Tiếng Việt':'vi','English':'en'}.get(language_mode)
+                        client=groq_client(groq_key) if groq_key else None
+                        with st.spinner('Nhận dạng và lấy mốc cảnh; các kết quả đã xong được lưu lại…'):
+                            built=pro_build_windows(root,src,script_text,use_script_mode,client,stt_model,language,target)
+                        project=dict(built,version=PRO_VERSION,voice='assets/voice.wav',style=style,mode=use_script_mode,script=script_text,
+                                     music='',sfx_file='',music_credit='',settings={'music_db':-24,'sfx_db':-18,'lufs':-16,'sfx_enabled':False,'hand':False,'resolution':'720p'})
+                        pro_save(root/'project.json',project)
+                    if use_ai:
+                        if not groq_key:raise ValueError('Cần Groq API Key để AI lập cảnh. Storyboard nháp đã lưu.')
+                        client=groq_client(groq_key);bar=st.progress(0)
+                        for i,scene in enumerate(project['scenes']):
+                            if not scene.get('planned'):
+                                project['scenes'][i]=pro_plan_one(client,planner_model,scene,tokens);pro_save(root/'project.json',project)
+                            bar.progress((i+1)/len(project['scenes']),text=f'Lập cảnh {i+1}/{len(project["scenes"])}')
+                st.rerun()
+            except Exception as exc:st.error(str(exc))
+    if root is None:return
+    project=pro_read(root/'project.json')
+    if not project:
+        st.info('Chưa có storyboard. Hãy bấm Lập storyboard để tiếp tục phần còn thiếu.');return
+    project_key=root.name
+    st.info(f'{project["duration"]:.1f} giây · {len(project["scenes"])} cảnh · {project["report"].get("note","")}')
+    st.caption('Tiến độ giữ trên máy chủ trong phiên làm việc. Streamlit Cloud có thể xóa ổ đĩa khi khởi động lại; tải gói dự án để giữ lâu dài.')
+    tabs=st.tabs(['Storyboard','Hình minh họa','Âm thanh','Xuất & lưu dự án'])
+    with tabs[0]:
+        with st.expander('Đối chiếu nhận dạng và kiểm tra biên tập'):
+            st.dataframe(project['report'].get('review',[]),use_container_width=True)
+            notes=pro_audit(project)
+            for note in notes[:35]:st.caption('• '+note)
+            st.caption('Nguồn và số liệu do bạn kiểm chứng; tool không tự xác minh sự kiện trên web.')
+        if st.button('Tiếp tục lập cảnh AI còn thiếu',disabled=not groq_key):
+            try:
+                with ProLock(root):
+                    client=groq_client(groq_key)
+                    for i,s in enumerate(project['scenes']):
+                        if not s.get('planned'):
+                            project['scenes'][i]=pro_plan_one(client,planner_model,s,tokens);pro_save(root/'project.json',project)
+                st.rerun()
+            except Exception as exc:st.error(str(exc))
+        rows=[{'Cảnh':i+1,'Từ':round(s['start'],2),'Đến':round(s['end'],2),'Kiểu':PRO_LABELS[s['kind']],'Chữ chính':s['headline']} for i,s in enumerate(project['scenes'])]
+        st.dataframe(rows,use_container_width=True,hide_index=True)
+        index=st.selectbox('Chọn cảnh để sửa',list(range(len(project['scenes']))),format_func=lambda i:f'{i+1:02d} · {project["scenes"][i]["start"]:.1f}s — {project["scenes"][i]["headline"][:70]}',key='select_'+project_key)
+        scene=project['scenes'][index];left,right=st.columns([1,1])
+        with left:
+            try:st.image(pro_frame(scene,root,.9,project['settings'].get('hand',False)),use_container_width=True)
+            except Exception as exc:st.warning(str(exc))
+            st.caption(f'Lời đọc: {scene["narration"]}')
+            st.caption('Hình xem trước là bố cục cuối; tranh AI được tạo ở tab Hình minh họa.')
+        with right:
+            with st.form('edit_'+scene['id']+'_'+str(scene.get('edit_version',0))):
+                kind=st.selectbox('Loại cảnh',PRO_KINDS,index=PRO_KINDS.index(scene['kind']),format_func=lambda k:PRO_LABELS[k])
+                title=st.text_input('Tiêu đề (có thể bỏ trống)',value=scene['title'],max_chars=100)
+                headline=st.text_area('Chữ chính trong ảnh',value=scene['headline'],height=90,max_chars=600)
+                labels=st.text_area('Các nhãn / mốc (mỗi dòng một nhãn, tối đa 3)',value='\n'.join(scene.get('labels',[])),max_chars=450)
+                prompt=st.text_area('Mô tả tranh (English)',value=scene.get('visual_prompt',''),height=85,max_chars=2000)
+                source=st.text_input('Nguồn dữ kiện / tư liệu',value=scene.get('source',''),max_chars=180)
+                verified=st.checkbox('Tôi đã kiểm tra nguồn và số liệu',value=scene.get('verified',False))
+                chart=st.text_area('Dữ liệu biểu đồ — mỗi dòng: nhãn | giá trị số',value='\n'.join(f'{r["label"]} | {r["value"]}' for r in scene.get('data',[])),help='Ví dụ: 01/09 | 231000. Nhập số không có dấu phân cách hàng nghìn. Chỉ dùng khi chọn Biểu đồ dữ liệu.')
+                unit=st.text_input('Đơn vị biểu đồ',value=scene.get('unit',''),max_chars=20)
+                sfx=st.selectbox('Hiệu ứng nhấn', ['none','click','impact'],index=['none','click','impact'].index(scene.get('sfx','none')))
+                cue=st.number_input('Hiệu ứng xuất hiện sau đầu cảnh (giây)',min_value=0.1,max_value=max(.1,float(scene['end']-scene['start'])-.05),value=min(max(.1,float(scene.get('sfx_offset',.5))),max(.1,float(scene['end']-scene['start'])-.05)),step=.1)
+                if index<len(project['scenes'])-1:
+                    boundary=st.number_input('Điểm chuyển sang cảnh kế tiếp (giây)',min_value=float(scene['start'])+.1,max_value=float(project['scenes'][index+1]['end'])-.1,value=float(scene['end']),step=.1)
+                else:boundary=scene['end']
+                saved=st.form_submit_button('Lưu cảnh')
+                if saved:
+                    try:
+                        data=[]
+                        if chart.strip():
+                            for line in chart.strip().splitlines():
+                                label,value=line.rsplit('|',1);data.append({'label':label.strip(),'value':float(value.strip())})
+                        updated=dict(scene,kind=kind,title=title.strip(),headline=headline.strip(),labels=[x.strip() for x in labels.splitlines() if x.strip()][:3],
+                            visual_prompt=prompt.strip(),source=source.strip(),verified=verified,data=data,unit=unit,sfx=sfx,sfx_offset=cue,end=float(boundary),warning='',planned=True,edit_version=scene.get('edit_version',0)+1)
+                        if prompt!=scene.get('visual_prompt',''):updated.update(image='',image_key='',image_reviewed=False)
+                        candidate=json.loads(json.dumps(project));candidate['scenes'][index]=updated
+                        if index+1<len(candidate['scenes']):candidate['scenes'][index+1]['start']=float(boundary)
+                        pro_validate_scenes(candidate['scenes'],candidate['duration']);pro_frame(updated,root,.9)
+                        with ProLock(root):pro_save(root/'project.json',candidate)
+                        st.rerun()
+                    except Exception as exc:st.error(str(exc))
+        split,merge=st.columns(2)
+        if split.button('Tách cảnh này thành hai',disabled=scene['end']-scene['start']<3):
+            try:
+                with ProLock(root):
+                    mid=(scene['start']+scene['end'])/2
+                    anchors=scene.get('anchors',[])
+                    candidates=[j for j in range(1,len(anchors)) if scene['start']+.5<anchors[j]['start']<scene['end']-.5]
+                    if candidates:
+                        cut=min(candidates,key=lambda j:abs(anchors[j]['start']-mid));mid=anchors[cut]['start'];aa,bb=anchors[:cut],anchors[cut:]
+                        na=' '.join(w['text'] for w in aa);nb=' '.join(w['text'] for w in bb)
+                    else:
+                        text=scene['narration'].split();cut=max(1,len(text)//2);na=' '.join(text[:cut]);nb=' '.join(text[cut:]);aa=[];bb=[]
+                    first=dict(scene,end=mid,narration=na,anchors=aa,id=pro_hash([scene['id'],'a',time.time()]))
+                    second=dict(scene,start=mid,narration=nb,anchors=bb,id=pro_hash([scene['id'],'b',time.time()]),title='',headline=pro_phrase(nb),image='',image_key='',kind='quote',warning='Cảnh vừa tách: sửa ý/chữ trước khi xuất.')
+                    project['scenes'][index:index+1]=[first,second];pro_save(root/'project.json',project)
+                st.rerun()
+            except Exception as exc:st.error(str(exc))
+        if merge.button('Gộp với cảnh kế tiếp',disabled=index==len(project['scenes'])-1):
+            try:
+                with ProLock(root):
+                    nxt=project['scenes'][index+1];scene.update(end=nxt['end'],narration=scene['narration']+' '+nxt['narration'],anchors=scene.get('anchors',[])+nxt.get('anchors',[]))
+                    project['scenes'][index:index+2]=[scene];pro_save(root/'project.json',project)
+                st.rerun()
+            except Exception as exc:st.error(str(exc))
+    with tabs[1]:
+        st.write('Tạo riêng ảnh còn thiếu, hoặc tải tư liệu của bạn. Sửa nhạc/chữ không gọi lại API ảnh.')
+        style_new=st.text_area('Định hướng hình ảnh của dự án',value=project['style'],key='style_'+project_key)
+        if st.button('Lưu định hướng hình ảnh'):
+            with ProLock(root):
+                project['style']=style_new
+                for s in project['scenes']:
+                    if s.get('image_provider') not in ('upload',''):s.update(image='',image_key='',image_reviewed=False)
+                pro_save(root/'project.json',project)
+            st.rerun()
+        providers=build_provider_list(cf_account,cf_token,hf_token,freetheai_key,together_key,nexa_key,agnes_key,pollinations_key,pollinations_model,flux_steps,
+            {},build_character_lock(char_main_name,char_main_desc,char_second_name,char_second_desc,enable_char_lock),42,style_mode)
+        ai_index=st.selectbox('Cảnh cần hình',list(range(len(project['scenes']))),format_func=lambda i:f'{i+1:02d} · {project["scenes"][i]["headline"][:70]}',key='img_'+project_key)
+        selected=project['scenes'][ai_index]
+        col1,col2=st.columns(2)
+        upload=col1.file_uploader('Ảnh / tư liệu thay thế',type=['jpg','jpeg','png','webp'],key='image_upload_'+selected['id'])
+        if col1.button('Dùng ảnh tải lên',disabled=upload is None):
+            try:
+                with ProLock(root):
+                    selected.update(image=pro_upload_asset(root,upload,'image'),kind='illustration',image_provider='upload',image_reviewed=True)
+                    pro_save(root/'project.json',project)
+                st.rerun()
+            except Exception as exc:st.error(str(exc))
+        one=col2.button('Tạo lại ảnh cảnh đã chọn',disabled=not providers)
+        all_missing=col2.button('Tạo các ảnh còn thiếu',disabled=not providers)
+        if one or all_missing:
+            try:
+                with ProLock(root):
+                    wanted=[ai_index] if one else [i for i,s in enumerate(project['scenes']) if s['kind']=='illustration' and not s.get('image')]
+                    for i in wanted:
+                        s=project['scenes'][i]
+                        if not s.get('visual_prompt'):raise ValueError(f'Cảnh {i+1} chưa có mô tả tranh. Hãy nhập ở Storyboard.')
+                        if one:s['revision']=s.get('revision',0)+1
+                        pro_save(root/'project.json',project)
+                        with st.spinner(f'Tạo ảnh cảnh {i+1}…'):
+                            image,key,provider=pro_image(root,s,providers,project['style'],image_timeout)
+                        s.update(image=image,image_key=key,image_provider=provider,image_reviewed=False,kind='illustration');pro_save(root/'project.json',project)
+                st.rerun()
+            except Exception as exc:st.error(str(exc))
+        if selected.get('image'):
+            st.image(str(pro_asset(root,selected['image'])),use_container_width=True)
+            st.caption('Kiểm tra chữ rác, biểu tượng và chi tiết sai do AI. Nếu có, tạo lại hoặc dùng ảnh tải lên.')
+            if st.button('Đã kiểm tra ảnh cảnh này'):
+                with ProLock(root):selected['image_reviewed']=True;pro_save(root/'project.json',project)
+                st.rerun()
+        st.caption('Không có API ảnh vẫn dựng được thẻ chữ, con số, timeline, đối chiếu và biểu đồ; không tự dùng ảnh trắng thay lỗi API.')
+    with tabs[2]:
+        settings=project['settings']
+        st.write('Nhạc thật do bạn chọn; không tự tạo hợp âm sóng sin. Không tải nhạc thì xuất voice sạch.')
+        music_up=st.file_uploader('Nhạc không lời (.mp3/.wav/.m4a)',type=['mp3','wav','m4a','ogg'],key='music_upload')
+        fx_up=st.file_uploader('SFX riêng (tùy chọn; dùng tối đa 1,5 giây)',type=['mp3','wav','m4a','ogg'],key='fx_upload')
+        with st.form('sound_'+project_key):
+            music_db=st.slider('Mức nhạc nền trước khi tự hạ theo voice (dB)',-40,-6,int(settings['music_db']))
+            sfx_db=st.slider('Mức SFX (dB)',-35,-3,int(settings['sfx_db']))
+            lufs=st.slider('Độ lớn bản phối (LUFS)',-20,-14,int(settings['lufs']))
+            enabled=st.checkbox('Bật các SFX đã đánh dấu trong storyboard',value=settings.get('sfx_enabled',False))
+            hand=st.checkbox('Bút/tay minh họa gạch chân ngắn',value=settings.get('hand',False))
+            resolution=st.selectbox('Độ phân giải xuất', ['720p','1080p'],index=0 if settings.get('resolution')=='720p' else 1)
+            credit=st.text_area('Tên nhạc / nguồn / nội dung ghi công',value=project.get('music_credit',''),height=90)
+            remove_music=st.checkbox('Bỏ nhạc nền đang lưu',value=False)
+            remove_sfx=st.checkbox('Bỏ SFX tải lên đang lưu',value=False)
+            apply=st.form_submit_button('Lưu âm thanh và thiết lập xuất')
+            if apply:
+                try:
+                    with ProLock(root):
+                        if remove_music:project['music']=''
+                        elif music_up:project['music']=pro_upload_asset(root,music_up,'music',True)
+                        if remove_sfx:project['sfx_file']=''
+                        elif fx_up:project['sfx_file']=pro_upload_asset(root,fx_up,'sfx',True)
+                        project['settings']=dict(music_db=music_db,sfx_db=sfx_db,lufs=lufs,sfx_enabled=enabled,hand=hand,resolution=resolution)
+                        project['music_credit']=credit;pro_save(root/'project.json',project)
+                    st.rerun()
+                except Exception as exc:st.error(str(exc))
+        if project.get('music'):st.audio(str(pro_asset(root,project['music'])))
+        with st.expander('Nhạc theo từng đoạn nội dung'):
+            additions=st.file_uploader('Thêm các bản nhạc vào dự án',type=['mp3','wav','m4a','ogg'],accept_multiple_files=True,key='music_library_upload')
+            if st.button('Lưu các bản nhạc vừa chọn',disabled=not additions):
+                try:
+                    with ProLock(root):
+                        library=project.setdefault('music_library',[])
+                        for upload in additions:
+                            relative=pro_upload_asset(root,upload,'music',True)
+                            if not any(m['file']==relative for m in library):library.append({'file':relative,'name':Path(upload.name).name})
+                        pro_save(root/'project.json',project)
+                    st.rerun()
+                except Exception as exc:st.error(str(exc))
+            library=project.get('music_library',[])
+            for i,m in enumerate(library):st.caption(f'{i+1}. {m["name"]}')
+            index_by_file={m['file']:i+1 for i,m in enumerate(library)}
+            cue_text=st.text_area('Các đoạn nhạc: giây bắt đầu | giây kết thúc | số bản nhạc',
+                value='\n'.join(f'{c["start"]} | {c["end"]} | {index_by_file.get(c["file"],1)}' for c in project.get('music_cues',[])),
+                help='Ví dụ: 0 | 30 | 1 và dòng kế 30 | 90 | 2. Để trống đoạn nào thì đoạn đó chỉ có voice. Để trống toàn bộ để dùng một bản nhạc nền ở trên.',key='cues_'+project_key)
+            if st.button('Lưu lịch nhạc'):
+                try:
+                    cues=[];last=0.
+                    for line in cue_text.splitlines():
+                        if not line.strip():continue
+                        a,b,n=line.split('|');a=float(a);b=float(b);n=int(n)
+                        if not 0<=a<b<=project['duration'] or a<last or not 1<=n<=len(library):raise ValueError('Mốc nhạc phải tăng dần, không chồng nhau, nằm trong video và chọn đúng số bản nhạc.')
+                        cues.append({'start':a,'end':b,'file':library[n-1]['file']});last=b
+                    with ProLock(root):project['music_cues']=cues;pro_save(root/'project.json',project)
+                    st.rerun()
+                except Exception as exc:st.error(str(exc))
+            if project.get('music_cues'):st.info('Đang dùng lịch nhạc theo đoạn; bản nhạc nền đơn phía trên không được dùng.')
+        st.caption('1080p được nâng từ bố cục 720p bằng Lanczos; không bổ sung chi tiết ảnh nguồn. Nhạc được lặp khi ngắn hơn video. Nên dùng nhạc loop mượt hoặc dài đủ video.')
+        if st.button('Nghe bản phối thử 20 giây'):
+            try:
+                with ProLock(root):
+                    with st.spinner('Phối thử voice + nhạc + SFX…'):
+                        sample=pro_mix(root,pro_asset(root,project['voice']),project['scenes'],project['settings'],pro_music_spec(root,project),pro_asset(root,project.get('sfx_file')),20)
+                st.audio(str(sample))
+            except Exception as exc:st.error(str(exc))
+    with tabs[3]:
+        notes=pro_audit(project)
+        st.caption('Xem bản thử trước. Cảnh đã render được dùng lại; thay nhạc chỉ phối âm và ghép lại.')
+        if notes:st.warning(f'Có {len(notes)} gợi ý cần xem trong phần kiểm tra biên tập. Tool không tự xác minh nguồn hoặc phát hiện mọi lỗi hình.')
+        c1,c2=st.columns(2);preview=c1.button('Xuất thử 3 cảnh đầu');full=c2.button('Xuất video hoàn chỉnh',type='primary')
+        if preview or full:
+            try:
+                with ProLock(root):
+                    missing=[str(i+1) for i,s in enumerate(project['scenes']) if s['kind']=='illustration' and not s.get('image')]
+                    if missing:raise ValueError('Cảnh chưa có ảnh: '+', '.join(missing)+'. Tạo/tải ảnh hoặc đổi loại cảnh trước khi xuất.')
+                    with st.spinner('Render và phối âm; bạn có thể tiếp tục sau lỗi mà không làm lại cảnh đã xong…'):
+                        out=pro_export(root,project,project['settings'],pro_music_spec(root,project),pro_asset(root,project.get('sfx_file')),preview)
+                    project['output']=out.name;project['output_preview']=preview
+                    project['output_signature']=pro_hash([project['scenes'],project['settings'],project.get('music'),project.get('music_cues'),project.get('sfx_file')]);pro_save(root/'project.json',project)
+                st.rerun()
+            except Exception as exc:st.error(str(exc))
+        if project.get('output') and pro_asset(root,project['output']).exists():
+            current=pro_hash([project['scenes'],project['settings'],project.get('music'),project.get('music_cues'),project.get('sfx_file')])
+            if current!=project.get('output_signature'):st.warning('Bản xuất dưới đây dùng thiết lập trước khi bạn chỉnh sửa. Bấm xuất lại để cập nhật.')
+            st.caption('Bản thử 3 cảnh đầu' if project.get('output_preview') else 'Bản xuất đầy đủ')
+            st.video(str(pro_asset(root,project['output'])))
+            with open(pro_asset(root,project['output']),'rb') as f:st.download_button('Tải video',f,file_name='studio_preview.mp4' if project.get('output_preview') else 'studio_video.mp4',mime='video/mp4',on_click='ignore')
+        if st.button('Chuẩn bị gói dự án để tải về'):
+            with ProLock(root):
+                pack=pro_backup(root,project);st.session_state['backup_'+project_key]=pack
+        if st.session_state.get('backup_'+project_key):
+            st.download_button('Tải gói dự án (.zip)',st.session_state['backup_'+project_key],file_name='studio_project.zip',mime='application/zip',on_click='ignore')
+            st.caption('Gói là bản chụp lúc bấm Chuẩn bị. Sau khi sửa thêm, bấm lại để cập nhật. Gồm voice, nhạc, ảnh và storyboard; không gồm API key hoặc các video render trung gian.')
+        st.download_button('Tải storyboard JSON',json.dumps(project,ensure_ascii=False,indent=2),file_name='storyboard.json',mime='application/json',on_click='ignore')
+        if project.get('music_credit'):st.download_button('Tải nội dung ghi công',project['music_credit'],file_name='music_credits.txt',on_click='ignore')
+
+
+
 audio = st.file_uploader("🎤 Tải lên voice", type=["mp3", "m4a", "wav", "ogg", "webm", "mp4"])
+
+if engine_mode == "Studio Pro":
+    pro_ui(audio)
+    st.stop()
 
 if audio:
     st.audio(audio)
