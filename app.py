@@ -427,54 +427,58 @@ def combined_words(result, offset, duration, batch):
 
 
 def combined_align(script, words):
+    """Use ASR as timing anchors, never as the authority for displayed spelling."""
     import difflib
     target = combined_tokens(script)
     if not target or not words:
-        raise ValueError("Cần cả text đúng bản đã đọc và voice nhận dạng được để căn khớp.")
+        raise ValueError("Cần text và mốc lời đọc trong voice để chia cảnh.")
     matcher = difflib.SequenceMatcher(None, [w["norm"] for w in words],
                                      [w["norm"] for w in target], autojunk=False)
-    matched = sum(block.size for block in matcher.get_matching_blocks())
-    # A shorter denominator tolerates spoken numbers vs written digits, but not huge unmatched spans.
-    score = matched / min(len(words), len(target))
-    if score < 0.55 or max(len(words),len(target)) > 2.5*min(len(words),len(target)):
-        raise ValueError(f"Text và voice khớp từ quá thấp ({score:.0%}). Hãy dùng đúng text đã đọc; không tự ép text khác nội dung vào voice.")
+    score = sum(block.size for block in matcher.get_matching_blocks()) / min(len(words), len(target))
     aligned = []; review = []
     for tag, a, b, x, y in matcher.get_opcodes():
         if tag == "equal":
             for source, token in zip(words[a:b], target[x:y]):
                 aligned.append(dict(source, text=token["text"], norm=token["norm"], original=source["text"], review=False))
         elif tag == "replace":
-            if max(b-a,y-x) > 12 or words[a]["batch"] != words[b-1]["batch"]:
-                raise ValueError("Có đoạn text khác lời nhận dạng quá dài hoặc vắt qua ranh giới đợt. Kiểm tra lại script/voice trước khi tạo ảnh.")
-            # Replacements inherit the observed word positions, including any intervening pauses.
+            # Approximate timing inside the measured span; script spelling is authoritative.
             for j, token in enumerate(target[x:y]):
-                first = a + min(b-a-1, j*(b-a)//max(1,y-x))
-                last = a + min(b-a-1, max(j*(b-a)//max(1,y-x), math.ceil((j+1)*(b-a)/max(1,y-x))-1))
-                # Map fractional token boundaries monotonically over measured source words.
-                # Unequal token counts (e.g. 100.000 vs 'một trăm nghìn') are estimated within that span.
-                def edge(position, is_end=False):
-                    index = min(b-a-1, max(0, math.ceil(position)-1 if is_end else int(position)))
-                    source = words[a+index]
-                    fraction = min(1.0,max(0.0,position-index))
-                    return source["start"]+(source["end"]-source["start"])*fraction
-                start = edge(j*(b-a)/(y-x))
-                end = edge((j+1)*(b-a)/(y-x), True)
-                aligned.append(dict(words[first], text=token["text"], norm=token["norm"], start=start, end=end,
-                                    original=" ".join(w["text"] for w in words[first:last+1]), review=True))
-            review.append({"start":words[a]["start"], "heard":" ".join(w["text"] for w in words[a:b]),
-                           "script":" ".join(t["text"] for t in target[x:y])})
-        elif tag == "delete":
-            # Ad-lib or stutter with no script spelling: keep the measured speech and flag it.
-            if b-a > 12: raise ValueError("Voice có đoạn dài không có trong text. Hãy bổ sung đúng lời đọc vào script.")
-            for word in words[a:b]: aligned.append(dict(word, original=word["text"], review=True))
-            review.append({"start":words[a]["start"],"heard":" ".join(w["text"] for w in words[a:b]),"script":"(Không có trong text; giữ lời nhận dạng)"})
-        else:
-            # Missing ASR words cannot safely be assigned an invented audio timestamp.
-            raise ValueError("Text có từ chưa tìm được vị trí trong voice: '" + " ".join(t["text"] for t in target[x:y])[:150] + "'. Kiểm tra text thừa/voice bị bỏ câu hoặc dùng Whisper large-v3.")
+                position = j*(b-a)/(y-x)
+                last_position = (j+1)*(b-a)/(y-x)
+                index = min(b-a-1, int(position))
+                last_index = min(b-a-1, max(0,math.ceil(last_position)-1))
+                source = words[a+index]; last = words[a+last_index]
+                start = source["start"]+(source["end"]-source["start"])*(position-index)
+                end = last["start"]+(last["end"]-last["start"])*(last_position-last_index)
+                if source["batch"] != last["batch"]: end = source["end"]
+                aligned.append(dict(source, text=token["text"], norm=token["norm"], start=start, end=max(start,end),
+                                    original=" ".join(w["text"] for w in words[a+index:a+last_index+1]), review=True, approximated=True))
+        elif tag == "insert":
+            # ASR may omit words. Attach script-only text to neighboring speech, not subtitles.
+            previous = words[a-1] if a else None
+            following = words[a] if a < len(words) else None
+            source = following or previous
+            if following:
+                end = following["start"]
+                floor = previous["end"] if previous and previous["batch"] == following["batch"] else end
+                start = min(end,max(floor,end-min(1.5,.25*(y-x))))
+            else:
+                start = end = previous["end"]
+            for j, token in enumerate(target[x:y]):
+                aligned.append(dict(source,text=token["text"],norm=token["norm"],
+                    start=start+(end-start)*j/(y-x),end=start+(end-start)*(j+1)/(y-x),
+                    original="",review=True,approximated=True))
+        # ASR-only words are excluded: they must never leak into image text.
+        if tag != "equal":
+            review.append({"start":words[min(a,len(words)-1)]["start"],
+                "heard":" ".join(w["text"] for w in words[a:b]) or "(Nhận dạng bỏ sót)",
+                "script":" ".join(t["text"] for t in target[x:y]) or "(Bỏ chữ chỉ có trong nhận dạng)",
+                "timing":"Ước lượng theo mốc voice lân cận"})
+    # Overlapping ASR timestamps can occur; enforce monotonic order without stopping the job.
     for i in range(1,len(aligned)):
-        if aligned[i]["start"] < aligned[i-1]["start"]:
-            raise ValueError("Căn text bị đảo thứ tự thời gian; cần kiểm tra lại voice.")
-    return aligned, {"score":score,"review":review}
+        aligned[i]["start"] = max(aligned[i]["start"],aligned[i-1]["start"])
+        aligned[i]["end"] = max(aligned[i]["start"],aligned[i]["end"])
+    return aligned, {"score":score,"review":review,"approximate":bool(review)}
 
 
 def combined_windows(words, offset, duration, min_s, max_s, max_scenes):
@@ -488,6 +492,8 @@ def combined_windows(words, offset, duration, min_s, max_s, max_scenes):
         if duration-start <= upper: break
         choices = []
         for j in range(first+1,len(local)):
+            if local[j]["start"] == local[j-1]["start"]: continue
+            if round((offset+local[j]["start"])*FPS) >= round((offset+duration)*FPS): continue
             span = local[j]["start"]-start
             if span < lower: continue
             if span > upper:
@@ -2258,12 +2264,19 @@ if audio:
                     offset += length
                 corrected, report = combined_align(script_text, all_words)
                 st.info(f"Đã đối chiếu text theo lời đọc. Mức trùng từ: {report['score']:.0%}; {len(report['review'])} đoạn đã sửa/cần kiểm tra.")
+                if report["score"] < .55: st.warning("Nhận dạng khác text khá nhiều. Tool vẫn dùng chữ từ text; vị trí một số cảnh chỉ được ước lượng theo voice.")
                 if approximate: st.warning("Một số đoạn không có timestamp từng từ; đã ước lượng bên trong timestamp câu. Độ chính xác thấp hơn timestamp từ.")
                 with st.expander("Đối chiếu lời nghe và text", expanded=False):
                     st.dataframe(report["review"], use_container_width=True)
                 for batch_index, data in enumerate(combined_data):
                     words = [word for word in corrected if word["batch"]==batch_index]
-                    data["windows"] = combined_windows(words,data["offset"],data["duration"],scene_min,scene_max,max_scenes)
+                    if words:
+                        data["windows"] = combined_windows(words,data["offset"],data["duration"],scene_min,scene_max,max_scenes)
+                    else:
+                        # Silence or ASR-only batch: continue the closest script context.
+                        nearest = min(corrected,key=lambda w:abs(w["start"]-data["offset"]))
+                        data["windows"] = [{"scene_id":1,"start":0.0,"end":data["duration"],"narration":nearest["text"]}]
+                        st.warning("Một đợt voice không có text đối chiếu được; dùng ngữ cảnh gần nhất cho hình minh họa.")
                 # Save the corrected timing map before any image request.
                 (root / "voice_text_alignment.json").write_text(json.dumps({"report":report,"batches":combined_data},ensure_ascii=False,indent=2),encoding="utf-8")
                 st.download_button("⬇️ Bản đối chiếu voice + text", (root / "voice_text_alignment.json").read_bytes(),
