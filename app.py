@@ -1,7 +1,8 @@
 """
 Xưởng Video Diễn Hoạt Kiến Thức AI — Bản Siêu Cấp V10.3
 =======================================================
-V10.3 FIX:
+V10.3 FIX + VOICE/TEXT SYNC:
+- Combined: word timestamps, script spelling, locked scene timing, original continuous soundtrack
 - Cache transcript theo HASH voice → không lẫn cache giữa các voice khác nhau
 - Batch audio có hash tiền tố → không trùng tên batch giữa các lần chạy
 - Qwen 14000 tokens (không cắt JSON)
@@ -357,6 +358,191 @@ def transcribe_file(client, path, model, language=None, cache_dir=None):
         except Exception: pass
     return result
 
+# ============================================================
+# VOICE + TEXT: audio owns timing; the supplied script owns spelling.
+# Other modes continue through their original paths.
+# ============================================================
+def combined_transcribe(client, path, model, language, cache_dir):
+    data = Path(path).read_bytes()
+    identity = json.dumps(["combined-word-v1", model, language], ensure_ascii=False).encode()
+    key = hashlib.sha256(identity + b"\0" + data).hexdigest()
+    cached = Path(cache_dir) / f"combined_{key}.json"
+    if cached.exists():
+        try:
+            result = json.loads(cached.read_text(encoding="utf-8"))
+            if isinstance(result, dict) and isinstance(result.get("words"), list):
+                return result
+        except (ValueError, OSError): pass
+    args = {"file": (Path(path).name, data), "model": model, "response_format": "verbose_json",
+            "timestamp_granularities": ["word", "segment"], "temperature": 0.0}
+    if language: args["language"] = language
+    result = client.audio.transcriptions.create(**args)
+    result = result.model_dump() if hasattr(result, "model_dump") else result
+    if not isinstance(result, dict): raise ValueError("Whisper không trả về dữ liệu thời gian hợp lệ.")
+    temporary = None
+    try:
+        cached.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=cached.parent, delete=False) as f:
+            temporary = Path(f.name); json.dump(result, f, ensure_ascii=False)
+        os.replace(temporary, cached)
+    finally:
+        if temporary: temporary.unlink(missing_ok=True)
+    return result
+
+
+def combined_tokens(text):
+    import unicodedata
+    tokens = []
+    for match in re.finditer(r"\S+", str(text)):
+        raw = match.group()
+        folded = unicodedata.normalize("NFD", raw.casefold().replace("đ", "d"))
+        normalized = "".join(c for c in folded if c.isalnum() and not unicodedata.combining(c))
+        if normalized: tokens.append({"text": raw, "norm": normalized})
+    return tokens
+
+
+def combined_words(result, offset, duration, batch):
+    words = []; approximated = False
+    raw_words = result.get("words") or []
+    if not raw_words:
+        approximated = True
+        # Explicit fallback: segment timing is measured; its internal word timing is only estimated.
+        for segment in result.get("segments") or []:
+            tokens = combined_tokens(segment.get("text", ""))
+            a, b = float(segment.get("start", 0)), float(segment.get("end", 0))
+            for index, token in enumerate(tokens):
+                raw_words.append({"word":token["text"], "start":a+(b-a)*index/len(tokens),
+                                  "end":a+(b-a)*(index+1)/len(tokens)})
+    for item in raw_words:
+        a, b = float(item.get("start", 0)), float(item.get("end", 0))
+        if not math.isfinite(a) or not math.isfinite(b): continue
+        a, b = max(0.0, a), min(duration, b)
+        if b <= a: continue
+        tokens = combined_tokens(item.get("word", item.get("text", "")))
+        for index, token in enumerate(tokens):
+            words.append(dict(token, start=offset+a+(b-a)*index/len(tokens),
+                              end=offset+a+(b-a)*(index+1)/len(tokens), batch=batch))
+    words.sort(key=lambda word:(word["start"],word["end"]))
+    return words, approximated
+
+
+def combined_align(script, words):
+    import difflib
+    target = combined_tokens(script)
+    if not target or not words:
+        raise ValueError("Cần cả text đúng bản đã đọc và voice nhận dạng được để căn khớp.")
+    matcher = difflib.SequenceMatcher(None, [w["norm"] for w in words],
+                                     [w["norm"] for w in target], autojunk=False)
+    matched = sum(block.size for block in matcher.get_matching_blocks())
+    # A shorter denominator tolerates spoken numbers vs written digits, but not huge unmatched spans.
+    score = matched / min(len(words), len(target))
+    if score < 0.55 or max(len(words),len(target)) > 2.5*min(len(words),len(target)):
+        raise ValueError(f"Text và voice khớp từ quá thấp ({score:.0%}). Hãy dùng đúng text đã đọc; không tự ép text khác nội dung vào voice.")
+    aligned = []; review = []
+    for tag, a, b, x, y in matcher.get_opcodes():
+        if tag == "equal":
+            for source, token in zip(words[a:b], target[x:y]):
+                aligned.append(dict(source, text=token["text"], norm=token["norm"], original=source["text"], review=False))
+        elif tag == "replace":
+            if max(b-a,y-x) > 12 or words[a]["batch"] != words[b-1]["batch"]:
+                raise ValueError("Có đoạn text khác lời nhận dạng quá dài hoặc vắt qua ranh giới đợt. Kiểm tra lại script/voice trước khi tạo ảnh.")
+            # Replacements inherit the observed word positions, including any intervening pauses.
+            for j, token in enumerate(target[x:y]):
+                first = a + min(b-a-1, j*(b-a)//max(1,y-x))
+                last = a + min(b-a-1, max(j*(b-a)//max(1,y-x), math.ceil((j+1)*(b-a)/max(1,y-x))-1))
+                # Map fractional token boundaries monotonically over measured source words.
+                # Unequal token counts (e.g. 100.000 vs 'một trăm nghìn') are estimated within that span.
+                def edge(position, is_end=False):
+                    index = min(b-a-1, max(0, math.ceil(position)-1 if is_end else int(position)))
+                    source = words[a+index]
+                    fraction = min(1.0,max(0.0,position-index))
+                    return source["start"]+(source["end"]-source["start"])*fraction
+                start = edge(j*(b-a)/(y-x))
+                end = edge((j+1)*(b-a)/(y-x), True)
+                aligned.append(dict(words[first], text=token["text"], norm=token["norm"], start=start, end=end,
+                                    original=" ".join(w["text"] for w in words[first:last+1]), review=True))
+            review.append({"start":words[a]["start"], "heard":" ".join(w["text"] for w in words[a:b]),
+                           "script":" ".join(t["text"] for t in target[x:y])})
+        elif tag == "delete":
+            # Ad-lib or stutter with no script spelling: keep the measured speech and flag it.
+            if b-a > 12: raise ValueError("Voice có đoạn dài không có trong text. Hãy bổ sung đúng lời đọc vào script.")
+            for word in words[a:b]: aligned.append(dict(word, original=word["text"], review=True))
+            review.append({"start":words[a]["start"],"heard":" ".join(w["text"] for w in words[a:b]),"script":"(Không có trong text; giữ lời nhận dạng)"})
+        else:
+            # Missing ASR words cannot safely be assigned an invented audio timestamp.
+            raise ValueError("Text có từ chưa tìm được vị trí trong voice: '" + " ".join(t["text"] for t in target[x:y])[:150] + "'. Kiểm tra text thừa/voice bị bỏ câu hoặc dùng Whisper large-v3.")
+    for i in range(1,len(aligned)):
+        if aligned[i]["start"] < aligned[i-1]["start"]:
+            raise ValueError("Căn text bị đảo thứ tự thời gian; cần kiểm tra lại voice.")
+    return aligned, {"score":score,"review":review}
+
+
+def combined_windows(words, offset, duration, min_s, max_s, max_scenes):
+    if duration <= 0 or not words: raise ValueError("Đợt audio không có lời đọc để tạo cảnh khớp nội dung.")
+    local = [dict(w, start=max(0.0,w["start"]-offset), end=min(duration,w["end"]-offset)) for w in words]
+    target = max((min_s+max_s)/2, duration/max(1,max_scenes))
+    lower = min(min_s, target); upper = max(max_s,target*1.2)
+    cuts = [0]; first = 0
+    while first < len(local)-1 and len(cuts) < max_scenes:
+        start = 0.0 if first==0 else local[first]["start"]
+        if duration-start <= upper: break
+        choices = []
+        for j in range(first+1,len(local)):
+            span = local[j]["start"]-start
+            if span < lower: continue
+            if span > upper:
+                if not choices: choices.append((abs(span-target),j))
+                break
+            sentence = bool(re.search(r"[.!?…;][\"'”’)]*$",local[j-1]["text"]))
+            pause = local[j]["start"]-local[j-1]["end"] >= .35
+            choices.append((abs(span-target) - (target*.3 if sentence else 0) - (target*.15 if pause else 0),j))
+        if not choices: break
+        cut = min(choices)[1]
+        if cut <= first: break
+        cuts.append(cut); first=cut
+    cuts.append(len(local))
+    scenes = []
+    for i,(a,b) in enumerate(zip(cuts,cuts[1:])):
+        start = 0.0 if i==0 else local[a]["start"]
+        end = duration if b==len(local) else local[b]["start"]
+        if round((offset+end)*FPS) <= round((offset+start)*FPS):
+            raise ValueError("Cảnh ngắn hơn một khung hình; kiểm tra mốc Whisper.")
+        scenes.append({"scene_id":i+1,"start":start,"end":end,
+                       "narration":" ".join(w["text"] for w in local[a:b])})
+    return scenes
+
+
+def combined_exact_text(value, narration, fallback=""):
+    source = combined_tokens(narration); query = combined_tokens(value)
+    if not query: return fallback
+    wanted = [w["norm"] for w in query]
+    for i in range(len(source)-len(query)+1):
+        if [w["norm"] for w in source[i:i+len(query)]] == wanted:
+            return " ".join(w["text"] for w in source[i:i+len(query)])
+    return fallback
+
+
+def combined_finish(videos, voice, scenes, root, with_sfx, sfx_vol, with_music, music_vol):
+    # Ignore per-batch AAC padding. Use original, continuous voice for the final soundtrack.
+    silent = []
+    for i, video in enumerate(videos):
+        path = root / f"combined_silent_{i:03d}.mp4"
+        run_cmd(["ffmpeg","-y","-v","error","-i",str(video),"-map","0:v:0","-an","-c:v","copy",str(path)])
+        silent.append(path)
+    joined = root / "combined_picture.mp4"
+    concat_batches(silent, joined)
+    sfx = build_sfx_track(scenes, root / "combined_sfx.wav", SFX_SAMPLE_RATE, sfx_vol) if with_sfx else None
+    music = build_music_track(scenes, root / "combined_music.wav", SFX_SAMPLE_RATE, music_vol) if with_music else None
+    soundtrack = voice
+    if sfx or music:
+        soundtrack = root / "combined_sound.m4a"
+        mix_audio_tracks(str(voice),str(sfx) if sfx else None,str(music) if music else None,str(soundtrack))
+    final = root / "video_final.mp4"
+    run_cmd(["ffmpeg","-y","-v","error","-i",str(joined),"-i",str(soundtrack),"-map","0:v:0","-map","1:a:0",
+             "-c:v","copy","-c:a","aac","-b:a","128k","-t",str(ffprobe_duration(voice)),"-movflags","+faststart",str(final)],timeout=1800)
+    return final
+
+
 def detect_language(result):
     try:
         d = result.model_dump() if hasattr(result, "model_dump") else result
@@ -658,9 +844,9 @@ def make_scene_plan(client, transcript_text, batch_start, batch_duration, model,
                     min_s, max_s, max_scenes, camera_mode="auto",
                     language="vi", enable_rich=True, char_lock=None,
                     enable_sfx=True, enable_music=True,
-                    user_script="", use_script_mode="voice_only", style_mode="comic"):
+                    user_script="", use_script_mode="voice_only", style_mode="comic", locked_scenes=None):
     avg_dur = (min_s + max_s) / 2.0
-    expected = max(1, round(batch_duration / avg_dur))
+    expected = len(locked_scenes) if locked_scenes is not None else max(1, round(batch_duration / avg_dur))
     is_en = (language == "en")
     lang_name = "English" if is_en else "Tiếng Việt"
     is_horror = (style_mode == "horror")
@@ -763,9 +949,18 @@ JSON FORMAT:
     else:
         user = f"Audio length: {batch_duration:.2f}s.\nMAX {expected} SCENES.\n\nTRANSCRIPT:\n{transcript_text}"
 
+    if locked_scenes is not None:
+        system += "\nVOICE+TEXT LOCK: Trả đúng một cảnh cho mỗi scene_id được cấp. Không đổi/tách/gộp/thêm cảnh. Thời gian do chương trình giữ, không tự dựng timeline."
+        system += "\nMỗi hình chỉ minh họa narration của scene_id tương ứng. title/callout/text_boxes lấy cụm từ NGUYÊN VĂN từ narration, đúng tên riêng, số và dấu tiếng Việt. Không bịa chữ. visual_prompt chỉ tả hình bằng tiếng Anh, không nhúng chữ/title vào mô tả."
+        system += "\nJSON mỗi cảnh phải có scene_id. Không markdown hoặc phần giải thích."
+        user = "Các cảnh đã căn từ voice và sửa chữ theo script (giây cục bộ trong đợt):\n" + json.dumps(locked_scenes, ensure_ascii=False)
+
     # V10.3: Qwen cap 14000
     MODEL_CAP = {"qwen/qwen3.8-27b": 15000, "openai/gpt-oss-120b": 40000, "openai/gpt-oss-20b": 9000}
     dyn_max = min(MODEL_CAP.get(model, 40000), max(50000, int(expected * 600 * 1.3)))
+
+    if locked_scenes is not None:
+        dyn_max = min(MODEL_CAP.get(model, 9000), 768 + 700*len(locked_scenes))
 
     raw = ""
     try:
@@ -773,7 +968,19 @@ JSON FORMAT:
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}])
         raw = r.choices[0].message.content or ""
         obj = extract_json(raw); raw_scenes = obj.get("scenes", [])
+        if locked_scenes is not None:
+            if not isinstance(raw_scenes,list) or len(raw_scenes)!=len(locked_scenes):
+                raise ValueError("AI trả thiếu/thừa cảnh đã khóa theo voice.")
+            indexed = {}
+            for scene in raw_scenes:
+                sid = scene.get("scene_id")
+                if type(sid) is not int or sid in indexed: raise ValueError("scene_id bị thiếu hoặc trùng.")
+                indexed[sid] = scene
+            if set(indexed) != {w["scene_id"] for w in locked_scenes}: raise ValueError("scene_id không khớp các câu đã căn.")
+            raw_scenes = [dict(indexed[w["scene_id"]],start=w["start"],end=w["end"]) for w in locked_scenes]
     except Exception as e:
+        if locked_scenes is not None:
+            raise RuntimeError(f"Lập cảnh voice+text chưa hoàn tất: {e}") from e
         st.error(f"❌ Qwen fail: {str(e)[:200]}")
         if raw: st.code(raw[:1000], language="text")
         raw_scenes = []
@@ -814,7 +1021,7 @@ JSON FORMAT:
     for s in raw_scenes[:max_scenes]:
         try:
             a = max(0.0, float(s["start"])); b = min(batch_duration, float(s["end"]))
-            if b <= a + 1.0: continue
+            if b <= a + (0.0 if locked_scenes is not None else 1.0): continue
             vp = str(s.get("visual_prompt", "")).strip()
             if not vp or len(vp) < 10: continue
             if is_horror: vp = horror_sanitize(vp)
@@ -835,46 +1042,63 @@ JSON FORMAT:
                 "visual_prompt": vp, "text_boxes": clean_tbs(s.get("text_boxes", []))})
         except Exception: continue
 
-    if not clean:
-        n = max(3, int(batch_duration / avg_dur)); sd = batch_duration / n
-        fb_t = "SCENE" if is_en else "CẢNH"
-        fb_prompts = ["Colored cartoon illustration with warm earth tones, a character in a natural scene",
-                      "Colored cartoon illustration, dramatic lighting, a character"]
-        clean = []
-        for i in range(n):
-            clean.append({"start": i * sd, "end": (i + 1) * sd, "title": f"{fb_t} {i+1:02d}",
-                "callout_type": "none", "callout_text": "", "callout_side": "right",
-                "camera_motion": random.choice(list(valid_motions)),
-                "sfx": random.choice(list(valid_sfx_set - {"none"})),
-                "music_emotion": random.choice(list(VALID_EMOTIONS - {"none"})),
-                "visual_prompt": fb_prompts[i % len(fb_prompts)], "text_boxes": []})
+    if locked_scenes is not None:
+        if len(clean)!=len(locked_scenes): raise ValueError("AI trả cảnh không hợp lệ; không dùng ảnh thay thế sai nội dung.")
+        for scene, window in zip(clean,locked_scenes):
+            narration = window["narration"]
+            fallback = " ".join(w["text"] for w in combined_tokens(narration)[:4])
+            scene["title"] = combined_exact_text(scene["title"], narration, fallback).upper()
+            scene["callout_text"] = combined_exact_text(scene["callout_text"], narration)
+            if not scene["callout_text"]: scene["callout_type"] = "none"
+            exact_boxes = []
+            for box in scene["text_boxes"] if enable_rich else []:
+                text = combined_exact_text(box["text"], narration)
+                if text: exact_boxes.append(dict(box,text=text))
+            scene["text_boxes"] = exact_boxes
+            scene["narration"] = narration
+            scene["start"],scene["end"] = window["start"],window["end"]
+        final = clean
+    else:
+        if not clean:
+            n = max(3, int(batch_duration / avg_dur)); sd = batch_duration / n
+            fb_t = "SCENE" if is_en else "CẢNH"
+            fb_prompts = ["Colored cartoon illustration with warm earth tones, a character in a natural scene",
+                          "Colored cartoon illustration, dramatic lighting, a character"]
+            clean = []
+            for i in range(n):
+                clean.append({"start": i * sd, "end": (i + 1) * sd, "title": f"{fb_t} {i+1:02d}",
+                    "callout_type": "none", "callout_text": "", "callout_side": "right",
+                    "camera_motion": random.choice(list(valid_motions)),
+                    "sfx": random.choice(list(valid_sfx_set - {"none"})),
+                    "music_emotion": random.choice(list(VALID_EMOTIONS - {"none"})),
+                    "visual_prompt": fb_prompts[i % len(fb_prompts)], "text_boxes": []})
 
-    merge_threshold = max(min_s * 0.7, 5.0)
-    merged = []
-    for s in clean:
-        if not merged: merged.append(s)
-        else:
-            prev = merged[-1]
-            if (s["end"] - s["start"]) < merge_threshold or (s["start"] - prev["start"] < merge_threshold):
-                prev["end"] = max(prev["end"], s["end"])
-                if not prev.get("callout_text") and s.get("callout_text"):
-                    prev["callout_text"] = s["callout_text"]; prev["callout_type"] = s["callout_type"]
-            else: merged.append(s)
-    clean = merged
-    clean[0]["start"] = 0.0
-    for i in range(len(clean) - 1): clean[i]["end"] = clean[i + 1]["start"]
-    clean[-1]["end"] = batch_duration
+        merge_threshold = max(min_s * 0.7, 5.0)
+        merged = []
+        for s in clean:
+            if not merged: merged.append(s)
+            else:
+                prev = merged[-1]
+                if (s["end"] - s["start"]) < merge_threshold or (s["start"] - prev["start"] < merge_threshold):
+                    prev["end"] = max(prev["end"], s["end"])
+                    if not prev.get("callout_text") and s.get("callout_text"):
+                        prev["callout_text"] = s["callout_text"]; prev["callout_type"] = s["callout_type"]
+                else: merged.append(s)
+        clean = merged
+        clean[0]["start"] = 0.0
+        for i in range(len(clean) - 1): clean[i]["end"] = clean[i + 1]["start"]
+        clean[-1]["end"] = batch_duration
 
-    split_threshold = max(max_s * 1.3, 15.0)
-    final = []
-    for s in clean:
-        dur = s["end"] - s["start"]
-        if dur > split_threshold:
-            mid = s["start"] + dur / 2.0
-            final.append({**s, "end": mid})
-            final.append({**s, "start": mid, "title": f"{s['title']} (TIẾP)",
-                "callout_type": "sticker", "callout_text": "!", "text_boxes": []})
-        else: final.append(s)
+        split_threshold = max(max_s * 1.3, 15.0)
+        final = []
+        for s in clean:
+            dur = s["end"] - s["start"]
+            if dur > split_threshold:
+                mid = s["start"] + dur / 2.0
+                final.append({**s, "end": mid})
+                final.append({**s, "start": mid, "title": f"{s['title']} (TIẾP)",
+                    "callout_type": "sticker", "callout_text": "!", "text_boxes": []})
+            else: final.append(s)
 
     if camera_mode == "random":
         for s in final: s["camera_motion"] = random.choice(list(valid_motions))
@@ -899,6 +1123,9 @@ Rich moody backgrounds, dramatic lighting.
 Absolutely NO text, letters, numbers, captions.
 Wide 16:9 cinematic composition.
 CHARACTER GENDER: male = MALE, female = FEMALE."""
+    elif language == "en_exact":
+        safe = prompt
+        style = "Colored cartoon illustration, warm earth tones, soft cinematic lighting, thick black outlines, expressive characters, wide 16:9. Absolutely NO lettering, words, digits, labels or speech bubbles; lettering is added separately."
     elif native_text:
         safe = prompt
         style = """COLORED CARTOON ILLUSTRATION with natural warm earth tones.
@@ -1200,6 +1427,20 @@ def add_comic_overlays(image_path, title, callout_type, callout_text, callout_si
                         style_mode="comic", language="vi"):
     img = Image.open(image_path).convert("RGB").resize((WIDTH, HEIGHT))
 
+    if language == "en_exact" and style_mode == "comic":
+        draw = ImageDraw.Draw(img)
+        if title:
+            size = 42
+            while size > 18 and draw.textbbox((0,0),title,font=font_for(size))[2] > WIDTH-140: size -= 2
+            draw.text((WIDTH//2,28),title,font=font_for(size),anchor="mt",fill="white",stroke_width=4,stroke_fill="#151515")
+        if callout_text and callout_type != "none":
+            import textwrap
+            text = "\n".join(textwrap.wrap(callout_text,width=32)[:3])
+            draw.multiline_text((WIDTH//2,HEIGHT-150),text,font=font_for(28),anchor="ma",align="center",
+                                fill="#fff6cc",stroke_width=3,stroke_fill="#151515")
+        img.save(output_path,quality=95)
+        return
+
     if language == "en" and style_mode == "comic":
         img.save(output_path, quality=95)
         return
@@ -1409,7 +1650,7 @@ HORROR_MOTIONS = {
 
 def get_motion_kfs(motion, style_mode="comic", language="vi"):
     if style_mode == "horror": src = HORROR_MOTIONS
-    elif language == "en": src = EN_COMIC_MOTIONS
+    elif language in ("en", "en_exact"): src = EN_COMIC_MOTIONS
     else: src = COMIC_MOTIONS
     return src.get(motion, list(src.values())[0])
 
@@ -1431,7 +1672,7 @@ def interp_motion(kfs, p):
 def render_kttv(image_path, duration, output_path, hand_path, motion="zoom_in_center",
                 style_mode="comic", language="vi"):
     tf = max(1, round(duration * FPS))
-    use_full_frame = (language == "en" and style_mode == "comic")
+    use_full_frame = (language in ("en", "en_exact") and style_mode == "comic")
     # V10.3: English bỏ hiệu ứng vẽ — hiện ảnh ngay
     if use_full_frame:
         dd = 0.001; df = 0; rf = 0
@@ -1515,7 +1756,7 @@ def render_kttv(image_path, duration, output_path, hand_path, motion="zoom_in_ce
 def render_hybrid(image_path, duration, output_path, hand_path, motion="zoom_in_center",
                   style_mode="comic", language="vi"):
     # V10.3: Với English, dùng render_kttv thay vì hybrid vẽ tay
-    if language == "en" and style_mode == "comic":
+    if language in ("en", "en_exact") and style_mode == "comic":
         return render_kttv(image_path, duration, output_path, hand_path, motion, style_mode, language)
 
     tf = max(1, round(duration * FPS))
@@ -1581,7 +1822,7 @@ def render_pure(image_path, duration, output_path, motion="zoom_in_center",
                 style_mode="comic", language="vi"):
     tf = max(1, round(duration * FPS))
     of = cv2.resize(cv2.imread(str(image_path)), (WIDTH, HEIGHT))
-    use_full_frame = (language == "en" and style_mode == "comic")
+    use_full_frame = (language in ("en", "en_exact") and style_mode == "comic")
     if use_full_frame:
         tb = None; cb = of
     else:
@@ -1606,7 +1847,7 @@ def render_pure(image_path, duration, output_path, motion="zoom_in_center",
 def render_classic(image_path, duration, output_path, hand_path, motion="zoom_in_center",
                    style_mode="comic", language="vi"):
     # V10.3: English → không vẽ tay
-    if language == "en" and style_mode == "comic":
+    if language in ("en", "en_exact") and style_mode == "comic":
         return render_kttv(image_path, duration, output_path, hand_path, motion, style_mode, language)
 
     tf = max(1, round(duration * FPS))
@@ -1788,7 +2029,7 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
                  image_timeout, flux_steps=4, fair_share=True, circuit=True, prio_fast=True,
                  chars=None, char_lock=None, enable_arrows=True, enable_shadow=True,
                  enable_sfx=True, sfx_vol=-12, enable_music=True, music_vol=-22,
-                 seed_lock=None, style_mode="comic", language="vi"):
+                 seed_lock=None, style_mode="comic", language="vi", strict_timing=False, timeline_offset=0.0):
     total = len(scenes)
     if total == 0: raise RuntimeError("Không có cảnh nào.")
     chars = chars or {}; char_lock = char_lock or {}
@@ -1865,9 +2106,14 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
     for i, s in enumerate(scenes, 1):
         im = batch_dir / f"scene_{i:03d}.jpg"; vd = batch_dir / f"scene_{i:03d}.mp4"
         if not im.exists(): raise RuntimeError(f"Thiếu ảnh scene {i}")
-        dur = max(1.0, float(s["end"]) - float(s["start"]))
+        if strict_timing:
+            dur = (round((timeline_offset+float(s["end"]))*FPS)-round((timeline_offset+float(s["start"]))*FPS))/FPS
+            if dur <= 0: raise ValueError("Cảnh không có khung hình hợp lệ.")
+        else:
+            dur = max(1.0, float(s["end"]) - float(s["start"]))
         mo = s.get("camera_motion", "zoom_in_center")
-        if "1." in style or "Vẽ 3 phase" in style: render_kttv(im, dur, vd, hand_path, mo, style_mode, language)
+        if strict_timing and dur < 1.85: render_pure(im, dur, vd, mo, style_mode, language)
+        elif "1." in style or "Vẽ 3 phase" in style: render_kttv(im, dur, vd, hand_path, mo, style_mode, language)
         elif "2." in style or "Hybrid" in style: render_hybrid(im, dur, vd, hand_path, mo, style_mode, language)
         elif "3." in style or "Chỉ Camera" in style: render_pure(im, dur, vd, mo, style_mode, language)
         else: render_classic(im, dur, vd, hand_path, mo, style_mode, language)
@@ -1961,6 +2207,9 @@ if audio:
         elif use_script_mode == "Chỉ dùng text": internal_mode = "text_only"
         else: internal_mode = "voice_only"
 
+        if internal_mode == "combined" and not script_text.strip():
+            st.error("Hãy dán đúng kịch bản đã đọc để kết hợp với voice."); st.stop()
+
         char_lock = build_character_lock(char_main_name, char_main_desc, char_second_name, char_second_desc, enable_char_lock)
         if enable_global_char and global_char_desc.strip():
             char_lock["__global__"] = global_char_desc.strip()
@@ -1985,42 +2234,83 @@ if audio:
             hp = Path("hand.png")
             bvids = []; all_s = 0; stt = st.empty()
 
-            vc = [(bi, ch, ffprobe_duration(ch)) for bi, ch in enumerate(chunks) if ffprobe_duration(ch) >= 5.0 or bi == 0]
+            if internal_mode == "combined":
+                vc = [(bi,ch,ffprobe_duration(ch)) for bi,ch in enumerate(chunks)]
+            else:
+                vc = [(bi, ch, ffprobe_duration(ch)) for bi, ch in enumerate(chunks) if ffprobe_duration(ch) >= 5.0 or bi == 0]
             if not vc: st.error("Không có audio hợp lệ."); st.stop()
 
             cm_mode = ("random" if "Random" in camera_motion_mode else
                       f"fixed:{camera_motion_mode.replace('Cố định: ', '').strip()}"
                       if "Cố định" in camera_motion_mode else "auto")
 
+            combined_data = []; global_scenes = []
+            if internal_mode == "combined":
+                all_words = []; offset = 0.0; approximate = False
+                for batch_index, (_, chunk, length) in enumerate(vc):
+                    stt.markdown(f"### 🎙️ Căn voice + text: nhận dạng {batch_index+1}/{len(vc)}")
+                    transcript = combined_transcribe(client, chunk, stt_model, lang_code, cache_dir)
+                    detected = str(detect_language(transcript) or "").lower()
+                    language = lang_code or ("en" if detected.startswith("en") else "vi")
+                    words, estimated = combined_words(transcript, offset, length, batch_index)
+                    all_words.extend(words); approximate |= estimated
+                    combined_data.append({"offset":offset,"duration":length,"language":language})
+                    offset += length
+                corrected, report = combined_align(script_text, all_words)
+                st.info(f"Đã đối chiếu text theo lời đọc. Mức trùng từ: {report['score']:.0%}; {len(report['review'])} đoạn đã sửa/cần kiểm tra.")
+                if approximate: st.warning("Một số đoạn không có timestamp từng từ; đã ước lượng bên trong timestamp câu. Độ chính xác thấp hơn timestamp từ.")
+                with st.expander("Đối chiếu lời nghe và text", expanded=False):
+                    st.dataframe(report["review"], use_container_width=True)
+                for batch_index, data in enumerate(combined_data):
+                    words = [word for word in corrected if word["batch"]==batch_index]
+                    data["windows"] = combined_windows(words,data["offset"],data["duration"],scene_min,scene_max,max_scenes)
+                # Save the corrected timing map before any image request.
+                (root / "voice_text_alignment.json").write_text(json.dumps({"report":report,"batches":combined_data},ensure_ascii=False,indent=2),encoding="utf-8")
+                st.download_button("⬇️ Bản đối chiếu voice + text", (root / "voice_text_alignment.json").read_bytes(),
+                                   file_name="voice_text_alignment.json",mime="application/json",on_click="ignore")
+
             for idx, (bi, chunk, bdur) in enumerate(vc):
-                bstart = bi * effective_batch
-                stt.markdown(f"### 🧠 Đợt {idx+1}/{len(vc)} — STT...")
-                tr = transcribe_file(client, chunk, stt_model, lang_code, cache_dir)
-                if lang_code is None:
-                    detected = detect_language(tr)
-                    st.info(f"🌐 Whisper: **{detected}**")
-                    effective_lang = "en" if detected.startswith("en") else "vi"
-                segs = normalize_segments(tr, bstart)
-                btext = "\n".join(f"[{x['start']:.2f}-{x['end']:.2f}] {x['text']}" for x in segs)
+                if internal_mode == "combined":
+                    data = combined_data[idx]; bstart = data["offset"]; effective_lang = data["language"]
+                    windows = data["windows"]; scenes = []
+                    stt.markdown(f"### ✂️ Đợt {idx+1}/{len(vc)} — Mô tả hình theo các câu đã khóa thời gian...")
+                    # Small visual-planning requests; scene IDs and timestamps remain fixed.
+                    for begin in range(0,len(windows),3):
+                        group = windows[begin:begin+3]
+                        scenes.extend(make_scene_plan(client,"",bstart,bdur,planner_model,scene_min,scene_max,max_scenes,cm_mode,
+                            language=effective_lang,enable_rich=enable_rich_overlay,char_lock=char_lock,
+                            enable_sfx=enable_sfx,enable_music=enable_music,user_script=script_text,
+                            use_script_mode="combined",style_mode=style_mode,locked_scenes=group))
+                    global_scenes.extend(dict(scene,start=scene["start"]+bstart,end=scene["end"]+bstart) for scene in scenes)
+                else:
+                    bstart = bi * effective_batch
+                    stt.markdown(f"### 🧠 Đợt {idx+1}/{len(vc)} — STT...")
+                    tr = transcribe_file(client, chunk, stt_model, lang_code, cache_dir)
+                    if lang_code is None:
+                        detected = detect_language(tr)
+                        st.info(f"🌐 Whisper: **{detected}**")
+                        effective_lang = "en" if detected.startswith("en") else "vi"
+                    segs = normalize_segments(tr, bstart)
+                    btext = "\n".join(f"[{x['start']:.2f}-{x['end']:.2f}] {x['text']}" for x in segs)
 
-                tc = len(vc); bscript = ""
-                if script_text and internal_mode in ("combined", "text_only"):
-                    lines = [l.strip() for l in script_text.split("\n") if l.strip()]
-                    lp = max(1, len(lines)//tc + 1)
-                    s_l = idx*lp; e_l = min(s_l+lp, len(lines))
-                    bscript = "\n".join(lines[s_l:e_l])
+                    tc = len(vc); bscript = ""
+                    if script_text and internal_mode in ("combined", "text_only"):
+                        lines = [l.strip() for l in script_text.split("\n") if l.strip()]
+                        lp = max(1, len(lines)//tc + 1)
+                        s_l = idx*lp; e_l = min(s_l+lp, len(lines))
+                        bscript = "\n".join(lines[s_l:e_l])
 
-                stt.markdown(f"### ✂️ Đợt {idx+1}/{len(vc)} — Lên kịch bản ({effective_lang})...")
-                scenes = make_scene_plan(client, btext, bstart, bdur, planner_model,
-                                         scene_min, scene_max, max_scenes, cm_mode,
-                                         language=effective_lang,
-                                         enable_rich=enable_rich_overlay,
-                                         char_lock=char_lock,
-                                         enable_sfx=enable_sfx,
-                                         enable_music=enable_music,
-                                         user_script=bscript,
-                                         use_script_mode=internal_mode,
-                                         style_mode=style_mode)
+                    stt.markdown(f"### ✂️ Đợt {idx+1}/{len(vc)} — Lên kịch bản ({effective_lang})...")
+                    scenes = make_scene_plan(client, btext, bstart, bdur, planner_model,
+                                             scene_min, scene_max, max_scenes, cm_mode,
+                                             language=effective_lang,
+                                             enable_rich=enable_rich_overlay,
+                                             char_lock=char_lock,
+                                             enable_sfx=enable_sfx,
+                                             enable_music=enable_music,
+                                             user_script=bscript,
+                                             use_script_mode=internal_mode,
+                                             style_mode=style_mode)
                 st.markdown(f"#### 📝 Đợt {idx+1}: {bdur:.1f}s → **{len(scenes)} cảnh**")
                 with st.expander("Chi tiết", expanded=False):
                     for si, s in enumerate(scenes, 1):
@@ -2036,9 +2326,11 @@ if audio:
                                    image_timeout, flux_steps, fair_share_enabled, circuit_breaker_enabled,
                                    prioritize_fast, chars={}, char_lock=char_lock,
                                    enable_arrows=enable_arrows, enable_shadow=enable_shadow,
-                                   enable_sfx=enable_sfx, sfx_vol=sfx_volume,
-                                   enable_music=enable_music, music_vol=music_volume,
-                                   seed_lock=seed_lock, style_mode=style_mode, language=effective_lang)
+                                   enable_sfx=enable_sfx if internal_mode != "combined" else False, sfx_vol=sfx_volume,
+                                   enable_music=enable_music if internal_mode != "combined" else False, music_vol=music_volume,
+                                   seed_lock=seed_lock, style_mode=style_mode,
+                                   language="en_exact" if internal_mode=="combined" and effective_lang=="en" else effective_lang,
+                                   strict_timing=internal_mode=="combined",timeline_offset=bstart)
                 sv = root / f"batch_final_{idx+1:03d}.mp4"
                 shutil.copy2(bvi, sv); bvids.append(sv)
                 all_s += len(scenes)
@@ -2046,7 +2338,10 @@ if audio:
 
             stt.markdown("### 🎬 Ghép video cuối...")
             fv = root / "video_final.mp4"
-            concat_batches(bvids, fv)
+            if internal_mode == "combined":
+                fv = combined_finish(bvids,src,global_scenes,root,enable_sfx,sfx_volume,enable_music,music_volume)
+            else:
+                concat_batches(bvids, fv)
             st.success(f"Hoàn thành! {all_s} cảnh ({style_mode} / {effective_lang} mode).")
             st.video(str(fv))
             st.download_button("⬇️ TẢI VIDEO", data=fv.read_bytes(),
