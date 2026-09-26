@@ -764,7 +764,7 @@ JSON FORMAT:
         user = f"Audio length: {batch_duration:.2f}s.\nMAX {expected} SCENES.\n\nTRANSCRIPT:\n{transcript_text}"
 
     # V10.3: Qwen cap 14000
-    MODEL_CAP = {"qwen/qwen3.8-27b": 30000, "openai/gpt-oss-120b": 40000, "openai/gpt-oss-20b": 9000}
+    MODEL_CAP = {"qwen/qwen3.8-27b": 15000, "openai/gpt-oss-120b": 40000, "openai/gpt-oss-20b": 9000}
     dyn_max = min(MODEL_CAP.get(model, 40000), max(50000, int(expected * 600 * 1.3)))
 
     raw = ""
