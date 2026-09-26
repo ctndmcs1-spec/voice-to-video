@@ -260,6 +260,7 @@ with st.sidebar:
 
     st.header("🎨 Overlay")
     overlay_box_style = st.selectbox("Kiểu khối chữ", ["Khối bo góc", "Kiểu chữ cũ"], index=0)
+    timed_text_enabled = st.checkbox("Khối chữ xuất hiện theo voice", value=True, help="Hiện tối đa 2 điểm nhấn mỗi cảnh nếu tìm được mốc voice. Không ép khớp từng từ.")
     enable_rich_overlay = st.checkbox("Overlay nhiều text box", value=True,
         help="Chỉ áp dụng cho Vietnamese mode")
     enable_arrows = st.checkbox("Vẽ mũi tên", value=True)
@@ -271,6 +272,7 @@ with st.sidebar:
         "Cố định: zoom_in_center", "Cố định: zoom_out_center",
         "Cố định: pan_left_to_right", "Cố định: pan_right_to_left",
         "Cố định: ken_burns_slow", "Cố định: static",
+        "Cố định: zoom_in_top_left", "Cố định: zoom_in_bottom_right",
     ], index=0)
 
     st.header("⏱️ Nhịp cảnh")
@@ -347,7 +349,7 @@ def transcribe_file(client, path, model, language=None, cache_dir=None):
             except Exception: pass
     with open(path, "rb") as f:
         kw = {"file": (Path(path).name, f.read()), "model": model,
-              "response_format": "verbose_json", "timestamp_granularities": ["segment"],
+              "response_format": "verbose_json", "timestamp_granularities": ["word", "segment"],
               "temperature": 0.0}
         if language: kw["language"] = language
         result = client.audio.transcriptions.create(**kw)
@@ -1443,6 +1445,62 @@ def overlay_place(width,height,x,y,occupied=()):
     return min(scored,key=lambda item:item[:2])[2]
 
 
+def save_overlay_layer(before, after, output_path, index, text):
+    a=np.array(before);b=np.array(after)
+    mask=np.any(a!=b,axis=2).astype(np.uint8)*255
+    layer=Image.fromarray(np.dstack((b,mask)), 'RGBA')
+    path=Path(output_path).with_suffix(f'.text{index}.png');layer.save(path)
+    return {'file':path.name,'text':str(text)}
+
+
+def prepare_overlay_timing(image_path, words, start, duration, enabled=True):
+    p=Path(image_path);meta=p.with_suffix('.overlay.json')
+    if not meta.exists():return
+    data=json.loads(meta.read_text(encoding='utf-8'))
+    selected=[w for w in words if float(w['end'])>start and float(w['start'])<start+duration]
+    norms=[w.get('norm') or combined_tokens(w.get('text',''))[0]['norm'] for w in selected if combined_tokens(w.get('text',''))]
+    selected=[w for w in selected if combined_tokens(w.get('text',''))]
+    count=0;last_end=-10.
+    for layer in data.get('layers',[]):
+        layer.pop('start',None);layer.pop('end',None)
+        needle=[w['norm'] for w in combined_tokens(layer.get('text',''))]
+        if not enabled or count>=2 or not needle:continue
+        for i in range(len(norms)-len(needle)+1):
+            if norms[i:i+len(needle)]!=needle:continue
+            a=max(0.,float(selected[i]['start'])-start)
+            b=min(duration,max(a+2.5,float(selected[i+len(needle)-1]['end'])-start+.6))
+            if b-a<.5 or a<last_end+.5:continue
+            layer.update(start=a,end=b);count+=1;last_end=b;break
+    meta.write_text(json.dumps(data,ensure_ascii=False),encoding='utf-8')
+
+
+def load_render_layers(image_path):
+    p=Path(image_path)
+    try:
+        data=json.loads(p.with_suffix('.overlay.json').read_text(encoding='utf-8'))
+        if data.get('digest')!=hashlib.sha256(p.read_bytes()).hexdigest():return image_path,[]
+        base=p.parent/data['base']
+        layers=[]
+        if not base.exists():return image_path,[]
+        for spec in data.get('layers',[]):
+            rgba=np.array(Image.open(p.parent/spec['file']).convert('RGBA'))
+            layers.append((cv2.cvtColor(rgba[:,:,:3],cv2.COLOR_RGB2BGR),rgba[:,:,3:4].astype(np.float32)/255.,spec))
+        return base,layers
+    except (OSError,ValueError,KeyError,TypeError):return image_path,[]
+
+
+def composite_render_layers(frame,layers,t):
+    for color,mask,spec in layers:
+        opacity=1.
+        if 'start' in spec:
+            a,b=spec['start'],spec['end']
+            if not a<=t<b:continue
+            opacity=min(1.,(t-a)/.16,(b-t)/.2)
+        alpha=mask*max(0.,opacity)
+        frame=(frame*(1.-alpha)+color*alpha).astype(np.uint8)
+    return frame
+
+
 def overlay_metadata(output_path,rectangles):
     p=Path(output_path)
     data={'digest':hashlib.sha256(p.read_bytes()).hexdigest(),'rectangles':[list(r) for r in rectangles]}
@@ -1536,7 +1594,10 @@ def add_comic_overlays(image_path, title, callout_type, callout_text, callout_si
         overlay_write(draw,layout,x,y,'#fff7ec' if (horror or full) else '#111111',stroke,'#151515')
         if not full:draw.line((x,y+th+8,x+tw,y+th+8),fill='#8b0000' if horror else '#d32f2f',width=3)
         rectangles.append((int(x)-4,int(y)-4,int(x+tw)+4,int(y+th)+12))
+    base_path=Path(output_path).with_suffix('.base.png');img.save(base_path)
+    layers=[]
     if callout_text and callout_type!='none':
+        before_layer=img.copy()
         layout=overlay_fit(draw,callout_text,355,155,30 if card else 26)
         box=layout[3];tw,th=box[2]-box[0],box[3]-box[1];w,h=tw+44,th+36
         cx,cy=(WIDTH*.28,HEIGHT*.45) if callout_side=='left' else (WIDTH*.74,HEIGHT*.42)
@@ -1558,9 +1619,11 @@ def add_comic_overlays(image_path, title, callout_type, callout_text, callout_si
                 draw.ellipse((x+20,b+19,x+25,b+24),fill='white',outline='#222222')
         overlay_write(draw,layout,x+22,y+18,fill)
         occupied.append((x,y,r,min(HEIGHT-25,b+(25 if not card else 0))));rectangles.extend(occupied)
+        layers.append(save_overlay_layer(before_layer,img,output_path,len(layers),callout_text))
     if text_boxes:
         filtered=smart_filter_tbs(text_boxes,callout_text,callout_type,callout_side)
         for tb in filtered:
+            before_layer=img.copy()
             rect=draw_rich_text_box(img,draw,tb,enable_shadow,occupied)
             if not rect:continue
             rectangles.append(rect)
@@ -1572,7 +1635,11 @@ def add_comic_overlays(image_path, title, callout_type, callout_text, callout_si
                     # Start outside the box so the arrow does not cross its letters.
                     dx,dy=ex-sx,ey-sy;factor=min((rect[2]-rect[0])/2/max(abs(dx),.001),(rect[3]-rect[1])/2/max(abs(dy),.001))
                     if factor<1:draw_arrow(draw,(sx+dx*factor,sy+dy*factor),(ex,ey),COLOR_MAP.get(tb.get('color'),'#212121'),w=4)
+            layers.append(save_overlay_layer(before_layer,img,output_path,len(layers),tb.get('text','')))
     img.save(output_path,quality=95);overlay_metadata(output_path,rectangles)
+    meta=Path(output_path).with_suffix('.overlay.json')
+    data=json.loads(meta.read_text());data.update(base=base_path.name,layers=layers)
+    meta.write_text(json.dumps(data,ensure_ascii=False),encoding='utf-8')
 
 # ============================================================
 # HAND + TRAJECTORY
@@ -1723,6 +1790,7 @@ def interp_motion(kfs, p):
 # ============================================================
 def render_kttv(image_path, duration, output_path, hand_path, motion="zoom_in_center",
                 style_mode="comic", language="vi"):
+    image_path, text_layers = load_render_layers(image_path)
     tf = max(1, round(duration * FPS))
     text_bounds = overlay_bounds(image_path, language in ("en", "en_exact") and style_mode == "comic")
     use_full_frame = (language in ("en", "en_exact") and style_mode == "comic")
@@ -1802,6 +1870,7 @@ def render_kttv(image_path, duration, output_path, hand_path, motion="zoom_in_ce
             fo = crop_full_frame(fc, sc, cu, cyu, protected_bounds=text_bounds)
         else:
             fo = compose_frame(tb, crop_content_motion(fc, sc, cu, cyu, protected_bounds=text_bounds))
+        fo = composite_render_layers(fo, text_layers, fi/FPS)
         proc.stdin.write(fo.tobytes())
     proc.stdin.close(); proc.wait()
     if proc.returncode != 0: raise RuntimeError("FFmpeg fail (style 1)")
@@ -1812,6 +1881,7 @@ def render_hybrid(image_path, duration, output_path, hand_path, motion="zoom_in_
     if language in ("en", "en_exact") and style_mode == "comic":
         return render_kttv(image_path, duration, output_path, hand_path, motion, style_mode, language)
 
+    image_path, text_layers = load_render_layers(image_path)
     tf = max(1, round(duration * FPS))
     text_bounds = overlay_bounds(image_path, language in ("en", "en_exact") and style_mode == "comic")
     dd = max(1.5, min(duration - 0.8, duration * DRAW_DURATION_RATIO))
@@ -1869,11 +1939,13 @@ def render_hybrid(image_path, duration, output_path, hand_path, motion="zoom_in_
         cw = int(WIDTH/sc); chh = int(ch_use/sc)
         ccx = max(cw//2, min(WIDTH-cw//2, int(cu))); ccy = max(chh//2, min(ch_use-chh//2, int(cyu)))
         fo = compose_frame(tb, crop_content_motion(fc, sc, ccx, ccy, protected_bounds=text_bounds))
+        fo = composite_render_layers(fo, text_layers, fi/FPS)
         proc.stdin.write(fo.tobytes())
     proc.stdin.close(); proc.wait()
 
 def render_pure(image_path, duration, output_path, motion="zoom_in_center",
                 style_mode="comic", language="vi"):
+    image_path, text_layers = load_render_layers(image_path)
     tf = max(1, round(duration * FPS))
     text_bounds = overlay_bounds(image_path, language in ("en", "en_exact") and style_mode == "comic")
     of = cv2.resize(cv2.imread(str(image_path)), (WIDTH, HEIGHT))
@@ -1896,6 +1968,7 @@ def render_pure(image_path, duration, output_path, motion="zoom_in_center",
             fo = crop_full_frame(cb, s, cx, cy, protected_bounds=text_bounds)
         else:
             fo = compose_frame(tb, crop_content_motion(cb, s, cx, cy, protected_bounds=text_bounds))
+        fo = composite_render_layers(fo, text_layers, fi/FPS)
         proc.stdin.write(fo.tobytes())
     proc.stdin.close(); proc.wait()
 
@@ -1905,6 +1978,7 @@ def render_classic(image_path, duration, output_path, hand_path, motion="zoom_in
     if language in ("en", "en_exact") and style_mode == "comic":
         return render_kttv(image_path, duration, output_path, hand_path, motion, style_mode, language)
 
+    image_path, text_layers = load_render_layers(image_path)
     tf = max(1, round(duration * FPS))
     df = int(max(1.5, min(duration-0.8, duration*DRAW_DURATION_RATIO))*FPS); rf = int(0.35*FPS)
     of = cv2.resize(cv2.imread(str(image_path)), (WIDTH, HEIGHT))
@@ -1944,6 +2018,7 @@ def render_classic(image_path, duration, output_path, hand_path, motion="zoom_in
         fc = (cb*a + wc*(1.0-a)).astype(np.uint8)
         if hv: paste_hand(fc, hb, ha, hx-tx, hy-ty)
         fo = compose_frame(tb, fc)
+        fo = composite_render_layers(fo, text_layers, fi/FPS)
         proc.stdin.write(fo.tobytes())
     proc.stdin.close(); proc.wait()
 
@@ -2166,6 +2241,7 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
             if dur <= 0: raise ValueError("Cảnh không có khung hình hợp lệ.")
         else:
             dur = max(1.0, float(s["end"]) - float(s["start"]))
+        prepare_overlay_timing(im, s.get("overlay_words",[]), float(s["start"]), dur, globals().get("timed_text_enabled",True))
         mo = s.get("camera_motion", "zoom_in_center")
         if strict_timing and dur < 1.85: render_pure(im, dur, vd, mo, style_mode, language)
         elif "1." in style or "Vẽ 3 phase" in style: render_kttv(im, dur, vd, hand_path, mo, style_mode, language)
@@ -2373,6 +2449,12 @@ if audio:
                                              user_script=bscript,
                                              use_script_mode=internal_mode,
                                              style_mode=style_mode)
+                # Reuse existing word timestamps; no additional transcription/API call.
+                if internal_mode == "combined":
+                    overlay_words=[dict(w,start=float(w['start'])-bstart,end=float(w['end'])-bstart) for w in corrected if float(w['end'])>bstart and float(w['start'])<bstart+bdur]
+                else:
+                    overlay_words,_=combined_words(tr.model_dump() if hasattr(tr,"model_dump") else tr,0.,bdur,idx)
+                for scene in scenes:scene['overlay_words']=overlay_words
                 st.markdown(f"#### 📝 Đợt {idx+1}: {bdur:.1f}s → **{len(scenes)} cảnh**")
                 with st.expander("Chi tiết", expanded=False):
                     for si, s in enumerate(scenes, 1):
