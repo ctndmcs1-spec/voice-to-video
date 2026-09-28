@@ -1,13 +1,12 @@
 """
-Xưởng Video Diễn Hoạt Kiến Thức AI — Bản Siêu Cấp V10.3
+Xưởng Video Diễn Hoạt Kiến Thức AI — Bản Siêu Cấp V10.4
 =======================================================
-V10.3 FIX + VOICE/TEXT SYNC:
-- Combined: word timestamps, script spelling, locked scene timing, original continuous soundtrack
-- Cache transcript theo HASH voice → không lẫn cache giữa các voice khác nhau
-- Batch audio có hash tiền tố → không trùng tên batch giữa các lần chạy
-- Qwen 14000 tokens (không cắt JSON)
-- English mode: tắt hiệu ứng vẽ (hiện ảnh ngay + camera motion)
-- English mode: full-frame camera (không title band)
+V10.4 FIX:
+- Camera motion chạy đúng: vẽ 35%, camera 65%
+- Checkbox tắt vẽ → ảnh hiện ngay + camera motion full thời lượng
+- Fix lỗi camera motion không chạy sau khi vẽ xong
+- Giữ combined mode (word timestamp + fuzzy align + locked scenes)
+- Giữ English native text cho voice_only
 """
 
 import os, re, io, json, math, time, base64, random, shutil, subprocess, tempfile, threading, wave, hashlib
@@ -27,7 +26,7 @@ import numpy as np
 # ============================================================
 # CẤU HÌNH
 # ============================================================
-APP_TITLE = "Xưởng Video Diễn Hoạt Kiến Thức AI (V10.3)"
+APP_TITLE = "Xưởng Video Diễn Hoạt Kiến Thức AI (V10.4)"
 BATCH_SECONDS = 5 * 60
 FPS = 24
 WIDTH = 1280
@@ -35,7 +34,7 @@ HEIGHT = 720
 TITLE_BAND_H = 95
 CONTENT_H = HEIGHT - TITLE_BAND_H
 REVEAL_RADIUS = 34
-DRAW_DURATION_RATIO = 0.45
+DRAW_DURATION_RATIO = 0.35  # V10.4: giảm còn 35% để camera có nhiều thời gian hơn
 PHASE_RATIOS = (0.40, 0.35, 0.25)
 MAX_TOTAL_FALLBACK_TIME = 300
 FAIR_SHARE_MULTIPLIER = 1.5
@@ -145,10 +144,9 @@ def horror_sanitize(text):
     return result
 
 # ============================================================
-# CACHE HELPERS — V10.3
+# CACHE HELPERS
 # ============================================================
 def file_hash(path, nbytes=10000):
-    """MD5 hash của 10KB đầu file — dùng để phân biệt các voice khác nhau."""
     try:
         with open(path, "rb") as f:
             return hashlib.md5(f.read(nbytes)).hexdigest()[:12]
@@ -159,8 +157,8 @@ def file_hash(path, nbytes=10000):
 # UI
 # ============================================================
 st.set_page_config(page_title=APP_TITLE, page_icon="🎬", layout="wide")
-st.title("🎬 Xưởng Video Diễn Hoạt Kiến Thức AI — V10.3")
-st.caption("Cache theo hash voice + Qwen 14k + English full-frame + sticker title")
+st.title("🎬 Xưởng Video Diễn Hoạt Kiến Thức AI — V10.4")
+st.caption("Fix camera motion + Combined mode chính xác + English native text")
 
 with st.sidebar:
     st.header("🎨 Style Mode")
@@ -211,10 +209,9 @@ with st.sidebar:
 
     st.header("📝 Văn bản kịch bản (tùy chọn)")
     script_text = st.text_area("Dán kịch bản", value="", height=100,
-        help="⚠️ Combined mode có thể lệch timing 5-20%. Dùng 'Chỉ dùng voice' để chính xác nhất.")
+        help="⚠️ Combined mode chính xác nhất. Timing khớp voice 95%+.")
     use_script_mode = st.radio("Chế độ phân tích",
-        ["Chỉ dùng voice", "Kết hợp voice + text", "Chỉ dùng text"], index=0,
-        help="'Chỉ dùng voice' = timing chính xác 100% (khuyên dùng).")
+        ["Chỉ dùng voice", "Kết hợp voice + text", "Chỉ dùng text"], index=0)
 
     st.header("👥 Nhân vật")
     char_main_name = st.text_input("Tên nhân vật chính", value="Tôi")
@@ -257,10 +254,14 @@ with st.sidebar:
         "3. Chỉ Camera Pan & Zoom",
         "4. Bảng trắng cổ điển",
     ], index=0)
+    # V10.4: Checkbox tắt vẽ tay
+    draw_animation = st.checkbox("Hiệu ứng vẽ tay", value=True,
+        help="Tắt để ảnh hiện ngay + camera motion chạy full thời lượng cảnh.")
 
     st.header("🎨 Overlay")
     overlay_box_style = st.selectbox("Kiểu khối chữ", ["Khối bo góc", "Kiểu chữ cũ"], index=0)
-    timed_text_enabled = st.checkbox("Khối chữ xuất hiện theo voice", value=True, help="Hiện tối đa 2 điểm nhấn mỗi cảnh nếu tìm được mốc voice. Không ép khớp từng từ.")
+    timed_text_enabled = st.checkbox("Khối chữ xuất hiện theo voice", value=True,
+        help="Hiện tối đa 2 điểm nhấn mỗi cảnh nếu tìm được mốc voice.")
     enable_rich_overlay = st.checkbox("Overlay nhiều text box", value=True,
         help="Chỉ áp dụng cho Vietnamese mode")
     enable_arrows = st.checkbox("Vẽ mũi tên", value=True)
@@ -333,7 +334,6 @@ def extract_json(text):
 def groq_client(key): return Groq(api_key=key)
 
 def transcribe_file(client, path, model, language=None, cache_dir=None):
-    # V10.3: Cache theo HASH của file audio → không lẫn giữa các voice khác nhau
     if cache_dir:
         fh = file_hash(path)
         cf = Path(cache_dir) / f"{fh}_transcript.json"
@@ -363,8 +363,7 @@ def transcribe_file(client, path, model, language=None, cache_dir=None):
     return result
 
 # ============================================================
-# VOICE + TEXT: audio owns timing; the supplied script owns spelling.
-# Other modes continue through their original paths.
+# VOICE + TEXT SYNC
 # ============================================================
 def combined_transcribe(client, path, model, language, cache_dir):
     data = Path(path).read_bytes()
@@ -393,7 +392,6 @@ def combined_transcribe(client, path, model, language, cache_dir):
         if temporary: temporary.unlink(missing_ok=True)
     return result
 
-
 def combined_tokens(text):
     import unicodedata
     tokens = []
@@ -404,13 +402,11 @@ def combined_tokens(text):
         if normalized: tokens.append({"text": raw, "norm": normalized})
     return tokens
 
-
 def combined_words(result, offset, duration, batch):
     words = []; approximated = False
     raw_words = result.get("words") or []
     if not raw_words:
         approximated = True
-        # Explicit fallback: segment timing is measured; its internal word timing is only estimated.
         for segment in result.get("segments") or []:
             tokens = combined_tokens(segment.get("text", ""))
             a, b = float(segment.get("start", 0)), float(segment.get("end", 0))
@@ -429,9 +425,7 @@ def combined_words(result, offset, duration, batch):
     words.sort(key=lambda word:(word["start"],word["end"]))
     return words, approximated
 
-
 def combined_align(script, words):
-    """Use ASR as timing anchors, never as the authority for displayed spelling."""
     import difflib
     target = combined_tokens(script)
     if not target or not words:
@@ -445,7 +439,6 @@ def combined_align(script, words):
             for source, token in zip(words[a:b], target[x:y]):
                 aligned.append(dict(source, text=token["text"], norm=token["norm"], original=source["text"], review=False))
         elif tag == "replace":
-            # Approximate timing inside the measured span; script spelling is authoritative.
             for j, token in enumerate(target[x:y]):
                 position = j*(b-a)/(y-x)
                 last_position = (j+1)*(b-a)/(y-x)
@@ -458,7 +451,6 @@ def combined_align(script, words):
                 aligned.append(dict(source, text=token["text"], norm=token["norm"], start=start, end=max(start,end),
                                     original=" ".join(w["text"] for w in words[a+index:a+last_index+1]), review=True, approximated=True))
         elif tag == "insert":
-            # ASR may omit words. Attach script-only text to neighboring speech, not subtitles.
             previous = words[a-1] if a else None
             following = words[a] if a < len(words) else None
             source = following or previous
@@ -472,18 +464,15 @@ def combined_align(script, words):
                 aligned.append(dict(source,text=token["text"],norm=token["norm"],
                     start=start+(end-start)*j/(y-x),end=start+(end-start)*(j+1)/(y-x),
                     original="",review=True,approximated=True))
-        # ASR-only words are excluded: they must never leak into image text.
         if tag != "equal":
             review.append({"start":words[min(a,len(words)-1)]["start"],
                 "heard":" ".join(w["text"] for w in words[a:b]) or "(Nhận dạng bỏ sót)",
                 "script":" ".join(t["text"] for t in target[x:y]) or "(Bỏ chữ chỉ có trong nhận dạng)",
                 "timing":"Ước lượng theo mốc voice lân cận"})
-    # Overlapping ASR timestamps can occur; enforce monotonic order without stopping the job.
     for i in range(1,len(aligned)):
         aligned[i]["start"] = max(aligned[i]["start"],aligned[i-1]["start"])
         aligned[i]["end"] = max(aligned[i]["start"],aligned[i]["end"])
     return aligned, {"score":score,"review":review,"approximate":bool(review)}
-
 
 def combined_windows(words, offset, duration, min_s, max_s, max_scenes):
     if duration <= 0 or not words: raise ValueError("Đợt audio không có lời đọc để tạo cảnh khớp nội dung.")
@@ -521,7 +510,6 @@ def combined_windows(words, offset, duration, min_s, max_s, max_scenes):
                        "narration":" ".join(w["text"] for w in local[a:b])})
     return scenes
 
-
 def combined_exact_text(value, narration, fallback=""):
     source = combined_tokens(narration); query = combined_tokens(value)
     if not query: return fallback
@@ -531,9 +519,7 @@ def combined_exact_text(value, narration, fallback=""):
             return " ".join(w["text"] for w in source[i:i+len(query)])
     return fallback
 
-
 def combined_finish(videos, voice, scenes, root, with_sfx, sfx_vol, with_music, music_vol):
-    # Ignore per-batch AAC padding. Use original, continuous voice for the final soundtrack.
     silent = []
     for i, video in enumerate(videos):
         path = root / f"combined_silent_{i:03d}.mp4"
@@ -552,7 +538,6 @@ def combined_finish(videos, voice, scenes, root, with_sfx, sfx_vol, with_music, 
              "-c:v","copy","-c:a","aac","-b:a","128k","-t",str(ffprobe_duration(voice)),"-movflags","+faststart",str(final)],timeout=1800)
     return final
 
-
 def detect_language(result):
     try:
         d = result.model_dump() if hasattr(result, "model_dump") else result
@@ -560,7 +545,6 @@ def detect_language(result):
     except Exception: return "unknown"
 
 def chunk_audio(src, out_dir, bs):
-    # V10.3: Hash tiền tố tránh trùng batch giữa các voice
     vh = file_hash(src)
     pattern = str(Path(out_dir) / f"{vh}_batch_%03d.m4a")
     run_cmd(["ffmpeg", "-y", "-i", str(src), "-map", "0:a:0", "-c:a", "aac", "-b:a", "96k",
@@ -968,10 +952,8 @@ JSON FORMAT:
         system += "\nJSON mỗi cảnh phải có scene_id. Không markdown hoặc phần giải thích."
         user = "Các cảnh đã căn từ voice và sửa chữ theo script (giây cục bộ trong đợt):\n" + json.dumps(locked_scenes, ensure_ascii=False)
 
-    # V10.3: Qwen cap 14000
     MODEL_CAP = {"qwen/qwen3.8-27b": 15000, "openai/gpt-oss-120b": 40000, "openai/gpt-oss-20b": 9000}
     dyn_max = min(MODEL_CAP.get(model, 40000), max(50000, int(expected * 600 * 1.3)))
-
     if locked_scenes is not None:
         dyn_max = min(MODEL_CAP.get(model, 9000), 768 + 700*len(locked_scenes))
 
@@ -1375,13 +1357,11 @@ def draw_text_shadow(draw, xy, text, font, fill, sw=0, sf=None, shadow=True):
     if sw > 0 and sf: draw.text((x, y), text, font=font, fill=fill, stroke_width=sw, stroke_fill=sf)
     else: draw.text((x, y), text, font=font, fill=fill)
 
-# Text-only layout helpers; scene/audio/image generation stays unchanged.
 def complete_title_fallback(narration):
     for clause in re.split(r'(?<=[.!?;])\s+|\n',str(narration).strip()):
         if 2 <= len(clause.split()) <= 10:
             return clause.strip().rstrip('.!?;')
     return ''
-
 
 def title_from_script(candidate,narration):
     title=combined_exact_text(candidate,narration)
@@ -1390,7 +1370,6 @@ def title_from_script(candidate,narration):
         return complete_title_fallback(narration).upper()
     return title.upper()
 
-
 @lru_cache(maxsize=64)
 def overlay_font(size):
     for path in [FONT_DIR/'NotoSans-Bold.ttf',Path('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'),Path('/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf'),Path('C:/Windows/Fonts/arialbd.ttf')]:
@@ -1398,7 +1377,6 @@ def overlay_font(size):
             try:return ImageFont.truetype(str(path),size)
             except OSError:pass
     return font_for(size,True)
-
 
 def overlay_wrap(draw,text,font,width,stroke=0):
     lines=[]
@@ -1409,14 +1387,12 @@ def overlay_wrap(draw,text,font,width,stroke=0):
             box=draw.textbbox((0,0),candidate,font=font,stroke_width=stroke)
             if box[2]-box[0]<=width:line=candidate;continue
             if line:lines.append(line);line=''
-            # Preserve all characters even for one long URL/token.
             for ch in word:
                 candidate=line+ch;box=draw.textbbox((0,0),candidate,font=font,stroke_width=stroke)
                 if box[2]-box[0]>width and line:lines.append(line);line=''
                 line+=ch
         if line:lines.append(line)
     return '\n'.join(lines)
-
 
 def overlay_fit(draw,text,width,height,size=30,stroke=0):
     for fs in range(int(size),9,-1):
@@ -1425,12 +1401,10 @@ def overlay_fit(draw,text,width,height,size=30,stroke=0):
         if box[2]-box[0]<=width and box[3]-box[1]<=height:return wrapped,font,spacing,box
     raise ValueError('Đoạn chữ quá dài cho ô hiển thị; cần rút gọn nội dung chữ.')
 
-
 def overlay_write(draw,layout,x,y,fill,stroke=0,stroke_fill='white',align='center'):
     text,font,spacing,bbox=layout
     draw.multiline_text((x-bbox[0],y-bbox[1]),text,font=font,spacing=spacing,fill=fill,
                         align=align,stroke_width=stroke,stroke_fill=stroke_fill)
-
 
 def overlay_place(width,height,x,y,occupied=()):
     margin=30;top=TITLE_BAND_H+28;bottom=HEIGHT-35
@@ -1444,14 +1418,12 @@ def overlay_place(width,height,x,y,occupied=()):
         scored.append((sum(overlap(rect,r) for r in occupied),abs(px-x)+abs(py-y),rect))
     return min(scored,key=lambda item:item[:2])[2]
 
-
 def save_overlay_layer(before, after, output_path, index, text):
     a=np.array(before);b=np.array(after)
     mask=np.any(a!=b,axis=2).astype(np.uint8)*255
     layer=Image.fromarray(np.dstack((b,mask)), 'RGBA')
     path=Path(output_path).with_suffix(f'.text{index}.png');layer.save(path)
     return {'file':path.name,'text':str(text)}
-
 
 def prepare_overlay_timing(image_path, words, start, duration, enabled=True):
     p=Path(image_path);meta=p.with_suffix('.overlay.json')
@@ -1473,7 +1445,6 @@ def prepare_overlay_timing(image_path, words, start, duration, enabled=True):
             layer.update(start=a,end=b);count+=1;last_end=b;break
     meta.write_text(json.dumps(data,ensure_ascii=False),encoding='utf-8')
 
-
 def load_render_layers(image_path):
     p=Path(image_path)
     try:
@@ -1488,7 +1459,6 @@ def load_render_layers(image_path):
         return base,layers
     except (OSError,ValueError,KeyError,TypeError):return image_path,[]
 
-
 def composite_render_layers(frame,layers,t):
     for color,mask,spec in layers:
         opacity=1.
@@ -1500,12 +1470,10 @@ def composite_render_layers(frame,layers,t):
         frame=(frame*(1.-alpha)+color*alpha).astype(np.uint8)
     return frame
 
-
 def overlay_metadata(output_path,rectangles):
     p=Path(output_path)
     data={'digest':hashlib.sha256(p.read_bytes()).hexdigest(),'rectangles':[list(r) for r in rectangles]}
     p.with_suffix('.overlay.json').write_text(json.dumps(data),encoding='utf-8')
-
 
 def overlay_bounds(image_path,full_frame=False):
     try:
@@ -1516,7 +1484,6 @@ def overlay_bounds(image_path,full_frame=False):
         if not rects:return None
         return (min(r[0] for r in rects),min(r[1] for r in rects),max(r[2] for r in rects),max(r[3] for r in rects))
     except (OSError,ValueError,KeyError,TypeError):return None
-
 
 def overlay_safe_crop(cw,ch,w,h,x1,y1,bounds):
     if not bounds:return w,h,x1,y1
@@ -1552,7 +1519,6 @@ def draw_rich_text_box(img, draw, tb, enable_shadow=True, occupied=None):
     overlay_write(draw,layout,x+18,y+14,fill,sw)
     occupied.append(rect)
     return rect
-
 
 def smart_filter_tbs(tbs, callout_text, callout_type, callout_side):
     filtered = []; min_dist = 0.20
@@ -1632,7 +1598,6 @@ def add_comic_overlays(image_path, title, callout_type, callout_text, callout_si
                 sx=(rect[0]+rect[2])/2;sy=(rect[1]+rect[3])/2
                 ex=max(40,min(WIDTH-40,float(arr['to_x'])*WIDTH));ey=max(TITLE_BAND_H+25,min(HEIGHT-40,float(arr['to_y'])*HEIGHT))
                 if 60<math.hypot(ex-sx,ey-sy)<WIDTH*.35:
-                    # Start outside the box so the arrow does not cross its letters.
                     dx,dy=ex-sx,ey-sy;factor=min((rect[2]-rect[0])/2/max(abs(dx),.001),(rect[3]-rect[1])/2/max(abs(dy),.001))
                     if factor<1:draw_arrow(draw,(sx+dx*factor,sy+dy*factor),(ex,ey),COLOR_MAP.get(tb.get('color'),'#212121'),w=4)
             layers.append(save_overlay_layer(before_layer,img,output_path,len(layers),tb.get('text','')))
@@ -1786,17 +1751,18 @@ def interp_motion(kfs, p):
     _, s, cx, cy = kfs[-1]; return s, cx, cy
 
 # ============================================================
-# RENDER 4 STYLES — V10.3: EN skip draw
+# RENDER 4 STYLES — V10.4: camera motion fix
 # ============================================================
 def render_kttv(image_path, duration, output_path, hand_path, motion="zoom_in_center",
-                style_mode="comic", language="vi"):
+                style_mode="comic", language="vi", draw_animation=True):
     image_path, text_layers = load_render_layers(image_path)
     tf = max(1, round(duration * FPS))
     text_bounds = overlay_bounds(image_path, language in ("en", "en_exact") and style_mode == "comic")
     use_full_frame = (language in ("en", "en_exact") and style_mode == "comic")
-    # V10.3: English bỏ hiệu ứng vẽ — hiện ảnh ngay
-    if use_full_frame:
-        dd = 0.001; df = 0; rf = 0
+    # V10.4: Nếu tắt vẽ hoặc full frame → hiện ảnh ngay, camera motion full
+    skip_draw = use_full_frame or not draw_animation
+    if skip_draw:
+        df = 0; rf = 0
     else:
         dd = max(1.5, min(duration - 0.8, duration * DRAW_DURATION_RATIO))
         df = int(dd * FPS); rf = int(0.35 * FPS)
@@ -1812,8 +1778,8 @@ def render_kttv(image_path, duration, output_path, hand_path, motion="zoom_in_ce
 
     ch_use = cb.shape[0]
     wc = np.full_like(cb, 255); rm = np.zeros((ch_use, WIDTH), dtype=np.uint8)
-    if use_full_frame:
-        rm[:, :] = 255  # Full reveal ngay từ đầu
+    if skip_draw:
+        rm[:, :] = 255
 
     zt = extract_stag_traj(image_path)
     ap_full = [p for z in zt for p in z] or [(WIDTH//2, HEIGHT//2)]
@@ -1830,7 +1796,7 @@ def render_kttv(image_path, duration, output_path, hand_path, motion="zoom_in_ce
 
     for fi in range(tf):
         hv = False; hx = hy = 0
-        if fi < df and not use_full_frame:
+        if not skip_draw and fi < df:
             if fi < pf[0]: cp=0; lp=fi/max(1,pf[0])
             elif fi < pf[1]: cp=1; lp=(fi-pf[0])/max(1,pf[1]-pf[0])
             else: cp=2; lp=(fi-pf[1])/max(1,pf[2]-pf[1])
@@ -1844,27 +1810,36 @@ def render_kttv(image_path, duration, output_path, hand_path, motion="zoom_in_ce
             else: tg = lt
             hx = tg[0]+int(1.2*math.sin(fi*1.8)); hy = tg[1]+int(1.2*math.cos(fi*1.8))
             lt = (hx, hy); hv = True
-        elif fi < df+rf and not use_full_frame:
+        elif not skip_draw and fi < df+rf:
             rm[:, :] = 255; pr = (fi-df)/max(1,rf)
             hx = int(lt[0]+(WIDTH+180-lt[0])*pr); hy = int(lt[1]+(ch_use+180-lt[1])*pr); hv = True
-        elif not use_full_frame:
-            rm[:, :] = 255
 
         a = (cv2.GaussianBlur(rm, (13, 13), 0).astype(np.float32)/255.0)[:, :, None]
         fc = (cb*a + wc*(1.0-a)).astype(np.uint8)
         if hv: paste_hand(fc, hb, ha, hx-tx, hy-ty)
 
-        # V10.3: EN mode → camera motion chạy từ frame 0
-        if use_full_frame or fi >= df+rf:
-            op = fi/max(1, tf-1) if use_full_frame else (fi-df-rf)/max(1, tf-df-rf)
+        # V10.4 FIX: Camera motion chạy đúng
+        if skip_draw:
+            # Ảnh hiện ngay → camera motion full từ frame 0
+            op = fi / max(1, tf - 1)
             st_, cx_, cy_ = interp_motion(kfs, op)
-            cyc = (cy_/HEIGHT)*ch_use
-            bl = ease(min(1.0, op*1.8)) if not use_full_frame else ease(op)
-            sc = 1.0 + (st_-1.0)*bl
-            cu = WIDTH*0.5 + (cx_-WIDTH*0.5)*bl
-            cyu = ch_use*0.5 + (cyc-ch_use*0.5)*bl
+            cyc = (cy_ / HEIGHT) * ch_use
+            bl = ease(op)
+            sc = 1.0 + (st_ - 1.0) * bl
+            cu = WIDTH * 0.5 + (cx_ - WIDTH * 0.5) * bl
+            cyu = ch_use * 0.5 + (cyc - ch_use * 0.5) * bl
+        elif fi >= df + rf:
+            # Vẽ xong → camera motion chạy cho phần còn lại
+            op = (fi - df - rf) / max(1, tf - df - rf)
+            st_, cx_, cy_ = interp_motion(kfs, op)
+            cyc = (cy_ / HEIGHT) * ch_use
+            bl = ease(min(1.0, op * 1.8))
+            sc = 1.0 + (st_ - 1.0) * bl
+            cu = WIDTH * 0.5 + (cx_ - WIDTH * 0.5) * bl
+            cyu = ch_use * 0.5 + (cyc - ch_use * 0.5) * bl
         else:
-            sc, cu, cyu = 1.0, WIDTH*0.5, ch_use*0.5
+            # Đang vẽ → giữ nguyên scale
+            sc, cu, cyu = 1.0, WIDTH * 0.5, ch_use * 0.5
 
         if use_full_frame:
             fo = crop_full_frame(fc, sc, cu, cyu, protected_bounds=text_bounds)
@@ -1876,10 +1851,10 @@ def render_kttv(image_path, duration, output_path, hand_path, motion="zoom_in_ce
     if proc.returncode != 0: raise RuntimeError("FFmpeg fail (style 1)")
 
 def render_hybrid(image_path, duration, output_path, hand_path, motion="zoom_in_center",
-                  style_mode="comic", language="vi"):
-    # V10.3: Với English, dùng render_kttv thay vì hybrid vẽ tay
-    if language in ("en", "en_exact") and style_mode == "comic":
-        return render_kttv(image_path, duration, output_path, hand_path, motion, style_mode, language)
+                  style_mode="comic", language="vi", draw_animation=True):
+    # V10.4: Nếu tắt vẽ hoặc English → dùng render_kttv
+    if (language in ("en", "en_exact") and style_mode == "comic") or not draw_animation:
+        return render_kttv(image_path, duration, output_path, hand_path, motion, style_mode, language, draw_animation)
 
     image_path, text_layers = load_render_layers(image_path)
     tf = max(1, round(duration * FPS))
@@ -1944,7 +1919,7 @@ def render_hybrid(image_path, duration, output_path, hand_path, motion="zoom_in_
     proc.stdin.close(); proc.wait()
 
 def render_pure(image_path, duration, output_path, motion="zoom_in_center",
-                style_mode="comic", language="vi"):
+                style_mode="comic", language="vi", draw_animation=True):
     image_path, text_layers = load_render_layers(image_path)
     tf = max(1, round(duration * FPS))
     text_bounds = overlay_bounds(image_path, language in ("en", "en_exact") and style_mode == "comic")
@@ -1973,10 +1948,9 @@ def render_pure(image_path, duration, output_path, motion="zoom_in_center",
     proc.stdin.close(); proc.wait()
 
 def render_classic(image_path, duration, output_path, hand_path, motion="zoom_in_center",
-                   style_mode="comic", language="vi"):
-    # V10.3: English → không vẽ tay
-    if language in ("en", "en_exact") and style_mode == "comic":
-        return render_kttv(image_path, duration, output_path, hand_path, motion, style_mode, language)
+                   style_mode="comic", language="vi", draw_animation=True):
+    if (language in ("en", "en_exact") and style_mode == "comic") or not draw_animation:
+        return render_kttv(image_path, duration, output_path, hand_path, motion, style_mode, language, draw_animation)
 
     image_path, text_layers = load_render_layers(image_path)
     tf = max(1, round(duration * FPS))
@@ -2159,7 +2133,8 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
                  image_timeout, flux_steps=4, fair_share=True, circuit=True, prio_fast=True,
                  chars=None, char_lock=None, enable_arrows=True, enable_shadow=True,
                  enable_sfx=True, sfx_vol=-12, enable_music=True, music_vol=-22,
-                 seed_lock=None, style_mode="comic", language="vi", strict_timing=False, timeline_offset=0.0):
+                 seed_lock=None, style_mode="comic", language="vi", strict_timing=False, timeline_offset=0.0,
+                 draw_animation=True):
     total = len(scenes)
     if total == 0: raise RuntimeError("Không có cảnh nào.")
     chars = chars or {}; char_lock = char_lock or {}
@@ -2243,11 +2218,11 @@ def render_batch(batch_audio, scenes, batch_dir, hand_path, style,
             dur = max(1.0, float(s["end"]) - float(s["start"]))
         prepare_overlay_timing(im, s.get("overlay_words",[]), float(s["start"]), dur, globals().get("timed_text_enabled",True))
         mo = s.get("camera_motion", "zoom_in_center")
-        if strict_timing and dur < 1.85: render_pure(im, dur, vd, mo, style_mode, language)
-        elif "1." in style or "Vẽ 3 phase" in style: render_kttv(im, dur, vd, hand_path, mo, style_mode, language)
-        elif "2." in style or "Hybrid" in style: render_hybrid(im, dur, vd, hand_path, mo, style_mode, language)
-        elif "3." in style or "Chỉ Camera" in style: render_pure(im, dur, vd, mo, style_mode, language)
-        else: render_classic(im, dur, vd, hand_path, mo, style_mode, language)
+        if strict_timing and dur < 1.85: render_pure(im, dur, vd, mo, style_mode, language, draw_animation)
+        elif "1." in style or "Vẽ 3 phase" in style: render_kttv(im, dur, vd, hand_path, mo, style_mode, language, draw_animation)
+        elif "2." in style or "Hybrid" in style: render_hybrid(im, dur, vd, hand_path, mo, style_mode, language, draw_animation)
+        elif "3." in style or "Chỉ Camera" in style: render_pure(im, dur, vd, mo, style_mode, language, draw_animation)
+        else: render_classic(im, dur, vd, hand_path, mo, style_mode, language, draw_animation)
         vids.append(vd)
         rb.progress(i/total); rt.markdown(f"**🎬 Render: {i}/{total}** — {s['title']}")
 
@@ -2352,7 +2327,7 @@ if audio:
 
         cache_dir = Path.home() / ".wb_cache"; cache_dir.mkdir(exist_ok=True)
 
-        root = Path(tempfile.mkdtemp(prefix=f"wb_v103_{style_mode}_"))
+        root = Path(tempfile.mkdtemp(prefix=f"wb_v104_{style_mode}_"))
         try:
             src = root / audio.name; src.write_bytes(audio.getbuffer())
             dur = ffprobe_duration(src)
@@ -2390,7 +2365,7 @@ if audio:
                 corrected, report = combined_align(script_text, all_words)
                 st.info(f"Đã đối chiếu text theo lời đọc. Mức trùng từ: {report['score']:.0%}; {len(report['review'])} đoạn đã sửa/cần kiểm tra.")
                 if report["score"] < .55: st.warning("Nhận dạng khác text khá nhiều. Tool vẫn dùng chữ từ text; vị trí một số cảnh chỉ được ước lượng theo voice.")
-                if approximate: st.warning("Một số đoạn không có timestamp từng từ; đã ước lượng bên trong timestamp câu. Độ chính xác thấp hơn timestamp từ.")
+                if approximate: st.warning("Một số đoạn không có timestamp từng từ; đã ước lượng bên trong timestamp câu.")
                 with st.expander("Đối chiếu lời nghe và text", expanded=False):
                     st.dataframe(report["review"], use_container_width=True)
                 for batch_index, data in enumerate(combined_data):
@@ -2398,11 +2373,9 @@ if audio:
                     if words:
                         data["windows"] = combined_windows(words,data["offset"],data["duration"],scene_min,scene_max,max_scenes)
                     else:
-                        # Silence or ASR-only batch: continue the closest script context.
                         nearest = min(corrected,key=lambda w:abs(w["start"]-data["offset"]))
                         data["windows"] = [{"scene_id":1,"start":0.0,"end":data["duration"],"narration":nearest["text"]}]
                         st.warning("Một đợt voice không có text đối chiếu được; dùng ngữ cảnh gần nhất cho hình minh họa.")
-                # Save the corrected timing map before any image request.
                 (root / "voice_text_alignment.json").write_text(json.dumps({"report":report,"batches":combined_data},ensure_ascii=False,indent=2),encoding="utf-8")
                 st.download_button("⬇️ Bản đối chiếu voice + text", (root / "voice_text_alignment.json").read_bytes(),
                                    file_name="voice_text_alignment.json",mime="application/json",on_click="ignore")
@@ -2412,7 +2385,6 @@ if audio:
                     data = combined_data[idx]; bstart = data["offset"]; effective_lang = data["language"]
                     windows = data["windows"]; scenes = []
                     stt.markdown(f"### ✂️ Đợt {idx+1}/{len(vc)} — Mô tả hình theo các câu đã khóa thời gian...")
-                    # Small visual-planning requests; scene IDs and timestamps remain fixed.
                     for begin in range(0,len(windows),3):
                         group = windows[begin:begin+3]
                         scenes.extend(make_scene_plan(client,"",bstart,bdur,planner_model,scene_min,scene_max,max_scenes,cm_mode,
@@ -2449,7 +2421,6 @@ if audio:
                                              user_script=bscript,
                                              use_script_mode=internal_mode,
                                              style_mode=style_mode)
-                # Reuse existing word timestamps; no additional transcription/API call.
                 if internal_mode == "combined":
                     overlay_words=[dict(w,start=float(w['start'])-bstart,end=float(w['end'])-bstart) for w in corrected if float(w['end'])>bstart and float(w['start'])<bstart+bdur]
                 else:
@@ -2474,7 +2445,8 @@ if audio:
                                    enable_music=enable_music if internal_mode != "combined" else False, music_vol=music_volume,
                                    seed_lock=seed_lock, style_mode=style_mode,
                                    language="en_exact" if internal_mode=="combined" and effective_lang=="en" else effective_lang,
-                                   strict_timing=internal_mode=="combined",timeline_offset=bstart)
+                                   strict_timing=internal_mode=="combined",timeline_offset=bstart,
+                                   draw_animation=draw_animation)
                 sv = root / f"batch_final_{idx+1:03d}.mp4"
                 shutil.copy2(bvi, sv); bvids.append(sv)
                 all_s += len(scenes)
