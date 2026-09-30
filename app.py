@@ -1,11 +1,10 @@
 """
-Xưởng Video Diễn Hoạt Kiến Thức AI — Bản Siêu Cấp V10.4
+Xưởng Video Diễn Hoạt Kiến Thức AI — Bản Siêu Cấp V10.5
 =======================================================
-V10.4 FIX:
-- Camera motion chạy đúng: vẽ 35%, camera 65%
-- Checkbox tắt vẽ → ảnh hiện ngay + camera motion full thời lượng
-- Fix lỗi camera motion không chạy sau khi vẽ xong
-- Giữ combined mode (word timestamp + fuzzy align + locked scenes)
+V10.5 FIX:
+- Cấm tuyệt đối AI vẽ chữ trong VI mode (prompt + strip_text_from_prompt)
+- Giữ camera motion V10.4 (vẽ 35%, camera 65%, checkbox tắt vẽ)
+- Giữ combined mode chính xác
 - Giữ English native text cho voice_only
 """
 
@@ -26,7 +25,7 @@ import numpy as np
 # ============================================================
 # CẤU HÌNH
 # ============================================================
-APP_TITLE = "Xưởng Video Diễn Hoạt Kiến Thức AI (V10.4)"
+APP_TITLE = "Xưởng Video Diễn Hoạt Kiến Thức AI (V10.5)"
 BATCH_SECONDS = 5 * 60
 FPS = 24
 WIDTH = 1280
@@ -34,7 +33,7 @@ HEIGHT = 720
 TITLE_BAND_H = 95
 CONTENT_H = HEIGHT - TITLE_BAND_H
 REVEAL_RADIUS = 34
-DRAW_DURATION_RATIO = 0.35  # V10.4: giảm còn 35% để camera có nhiều thời gian hơn
+DRAW_DURATION_RATIO = 0.35
 PHASE_RATIOS = (0.40, 0.35, 0.25)
 MAX_TOTAL_FALLBACK_TIME = 300
 FAIR_SHARE_MULTIPLIER = 1.5
@@ -144,6 +143,62 @@ def horror_sanitize(text):
     return result
 
 # ============================================================
+# V10.5: STRIP TEXT FROM PROMPT (VI mode)
+# ============================================================
+# Các pattern mô tả chữ mà AI có thể nhét vào visual_prompt
+_TEXT_PATTERNS = [
+    r'with\s+text\s+["\'][^"\']*["\']',
+    r'with\s+the\s+text\s+["\'][^"\']*["\']',
+    r'with\s+word\s+["\'][^"\']*["\']',
+    r'saying\s+["\'][^"\']*["\']',
+    r'says\s+["\'][^"\']*["\']',
+    r'title\s+["\'][^"\']*["\']',
+    r'titled\s+["\'][^"\']*["\']',
+    r'label\s+["\'][^"\']*["\']',
+    r'labeled\s+["\'][^"\']*["\']',
+    r'caption\s+["\'][^"\']*["\']',
+    r'captioned\s+["\'][^"\']*["\']',
+    r'written\s+["\'][^"\']*["\']',
+    r'reads?\s+["\'][^"\']*["\']',
+    r'text\s+["\'][^"\']*["\']',
+    r'speech\s+bubble\s+with\s+["\'][^"\']*["\']',
+    r'speech\s+bubble\s+["\'][^"\']*["\']',
+    r'thought\s+bubble\s+with\s+["\'][^"\']*["\']',
+    r'sticker\s+["\'][^"\']*["\']',
+    r'banner\s+with\s+["\'][^"\']*["\']',
+    r'sign\s+with\s+["\'][^"\']*["\']',
+    r'sign\s+reading\s+["\'][^"\']*["\']',
+    r'sign\s+saying\s+["\'][^"\']*["\']',
+    r'signboard\s+["\'][^"\']*["\']',
+    # Tiếng Việt không dấu nháy
+    r'chữ\s+["\'][^"\']*["\']',
+    r'có\s+chữ\s+["\'][^"\']*["\']',
+    r'với\s+chữ\s+["\'][^"\']*["\']',
+    r'tiêu\s+đề\s+["\'][^"\']*["\']',
+    r'nhãn\s+["\'][^"\']*["\']',
+    r'bong\s+bóng\s+["\'][^"\']*["\']',
+]
+
+def strip_text_from_prompt(prompt):
+    """V10.5: Loại bỏ mọi mô tả text khỏi visual_prompt (VI mode)."""
+    if not prompt: return prompt
+    result = prompt
+    for pat in _TEXT_PATTERNS:
+        result = re.sub(pat, '', result, flags=re.IGNORECASE)
+    # Xóa các cụm treo lơ lửng sau khi xóa
+    result = re.sub(r'\s+,', ',', result)
+    result = re.sub(r',\s*\.', '.', result)
+    result = re.sub(r'\.\s*\.', '.', result)
+    result = re.sub(r'\s{2,}', ' ', result)
+    result = re.sub(r'^\s*[,.]\s*', '', result)
+    result = re.sub(r'\s*[,.]\s*$', '', result)
+    result = result.strip()
+    # Thêm câu cấm chữ nếu còn chữ trong ngoặc kép
+    if re.search(r'["\'][^"\']{2,}["\']', result):
+        result += ". IMPORTANT: Absolutely NO text, letters, or words in the image."
+    return result
+
+# ============================================================
 # CACHE HELPERS
 # ============================================================
 def file_hash(path, nbytes=10000):
@@ -157,8 +212,8 @@ def file_hash(path, nbytes=10000):
 # UI
 # ============================================================
 st.set_page_config(page_title=APP_TITLE, page_icon="🎬", layout="wide")
-st.title("🎬 Xưởng Video Diễn Hoạt Kiến Thức AI — V10.4")
-st.caption("Fix camera motion + Combined mode chính xác + English native text")
+st.title("🎬 Xưởng Video Diễn Hoạt Kiến Thức AI — V10.5")
+st.caption("Fix AI vẽ chữ VI + Camera motion V10.4 + Combined mode chính xác")
 
 with st.sidebar:
     st.header("🎨 Style Mode")
@@ -179,7 +234,7 @@ with st.sidebar:
         if effective_lang == "en":
             st.success("🇬🇧 English: AI vẽ sticker title + full-frame camera")
         else:
-            st.info("🇻🇳 Vietnamese: Pillow overlay + title band 95px")
+            st.info("🇻🇳 Vietnamese: Pillow overlay + title band 95px (AI không vẽ chữ)")
     else:
         st.warning("⚠️ Horror mode: nhịp 5-10s/cảnh. Khuyên dùng Pollinations flux-pro.")
 
@@ -254,7 +309,6 @@ with st.sidebar:
         "3. Chỉ Camera Pan & Zoom",
         "4. Bảng trắng cổ điển",
     ], index=0)
-    # V10.4: Checkbox tắt vẽ tay
     draw_animation = st.checkbox("Hiệu ứng vẽ tay", value=True,
         help="Tắt để ảnh hiện ngay + camera motion chạy full thời lượng cảnh.")
 
@@ -859,7 +913,8 @@ def make_scene_plan(client, transcript_text, batch_start, batch_duration, model,
     if is_horror:
         style_rule = """RÀNG BUỘC HORROR: Dark atmospheric, cinematic, deep shadows. NO text."""
         title_rule = f"- {'English: 3-6 words, mysterious, UPPERCASE' if is_en else 'Tiếng Việt: 3-6 từ, bí ẩn, VIẾT HOA'}"
-        visual_rule = """MỖI CẢNH LÀ SÂN KHẤU KINH DỊ KHÁC NHAU."""
+        visual_rule = """MỖI CẢNH LÀ SÂN KHẤU KINH DỊ KHÁC NHAU.
+⛔ TUYỆT ĐỐI KHÔNG vẽ chữ, số, ký tự trong visual_prompt. Mọi chữ sẽ do tool overlay thêm sau."""
         rich_note = """OVERLAY: 1-2 text_boxes. 4 góc.""" if enable_rich else ""
         sfx_note = """SFX: creak/whisper/scream/heartbeat/thunder/silence_break/whoosh/impact/swoosh/none.""" if enable_sfx else ""
         music_note = """NHẠC: dread/panic/eerie/ominous/sad/tense/neutral/none.""" if enable_music else ""
@@ -874,10 +929,12 @@ def make_scene_plan(client, transcript_text, batch_start, batch_duration, model,
 - Title as STICKER-STYLE: bold letters + thick outline, NO rectangular banner
 - Wide 16:9 cinematic composition"""
         else:
-            style_rule = "RÀNG BUỘC: 2D comic doodle, nét mực đen dày, nền TRẮNG TINH, KHÔNG chữ/số."
+            style_rule = """RÀNG BUỘC: 2D comic doodle, nét mực đen dày, nền TRẮNG TINH.
+⛔ TUYỆT ĐỐI KHÔNG chữ, số, ký tự, banner, biển hiệu, bong bóng thoại trong ảnh. Mọi chữ sẽ do tool overlay thêm sau."""
         title_rule = f"- {'English: 3-6 words, UPPERCASE' if is_en else 'Tiếng Việt: 3-6 từ, VIẾT HOA'}"
         visual_rule = """MỖI CẢNH LÀ SÂN KHẤU KHÁC NHAU. KHÔNG lặp bố cục.
-Bao gồm: nhân vật + tư thế, hành động, bối cảnh, đồ vật ẩn dụ, cảm xúc, màu nhấn."""
+Bao gồm: nhân vật + tư thế, hành động, bối cảnh, đồ vật ẩn dụ, cảm xúc, màu nhấn.
+⛔ TUYỆT ĐỐI KHÔNG vẽ chữ, số, ký tự, bong bóng thoại, banner, biển hiệu có chữ trong visual_prompt. Mọi chữ sẽ do tool overlay thêm sau."""
         rich_note = """OVERLAY: 2-3 text_boxes. 4 góc. Text NGẮN.""" if enable_rich else ""
         sfx_note = """SFX: whoosh/pop/ding/impact/sad/bell/typing/sparkle/swoosh/none.""" if enable_sfx else ""
         music_note = """NHẠC: happy/sad/epic/calm/tense/inspirational/neutral/none.""" if enable_music else ""
@@ -893,7 +950,8 @@ Bao gồm: nhân vật + tư thế, hành động, bối cảnh, đồ vật ẩ
 Ví dụ: "... Title 'XXX' as sticker text top center. Speech bubble 'YYY' near character."
 """
     else:
-        native_note = """QUY TẮC NHÂN VẬT: Ghi rõ "male character"/"female character"."""
+        native_note = """QUY TẮC NHÂN VẬT: Ghi rõ "male character"/"female character".
+⛔ KHÔNG mô tả chữ, số, bong bóng thoại, banner, biển hiệu trong visual_prompt."""
 
     system = f"""Bạn là giám đốc sáng tạo kịch bản cho kênh {("KINH DỊ" if is_horror else "hoạt họa kiến thức")}.
 NGÔN NGỮ OUTPUT: {lang_name}.
@@ -947,7 +1005,8 @@ JSON FORMAT:
 
     if locked_scenes is not None:
         system += "\nVOICE+TEXT LOCK: Trả đúng một cảnh cho mỗi scene_id được cấp. Không đổi/tách/gộp/thêm cảnh. Thời gian do chương trình giữ, không tự dựng timeline."
-        system += "\nMỗi hình chỉ minh họa narration của scene_id tương ứng. title/callout/text_boxes lấy cụm từ NGUYÊN VĂN từ narration, đúng tên riêng, số và dấu tiếng Việt. Không bịa chữ. visual_prompt chỉ tả hình bằng tiếng Anh, không nhúng chữ/title vào mô tả."
+        system += "\nMỗi hình chỉ minh họa narration của scene_id tương ứng. title/callout/text_boxes lấy cụm từ NGUYÊN VĂN từ narration, đúng tên riêng, số và dấu tiếng Việt. Không bịa chữ. visual_prompt chỉ tả hình bằng tiếng Anh, KHÔNG nhúng chữ/title vào mô tả."
+        system += "\n⛔ CẤM TUYỆT ĐỐI mọi mô tả chữ, số, ký tự, banner, biển hiệu, bong bóng thoại trong visual_prompt."
         system += "\nTiêu đề phải trọn ý, không lấy các từ đầu thành câu cụt. Nếu không chọn được cụm ngắn trọn ý, để title rỗng. Các ô chữ ngắn, không chép cả đoạn."
         system += "\nJSON mỗi cảnh phải có scene_id. Không markdown hoặc phần giải thích."
         user = "Các cảnh đã căn từ voice và sửa chữ theo script (giây cục bộ trong đợt):\n" + json.dumps(locked_scenes, ensure_ascii=False)
@@ -1020,7 +1079,9 @@ JSON FORMAT:
             vp = str(s.get("visual_prompt", "")).strip()
             if not vp or len(vp) < 10: continue
             if is_horror: vp = horror_sanitize(vp)
-            elif not native_text: vp = sanitize_prompt_text(vp)
+            elif not native_text:
+                vp = sanitize_prompt_text(vp)
+                vp = strip_text_from_prompt(vp)  # V10.5: loại bỏ mọi mô tả text
             ct = str(s.get("callout_type", "speech")).strip().lower()
             if ct not in ("speech", "thought", "sticker", "none"): ct = "speech"
             cm = str(s.get("camera_motion", list(valid_motions)[0])).strip().lower()
@@ -1112,6 +1173,7 @@ def _build_full_prompt(prompt, chars=None, char_lock=None, style_mode="comic",
 
     if style_mode == "horror":
         safe = horror_sanitize(prompt)
+        safe = strip_text_from_prompt(safe)  # V10.5: horror cũng cấm chữ
         style = """Dramatic dark illustration, cinematic horror atmosphere, deep shadows.
 Rich moody backgrounds, dramatic lighting.
 Absolutely NO text, letters, numbers, captions.
@@ -1141,12 +1203,15 @@ RENDER TEXT VISIBLY: title, speech bubbles, labels. Text MUST be correctly spell
 Wide 16:9 cinematic composition.
 CHARACTER GENDER: male = MALE, female = FEMALE."""
     else:
+        # V10.5: VI mode — cấm tuyệt đối chữ
         safe = sanitize_prompt_text(prompt)
+        safe = strip_text_from_prompt(safe)
         style = """Authentic 2D comic doodle art style, thick black ink contour outlines.
 Pure solid flat white background.
 Vivid expressive cartoon character.
 Selective vibrant spot colors on key elements.
-Absolutely NO text, letters, numbers, captions, or empty speech balloons.
+ABSOLUTELY NO text, letters, numbers, words, captions, labels, signs, banners, or speech bubbles of any kind.
+Do NOT write anything in the image. All text is added separately by post-processing.
 Wide 16:9 cinematic composition.
 CHARACTER GENDER: male = MALE, female = FEMALE."""
 
@@ -1548,6 +1613,7 @@ def add_comic_overlays(image_path, title, callout_type, callout_text, callout_si
                         style_mode='comic', language='vi'):
     img=Image.open(image_path).convert('RGB').resize((WIDTH,HEIGHT));draw=ImageDraw.Draw(img)
     full=(language=='en_exact' and style_mode=='comic')
+    # V10.5: English native text → AI vẽ, Pillow không can thiệp
     if language=='en' and style_mode=='comic':
         img.save(output_path,quality=95);overlay_metadata(output_path,[]);return
     horror=(style_mode=='horror');rectangles=[];occupied=[]
@@ -1751,7 +1817,7 @@ def interp_motion(kfs, p):
     _, s, cx, cy = kfs[-1]; return s, cx, cy
 
 # ============================================================
-# RENDER 4 STYLES — V10.4: camera motion fix
+# RENDER 4 STYLES
 # ============================================================
 def render_kttv(image_path, duration, output_path, hand_path, motion="zoom_in_center",
                 style_mode="comic", language="vi", draw_animation=True):
@@ -1759,7 +1825,6 @@ def render_kttv(image_path, duration, output_path, hand_path, motion="zoom_in_ce
     tf = max(1, round(duration * FPS))
     text_bounds = overlay_bounds(image_path, language in ("en", "en_exact") and style_mode == "comic")
     use_full_frame = (language in ("en", "en_exact") and style_mode == "comic")
-    # V10.4: Nếu tắt vẽ hoặc full frame → hiện ảnh ngay, camera motion full
     skip_draw = use_full_frame or not draw_animation
     if skip_draw:
         df = 0; rf = 0
@@ -1818,9 +1883,7 @@ def render_kttv(image_path, duration, output_path, hand_path, motion="zoom_in_ce
         fc = (cb*a + wc*(1.0-a)).astype(np.uint8)
         if hv: paste_hand(fc, hb, ha, hx-tx, hy-ty)
 
-        # V10.4 FIX: Camera motion chạy đúng
         if skip_draw:
-            # Ảnh hiện ngay → camera motion full từ frame 0
             op = fi / max(1, tf - 1)
             st_, cx_, cy_ = interp_motion(kfs, op)
             cyc = (cy_ / HEIGHT) * ch_use
@@ -1829,7 +1892,6 @@ def render_kttv(image_path, duration, output_path, hand_path, motion="zoom_in_ce
             cu = WIDTH * 0.5 + (cx_ - WIDTH * 0.5) * bl
             cyu = ch_use * 0.5 + (cyc - ch_use * 0.5) * bl
         elif fi >= df + rf:
-            # Vẽ xong → camera motion chạy cho phần còn lại
             op = (fi - df - rf) / max(1, tf - df - rf)
             st_, cx_, cy_ = interp_motion(kfs, op)
             cyc = (cy_ / HEIGHT) * ch_use
@@ -1838,7 +1900,6 @@ def render_kttv(image_path, duration, output_path, hand_path, motion="zoom_in_ce
             cu = WIDTH * 0.5 + (cx_ - WIDTH * 0.5) * bl
             cyu = ch_use * 0.5 + (cyc - ch_use * 0.5) * bl
         else:
-            # Đang vẽ → giữ nguyên scale
             sc, cu, cyu = 1.0, WIDTH * 0.5, ch_use * 0.5
 
         if use_full_frame:
@@ -1852,7 +1913,6 @@ def render_kttv(image_path, duration, output_path, hand_path, motion="zoom_in_ce
 
 def render_hybrid(image_path, duration, output_path, hand_path, motion="zoom_in_center",
                   style_mode="comic", language="vi", draw_animation=True):
-    # V10.4: Nếu tắt vẽ hoặc English → dùng render_kttv
     if (language in ("en", "en_exact") and style_mode == "comic") or not draw_animation:
         return render_kttv(image_path, duration, output_path, hand_path, motion, style_mode, language, draw_animation)
 
@@ -2327,7 +2387,7 @@ if audio:
 
         cache_dir = Path.home() / ".wb_cache"; cache_dir.mkdir(exist_ok=True)
 
-        root = Path(tempfile.mkdtemp(prefix=f"wb_v104_{style_mode}_"))
+        root = Path(tempfile.mkdtemp(prefix=f"wb_v105_{style_mode}_"))
         try:
             src = root / audio.name; src.write_bytes(audio.getbuffer())
             dur = ffprobe_duration(src)
